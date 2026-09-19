@@ -1,7 +1,7 @@
 import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
-import { BankAccount, CustomerLink, CustomerVisit, GenericRecord, GlobalCustomer, Lead, Product, SalesCompetitorIntel, SalesCrmActivity, SalespersonTrip, SalesRoutePlan, Target, User } from "../models/index.js";
+import { BankAccount, CustomerLink, CustomerVisit, GenericRecord, GlobalCustomer, Lead, Product, SalesCompetitorIntel, SalesCrmActivity, SalespersonTrip, SalesRoutePlan, Target, User, Pincode } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { financialModels, postBalancedEntries } from "../services/accountingService.js";
 import { hierarchyVisibilityForUser } from "../services/assignmentHierarchyService.js";
@@ -537,11 +537,23 @@ async function collectionPriorityItems({ tenantKey, financialYear, customers }) 
     const promisedToday = money(todayPromise.reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0));
     const brokenPromiseAmount = money(broken.reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0));
     const maxOverdueDays = bills.reduce((m, x) => Math.max(m, x.overdueDays), 0);
+    const aging = { "0_7": 0, "8_15": 0, "16_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0, opening_or_unallocated: 0 };
+    let oldestPendingDays = 0;
+    let invoiceOutstanding = 0;
+    for (const bill of bills) {
+      const pendingDays = Math.max(0, daysBetween(today, bill.date));
+      oldestPendingDays = Math.max(oldestPendingDays, pendingDays);
+      const bucket = pendingAgeBucket(pendingDays);
+      aging[bucket] += num(bill.outstanding);
+      invoiceOutstanding += num(bill.outstanding);
+    }
     const outstanding = money(num(balanceMap.get(c.globalCustomerId)) + openingSigned(c, financialYear));
+    aging.opening_or_unallocated = money(Math.max(0, outstanding - invoiceOutstanding));
+    for (const key of Object.keys(aging)) aging[key] = money(aging[key]);
     const score = Math.round((Math.min(50, overdueAmount / 2000) + Math.min(35, maxOverdueDays) + (promisedToday > 0 ? 25 : 0) + (broken.length ? 30 : 0) + (dueToday > 0 ? 12 : 0)) * 10) / 10;
     return {
       customer: shapeCustomer(c, null, { outstanding }), outstanding, overdueAmount, dueToday,
-      promisedToday, brokenPromiseAmount, maxOverdueDays, openBills: bills.length,
+      promisedToday, brokenPromiseAmount, maxOverdueDays, oldestPendingDays, aging, openBills: bills.length,
       priorityScore: score,
       priority: broken.length || maxOverdueDays > 30 ? "CRITICAL" : promisedToday > 0 || overdueAmount > 0 ? "HIGH" : dueToday > 0 ? "MEDIUM" : "NORMAL",
       nextPromise: [...customerPromises].sort((a, b) => new Date(a.promiseDate) - new Date(b.promiseDate))[0] || null,
@@ -1942,15 +1954,283 @@ router.get("/opportunities", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
+function financialYearBounds(financialYear) {
+  const match = clean(financialYear).match(/^(\d{4})-(\d{2}|\d{4})$/);
+  const startYear = match ? Number(match[1]) : (new Date().getMonth() >= 3 ? new Date().getFullYear() : new Date().getFullYear() - 1);
+  return { start: new Date(startYear, 3, 1), end: new Date(startYear + 1, 3, 1), startYear };
+}
+function salesCollectionPeriodBuckets(financialYear, periodValue) {
+  const period = upper(periodValue || "MONTHLY");
+  const { start, end, startYear } = financialYearBounds(financialYear);
+  const months = [];
+  for (let i = 0; i < 12; i += 1) {
+    const from = new Date(startYear, 3 + i, 1);
+    const to = new Date(startYear, 4 + i, 1);
+    months.push({ index: i, from, to, label: from.toLocaleString("en-IN", { month: "short" }), key: `${from.getFullYear()}-${String(from.getMonth() + 1).padStart(2, "0")}` });
+  }
+  if (period === "QUARTERLY") return [0, 1, 2, 3].map((q) => ({ key: `Q${q + 1}`, label: `Q${q + 1}`, from: months[q * 3].from, to: months[q * 3 + 2].to }));
+  if (["HALF_YEARLY", "HALFYEARLY", "HALF-YEARLY"].includes(period)) return [
+    { key: "H1", label: "H1 • Apr-Sep", from: months[0].from, to: months[5].to },
+    { key: "H2", label: "H2 • Oct-Mar", from: months[6].from, to: months[11].to },
+  ];
+  if (period === "YEARLY") return [{ key: financialYear, label: `FY ${financialYear}`, from: start, to: end }];
+  return months;
+}
+function pendingAgeBucket(days) {
+  const d = Math.max(0, Number(days || 0));
+  if (d <= 7) return "0_7";
+  if (d <= 15) return "8_15";
+  if (d <= 30) return "16_30";
+  if (d <= 60) return "31_60";
+  if (d <= 90) return "61_90";
+  return "90_plus";
+}
+
+router.get("/analytics/sales-collection", async (req, res) => {
+  try {
+    const financialYear = fyOf(req);
+    const period = upper(req.query.period || "MONTHLY");
+    const partyQ = clean(req.query.q).toLowerCase();
+    const partyLimit = Math.min(200, Math.max(25, Number(req.query.partyLimit || 75)));
+    const { start, end } = financialYearBounds(financialYear);
+    const buckets = salesCollectionPeriodBuckets(financialYear, period);
+    const { filter } = await visibleCustomerFilter(req, { status: "ACTIVE" });
+    const customers = await CustomerLink.find(filter)
+      .select("globalCustomerId localName displayIdentifier companyContactNumber ownerMobile contacts addresses creditDays creditLimit approvedTerms accountingProfile salespersonId")
+      .sort({ localName: 1 }).lean();
+    const ids = customers.map((x) => clean(x.globalCustomerId)).filter(Boolean);
+    if (!ids.length) return ok(res, { financialYear, period, summary: { sales: 0, collections: 0, gap: 0, collectionPct: 0, outstanding: 0 }, trend: buckets.map((b) => ({ ...b, from: b.from, to: b.to, sales: 0, collections: 0, gap: 0, collectionPct: 0 })), parties: [], aging: {} });
+
+    const { SalesInvoice, Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const [salesByMonth, collectionByMonth, partySales, partyCollections, invoiceRows, receiptTotals, balanceMap] = await Promise.all([
+      SalesInvoice.aggregate([
+        { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $gte: start, $lt: end } } },
+        { $group: { _id: { year: { $year: "$date" }, month: { $month: "$date" } }, amount: { $sum: "$grandTotal" }, count: { $sum: 1 } } },
+      ]),
+      Receipt.aggregate([
+        { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $gte: start, $lt: end } } },
+        { $group: { _id: { year: { $year: "$date" }, month: { $month: "$date" } }, amount: { $sum: "$amount" }, count: { $sum: 1 } } },
+      ]),
+      SalesInvoice.aggregate([
+        { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $gte: start, $lt: end } } },
+        { $group: { _id: "$customerGlobalId", amount: { $sum: "$grandTotal" }, invoices: { $sum: 1 }, lastSaleAt: { $max: "$date" } } },
+      ]),
+      Receipt.aggregate([
+        { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $gte: start, $lt: end } } },
+        { $group: { _id: "$customerGlobalId", amount: { $sum: "$amount" }, receipts: { $sum: 1 }, lastCollectionAt: { $max: "$date" } } },
+      ]),
+      SalesInvoice.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $lt: end } })
+        .select("customerGlobalId invoiceNo date grandTotal workflowStatus status").sort({ date: 1, createdAt: 1 }).lean(),
+      Receipt.aggregate([
+        { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $lt: end } } },
+        { $group: { _id: "$customerGlobalId", total: { $sum: "$amount" } } },
+      ]),
+      receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: ids }),
+    ]);
+
+    const monthSales = new Map(salesByMonth.map((x) => [`${x._id.year}-${String(x._id.month).padStart(2, "0")}`, { amount: num(x.amount), count: num(x.count) }]));
+    const monthCollections = new Map(collectionByMonth.map((x) => [`${x._id.year}-${String(x._id.month).padStart(2, "0")}`, { amount: num(x.amount), count: num(x.count) }]));
+    const monthlyRows = salesCollectionPeriodBuckets(financialYear, "MONTHLY").map((m) => ({
+      ...m,
+      sales: money(monthSales.get(m.key)?.amount || 0),
+      collections: money(monthCollections.get(m.key)?.amount || 0),
+      invoiceCount: num(monthSales.get(m.key)?.count),
+      receiptCount: num(monthCollections.get(m.key)?.count),
+    }));
+    const trend = buckets.map((bucket) => {
+      const rows = monthlyRows.filter((m) => m.from >= bucket.from && m.from < bucket.to);
+      const sales = money(rows.reduce((sum, x) => sum + x.sales, 0));
+      const collections = money(rows.reduce((sum, x) => sum + x.collections, 0));
+      return {
+        key: bucket.key, label: bucket.label, from: bucket.from, to: bucket.to,
+        sales, collections, gap: money(sales - collections), collectionPct: sales > 0 ? Math.round(collections / sales * 1000) / 10 : (collections > 0 ? 100 : 0),
+        invoiceCount: rows.reduce((sum, x) => sum + x.invoiceCount, 0), receiptCount: rows.reduce((sum, x) => sum + x.receiptCount, 0),
+      };
+    });
+
+    const salesMap = new Map(partySales.map((x) => [String(x._id), x]));
+    const receiptMap = new Map(partyCollections.map((x) => [String(x._id), x]));
+    const receiptTotalMap = new Map(receiptTotals.map((x) => [String(x._id), num(x.total)]));
+    const invoiceMap = new Map();
+    for (const inv of invoiceRows) {
+      const id = clean(inv.customerGlobalId);
+      if (!invoiceMap.has(id)) invoiceMap.set(id, []);
+      invoiceMap.get(id).push(inv);
+    }
+    const today = startOfDay(new Date());
+    const aging = { "0_7": 0, "8_15": 0, "16_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0, opening_or_unallocated: 0 };
+    const parties = customers.map((customer) => {
+      const id = clean(customer.globalCustomerId);
+      const s = salesMap.get(id) || {}, r = receiptMap.get(id) || {};
+      const bills = allocateReceiptsToInvoices(invoiceMap.get(id) || [], receiptTotalMap.get(id) || 0, customer.creditDays || customer.approvedTerms?.creditDays || 0).filter((x) => x.outstanding > 0);
+      let oldestPendingDays = 0, maxOverdueDays = 0, invoiceOutstanding = 0, overdueAmount = 0;
+      const partyAging = { "0_7": 0, "8_15": 0, "16_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0 };
+      for (const bill of bills) {
+        const pendingDays = Math.max(0, daysBetween(today, bill.date));
+        oldestPendingDays = Math.max(oldestPendingDays, pendingDays);
+        maxOverdueDays = Math.max(maxOverdueDays, num(bill.overdueDays));
+        invoiceOutstanding += num(bill.outstanding);
+        if (num(bill.overdueDays) > 0) overdueAmount += num(bill.outstanding);
+        const key = pendingAgeBucket(pendingDays);
+        partyAging[key] += num(bill.outstanding);
+        aging[key] += num(bill.outstanding);
+      }
+      const outstanding = money(Math.max(0, num(balanceMap.get(id)) + openingSigned(customer, financialYear)));
+      const unallocated = money(Math.max(0, outstanding - invoiceOutstanding));
+      aging.opening_or_unallocated += unallocated;
+      return {
+        customerGlobalId: id,
+        customerName: customerName(customer),
+        mobile: customerMobile(customer),
+        city: billingAddress(customer).city || "",
+        pincode: billingAddress(customer).pincode || "",
+        sales: money(s.amount || 0), invoices: num(s.invoices), lastSaleAt: s.lastSaleAt || null,
+        collections: money(r.amount || 0), receipts: num(r.receipts), lastCollectionAt: r.lastCollectionAt || null,
+        gap: money(num(s.amount) - num(r.amount)),
+        collectionPct: num(s.amount) > 0 ? Math.round(num(r.amount) / num(s.amount) * 1000) / 10 : (num(r.amount) > 0 ? 100 : 0),
+        outstanding,
+        overdueAmount: money(overdueAmount),
+        oldestPendingDays,
+        maxOverdueDays,
+        openBills: bills.length,
+        aging: Object.fromEntries(Object.entries(partyAging).map(([k,v]) => [k, money(v)])),
+        openingOrUnallocated: unallocated,
+      };
+    }).filter((x) => x.sales > 0 || x.collections > 0 || x.outstanding > 0)
+      .sort((a, b) => b.outstanding - a.outstanding || b.oldestPendingDays - a.oldestPendingDays || b.sales - a.sales);
+
+    const totalSales = money(trend.reduce((sum, x) => sum + x.sales, 0));
+    const totalCollections = money(trend.reduce((sum, x) => sum + x.collections, 0));
+    const totalOutstanding = money(parties.reduce((sum, x) => sum + x.outstanding, 0));
+    const overdueOutstanding = money(parties.reduce((sum, x) => sum + num(x.overdueAmount), 0));
+    const filteredParties = partyQ ? parties.filter((x) => [x.customerName, x.mobile, x.city, x.pincode].some((v) => clean(v).toLowerCase().includes(partyQ))) : parties;
+    return ok(res, {
+      financialYear, period,
+      summary: { sales: totalSales, collections: totalCollections, gap: money(totalSales - totalCollections), collectionPct: totalSales > 0 ? Math.round(totalCollections / totalSales * 1000) / 10 : (totalCollections > 0 ? 100 : 0), outstanding: totalOutstanding, overdueOutstanding, parties: parties.length },
+      trend,
+      aging: Object.fromEntries(Object.entries(aging).map(([k,v]) => [k, money(v)])),
+      parties: filteredParties.slice(0, partyLimit),
+      partyMeta: { total: filteredParties.length, returned: Math.min(filteredParties.length, partyLimit), limit: partyLimit, query: partyQ },
+    });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+function homeActionNested(route, screen, params = {}) {
+  return { type: "NESTED", route, screen, params };
+}
+function homeActionRoute(route, params = {}) {
+  return { type: "NAVIGATE", route, params };
+}
+function dynamicMoneyTone(value, thresholds = {}) {
+  const n = num(value);
+  if (thresholds.critical !== undefined && n >= thresholds.critical) return "CRITICAL";
+  if (thresholds.high !== undefined && n >= thresholds.high) return "HIGH";
+  if (thresholds.good !== undefined && n >= thresholds.good) return "GOOD";
+  return "TEAL";
+}
+function currentFiscalIndex(now, financialYear) {
+  const { start } = financialYearBounds(financialYear);
+  const months = (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth());
+  return Math.max(0, Math.min(11, months));
+}
+function periodSummaryFromMonthly(monthlyRows, financialYear, now = new Date()) {
+  const idx = currentFiscalIndex(now, financialYear);
+  const sumRange = (from, to) => {
+    const rows = monthlyRows.slice(from, to + 1);
+    const sales = money(rows.reduce((a, x) => a + num(x.sales), 0));
+    const collections = money(rows.reduce((a, x) => a + num(x.collections), 0));
+    return { sales, collections, gap: money(sales - collections), collectionPct: sales > 0 ? Math.round((collections / sales) * 1000) / 10 : collections > 0 ? 100 : 0 };
+  };
+  const month = sumRange(idx, idx);
+  const qStart = Math.floor(idx / 3) * 3;
+  const halfStart = Math.floor(idx / 6) * 6;
+  return [
+    { id: "MONTHLY", label: monthlyRows[idx]?.label || "This Month", shortLabel: "Month", ...month },
+    { id: "QUARTERLY", label: `Q${Math.floor(idx / 3) + 1}`, shortLabel: "Quarter", ...sumRange(qStart, Math.min(qStart + 2, idx)) },
+    { id: "HALF_YEARLY", label: idx < 6 ? "H1 • Apr-Sep" : "H2 • Oct-Mar", shortLabel: "Half Year", ...sumRange(halfStart, Math.min(halfStart + 5, idx)) },
+    { id: "YEARLY", label: `FY ${financialYear}`, shortLabel: "Year", ...sumRange(0, idx) },
+  ];
+}
+async function homeLeadMarketContext(req, latitude, longitude) {
+  const scope = await visibility(req);
+  const match = { tenantKey: req.auth.tenantKey, stage: { $in: ["NEW", "ASSIGNED", "FOLLOW_UP"] } };
+  if (scope.isLeaf) match.assignedUserId = String(req.auth.sub);
+  else if (!scope.unrestricted) match.assignedUserId = { $in: (scope.userIds || []).map(String) };
+
+  const groups = await Lead.aggregate([
+    { $match: match },
+    { $group: {
+      _id: { $ifNull: ["$pincode", ""] },
+      count: { $sum: 1 },
+      highPriority: { $sum: { $cond: [{ $in: ["$priority", ["HIGH", "URGENT", "CRITICAL"]] }, 1, 0] } },
+      followUpDue: { $sum: { $cond: [{ $and: [{ $ne: ["$nextFollowUpAt", null] }, { $lte: ["$nextFollowUpAt", new Date()] }] }, 1, 0] } },
+      city: { $first: "$city" }, state: { $first: "$state" }, updatedAt: { $max: "$updatedAt" },
+    } },
+    { $sort: { count: -1, highPriority: -1, followUpDue: -1 } },
+    { $limit: 250 },
+  ]);
+  const pins = groups.map((x) => clean(x._id).replace(/\D/g, "").slice(0, 6)).filter((x) => x.length === 6);
+  const pinRows = pins.length ? await Pincode.find({ pincode: { $in: pins } }).select("pincode area city district state latitude longitude").lean() : [];
+  const geoMap = new Map();
+  for (const row of pinRows) {
+    const pin = clean(row.pincode);
+    const lat = Number(row.latitude), lng = Number(row.longitude);
+    const existing = geoMap.get(pin) || { latitude: 0, longitude: 0, n: 0, area: "", city: "", district: "", state: "" };
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      existing.latitude = (existing.latitude * existing.n + lat) / (existing.n + 1);
+      existing.longitude = (existing.longitude * existing.n + lng) / (existing.n + 1);
+      existing.n += 1;
+    }
+    existing.area ||= clean(row.area); existing.city ||= clean(row.city); existing.district ||= clean(row.district); existing.state ||= clean(row.state);
+    geoMap.set(pin, existing);
+  }
+  const areas = groups.slice(0, 8).map((row) => {
+    const pincode = clean(row._id).replace(/\D/g, "").slice(0, 6) || "NO_PINCODE";
+    const geo = geoMap.get(pincode) || {};
+    return {
+      pincode, count: num(row.count), highPriority: num(row.highPriority), followUpDue: num(row.followUpDue),
+      area: geo.area || "", city: clean(row.city) || geo.city || "", district: geo.district || "", state: clean(row.state) || geo.state || "",
+    };
+  });
+
+  let nearestLead = null;
+  if (Number.isFinite(latitude) && Number.isFinite(longitude) && geoMap.size) {
+    const nearPins = [...geoMap.entries()].filter(([, g]) => g.n > 0).map(([pincode, g]) => ({
+      pincode, distanceMeters: haversine({ latitude, longitude }, { latitude: g.latitude, longitude: g.longitude }), geo: g,
+    })).filter((x) => Number.isFinite(x.distanceMeters)).sort((a, b) => a.distanceMeters - b.distanceMeters).slice(0, 10);
+    if (nearPins.length) {
+      const distanceMap = new Map(nearPins.map((x) => [x.pincode, x]));
+      const candidateMatch = { ...match, pincode: { $in: nearPins.map((x) => x.pincode) } };
+      const candidates = await Lead.find(candidateMatch).select("_id leadId companyName contactPerson mobile address pincode city state priority nextFollowUpAt updatedAt").sort({ updatedAt: -1 }).limit(120).lean();
+      nearestLead = candidates.map((lead) => {
+        const x = distanceMap.get(clean(lead.pincode));
+        return x ? { ...lead, distanceMeters: x.distanceMeters, distanceKm: Math.round(x.distanceMeters / 100) / 10, latitude: x.geo.latitude, longitude: x.geo.longitude } : null;
+      }).filter(Boolean).sort((a, b) => a.distanceMeters - b.distanceMeters || (upper(b.priority) === "HIGH" ? 1 : 0) - (upper(a.priority) === "HIGH" ? 1 : 0))[0] || null;
+    }
+  }
+  return { areas, totalAreas: groups.filter((x) => clean(x._id)).length, totalOpenLeads: groups.reduce((a, x) => a + num(x.count), 0), nearestLead };
+}
+function actionForOpportunity(x, financialYear) {
+  if (!x) return null;
+  if (x.action === "COLLECT" && x.customerGlobalId) return homeActionNested("Customers", "CreateReceipt", { customerId: x.customerGlobalId, customerName: x.customerName, financialYear });
+  if (x.action === "ORDER" && x.customerGlobalId) return homeActionNested("Customers", "CreateOrder", { customerId: x.customerGlobalId, customerName: x.customerName, financialYear, mode: x.orderMode || "SUGGESTED" });
+  if (x.action === "CUSTOMER" && x.customerGlobalId) return homeActionNested("Customers", "Customer360", { customerId: x.customerGlobalId, customerName: x.customerName, financialYear });
+  if (x.action === "LEAD") return homeActionNested("Leads", "LeadList", { initialTab: "leads" });
+  return null;
+}
+
 router.get("/home", async (req, res) => {
   try {
     const financialYear = fyOf(req), now = new Date();
+    const latitude = Number(req.query.latitude ?? req.query.lat), longitude = Number(req.query.longitude ?? req.query.lng ?? req.query.lon);
+    const hasLocation = Number.isFinite(latitude) && Number.isFinite(longitude);
     const { filter } = await visibleCustomerFilter(req, { status: "ACTIVE" });
     const customers = await CustomerLink.find(filter).select("globalCustomerId localName displayIdentifier companyContactNumber ownerMobile contacts addresses creditDays creditLimit accountingProfile salespersonId").lean();
     const ids = customers.map((x) => x.globalCustomerId);
     const { SalesInvoice, SalesOrder, Receipt } = financialModels(req.auth.tenantKey, financialYear);
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1), monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1), todayStart = startOfDay(now), todayEnd = endOfDay(now);
-    const [priority, cash, collectionTarget, monthSalesAgg, todayOrdersAgg, todayCollectionsAgg, targetDoc] = await Promise.all([
+    const { start: fyStart, end: fyEnd } = financialYearBounds(financialYear);
+    const [priority, cash, collectionTarget, monthSalesAgg, todayOrdersAgg, todayCollectionsAgg, targetDoc, fySalesRows, fyCollectionRows, routePlan, market] = await Promise.all([
       collectionPriorityItems({ tenantKey: req.auth.tenantKey, financialYear, customers }),
       cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, at: now }),
       collectionTargetForUser({ tenantKey: req.auth.tenantKey, financialYear, userId: req.auth.sub, at: now }),
@@ -1958,8 +2238,13 @@ router.get("/home", async (req, res) => {
       SalesOrder.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, date: { $gte: todayStart, $lt: todayEnd }, status: { $nin: ["CANCELLED", "REJECTED"] } } }, { $group: { _id: null, sales: { $sum: "$grandTotal" }, orders: { $sum: 1 } } }]),
       Receipt.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", date: { $gte: todayStart, $lt: todayEnd }, ...collectionOwnerFilter(req.auth.sub) } }, { $group: { _id: null, amount: { $sum: "$amount" }, count: { $sum: 1 } } }]),
       Target.findOne({ tenantKey: req.auth.tenantKey, financialYear, level: "USER", entityId: req.auth.sub, status: { $ne: "CANCELLED" } }).lean(),
+      ids.length ? SalesInvoice.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $gte: fyStart, $lt: fyEnd } } }, { $group: { _id: { year: { $year: "$date" }, month: { $month: "$date" } }, amount: { $sum: "$grandTotal" }, count: { $sum: 1 } } }]) : [],
+      ids.length ? Receipt.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $gte: fyStart, $lt: fyEnd } } }, { $group: { _id: { year: { $year: "$date" }, month: { $month: "$date" } }, amount: { $sum: "$amount" }, count: { $sum: 1 } } }]) : [],
+      SalesRoutePlan.findOne({ tenantKey: req.auth.tenantKey, salespersonId: String(req.auth.sub), dateKey: localDateKey() }).sort({ updatedAt: -1 }).lean(),
+      homeLeadMarketContext(req, hasLocation ? latitude : NaN, hasLocation ? longitude : NaN),
     ]);
-    const opportunities = await opportunityItemsForUser({ req, financialYear, limit: 20, customers, priority });
+
+    const opportunities = await opportunityItemsForUser({ req, financialYear, limit: 24, customers, priority });
     const salesMonth = money(monthSalesAgg[0]?.sales || 0), invoicesMonth = num(monthSalesAgg[0]?.invoices), todayOrderSales = money(todayOrdersAgg[0]?.sales || 0), todayOrders = num(todayOrdersAgg[0]?.orders);
     const todayCollections = money(todayCollectionsAgg[0]?.amount || 0), todayReceiptCount = num(todayCollectionsAgg[0]?.count);
     const monthlyNames = [monthKey(now), String(now.getMonth()+1).padStart(2,"0"), now.toLocaleString("en-US",{month:"long"}), now.toLocaleString("en-US",{month:"short"})].map((x)=>x.toLowerCase());
@@ -1971,18 +2256,122 @@ router.get("/home", async (req, res) => {
     const promisedToday = money(priority.reduce((s, x) => s + num(x.promisedToday), 0));
     const outstanding = money(priority.reduce((s, x) => s + Math.max(0, num(x.outstanding)), 0));
     const brokenPromises = priority.filter((x) => x.brokenPromiseAmount > 0).length;
-    const top = opportunities[0] || null;
-    const headline = top ? top.title : "You're caught up";
-    const headlineSub = top ? top.subtitle : "No urgent sales or collection action is waiting right now.";
+
+    const salesByMonth = new Map(fySalesRows.map((x) => [`${x._id.year}-${String(x._id.month).padStart(2,"0")}`, x]));
+    const receiptByMonth = new Map(fyCollectionRows.map((x) => [`${x._id.year}-${String(x._id.month).padStart(2,"0")}`, x]));
+    const fiscalMonths = salesCollectionPeriodBuckets(financialYear, "MONTHLY").map((m) => ({
+      ...m,
+      sales: money(salesByMonth.get(m.key)?.amount || 0), collections: money(receiptByMonth.get(m.key)?.amount || 0),
+      invoiceCount: num(salesByMonth.get(m.key)?.count), receiptCount: num(receiptByMonth.get(m.key)?.count),
+    }));
+    const periodComparisons = periodSummaryFromMonthly(fiscalMonths, financialYear, now);
+
+    const aging = { "0_7": 0, "8_15": 0, "16_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0, opening_or_unallocated: 0 };
+    for (const row of priority) for (const [key, value] of Object.entries(row.aging || {})) aging[key] = money(num(aging[key]) + num(value));
+    const topPendingParties = [...priority].filter((x) => num(x.outstanding) > 0).sort((a,b) => num(b.outstanding) - num(a.outstanding) || num(b.oldestPendingDays) - num(a.oldestPendingDays)).slice(0,5);
+
+    const openStops = (routePlan?.stops || []).filter((x) => !["COMPLETED","SKIPPED"].includes(upper(x.status)));
+    const nextStop = openStops[0] || null;
+    const routeProgress = routePlan?.stops?.length ? Math.round(((num(routePlan.completedStops)+num(routePlan.skippedStops))/routePlan.stops.length)*100) : 0;
+
+    const routeCandidate = routePlan && ["READY","IN_PROGRESS"].includes(upper(routePlan.status)) && nextStop ? {
+      id: `ROUTE-${routePlan._id}`, type: "ROUTE_NEXT_STOP", score: 128, priority: "HIGH", title: routePlan.status === "IN_PROGRESS" ? "Continue today's route" : "Start today's route",
+      subtitle: `${nextStop.customerNameSnapshot || "Next customer"} • ${nextStop.reason || "Planned field visit"}`, amount: num(nextStop.opportunityAmount), actionDescriptor: homeActionRoute("PriorityRoute")
+    } : null;
+    const topOpportunity = opportunities[0] || null;
+    const heroSource = routeCandidate && (!topOpportunity || num(routeCandidate.score) >= num(topOpportunity.score)) ? routeCandidate : topOpportunity;
+    const heroAction = heroSource?.actionDescriptor || actionForOpportunity(heroSource, financialYear) || homeActionRoute("PriorityCenter");
+    const hour = now.getHours();
+    const greeting = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
+
+    const sections = [];
+    const push = (section) => { if (section && (!section.items || section.items.length) && (!section.cards || section.cards.length)) sections.push(section); };
+
+    const urgentCards = [];
+    if (brokenPromises) urgentCards.push({ id:"broken-promises", icon:"handshake-outline", label:"Broken Promises", value:brokenPromises, format:"NUMBER", sub:`${priority.filter(x=>x.brokenPromiseAmount>0).length} party(s) need recovery`, tone:"CRITICAL", size:"HALF", action:homeActionNested("Customers","CollectionPriority",{financialYear}) });
+    if (overdue > 0) urgentCards.push({ id:"overdue", icon:"alert-circle-outline", label:"Overdue", value:overdue, format:"MONEY", sub:`${priority.filter(x=>x.overdueAmount>0).length} party(s)`, tone:"HIGH", size:"HALF", action:homeActionNested("Customers","CollectionPriority",{financialYear}) });
+    if (market.nearestLead) urgentCards.push({ id:"nearest-lead", icon:"map-marker-star-outline", label:"Nearest Lead", value:market.nearestLead.companyName || market.nearestLead.contactPerson || "Lead", format:"TEXT", sub:`${market.nearestLead.distanceKm.toFixed(1)} km • ${market.nearestLead.pincode || "No pincode"}`, tone:"TEAL", size:"FULL", action:homeActionNested("Leads","LeadList",{initialTab:"leads",initialPincode:market.nearestLead.pincode||"",initialSearch:market.nearestLead.companyName||market.nearestLead.mobile||"",focusLeadId:String(market.nearestLead._id)}) });
+    if (routePlan && ["READY","IN_PROGRESS"].includes(upper(routePlan.status))) urgentCards.push({ id:"route", icon:"map-marker-path", label:routePlan.status === "IN_PROGRESS" ? "Route In Progress" : "Route Ready", value:`${routePlan.completedStops||0}/${routePlan.stops?.length||0}`, format:"TEXT", sub:nextStop?`Next: ${nextStop.customerNameSnapshot}`:`${routeProgress}% completed`, tone:"GOOD", size:"FULL", action:homeActionRoute("PriorityRoute") });
+    push({ id:"act-now", kind:"METRIC_GRID", title:"Act Now", priority:110, cards:urgentCards });
+
+    push({ id:"today", kind:"METRIC_GRID", title:"Today", priority:95, cards:[
+      { id:"orders",icon:"cart-check",label:"Orders Booked",value:todayOrderSales,format:"MONEY",sub:`${todayOrders} order(s)`,tone:todayOrders?"GOOD":"MUTED",size:"HALF",action:homeActionRoute("Customers") },
+      { id:"collections",icon:"cash-check",label:"Collected",value:todayCollections,format:"MONEY",sub:`${todayReceiptCount} receipt(s)`,tone:todayCollections?"GOOD":"MUTED",size:"HALF",action:homeActionRoute("Cash") },
+      ...(promisedToday>0?[{ id:"promised",icon:"hand-coin-outline",label:"Promised Today",value:promisedToday,format:"MONEY",sub:"Follow up before day end",tone:"HIGH",size:"HALF",action:homeActionNested("Customers","CollectionPriority",{financialYear}) }]:[]),
+      { id:"cash",icon:"wallet-outline",label:"Cash With Me",value:cash.cashInHand,format:"MONEY",sub:num(cash.cashInHand)>0?"Physical cash responsibility":"No cash pending",tone:num(cash.cashInHand)>0?"TEAL":"MUTED",size:"HALF",action:homeActionRoute("Cash") },
+    ]});
+
+    const currentComparison = periodComparisons[0] || {};
+    const comparisonPriority = num(currentComparison.sales) > 0 && num(currentComparison.collectionPct) < 70 ? 103 : num(currentComparison.gap) > 0 ? 96 : 86;
+    push({ id:"sales-collection", kind:"PERIOD_COMPARE", title:"Sales vs Collection", subtitle:"Tap any period for complete analysis and party drill-down", priority:comparisonPriority,
+      action:homeActionRoute("SalesCollectionAnalytics"), items:periodComparisons.map((x)=>({ ...x, action:homeActionRoute("SalesCollectionAnalytics",{initialPeriod:x.id}) })) });
+
+    const ageLabels = {"0_7":"0-7 Days","8_15":"8-15 Days","16_30":"16-30 Days","31_60":"31-60 Days","61_90":"61-90 Days","90_plus":"90+ Days",opening_or_unallocated:"Opening / Legacy"};
+    const ageOrder = ["90_plus","61_90","31_60","16_30","8_15","0_7","opening_or_unallocated"];
+    const agingCards = ageOrder.filter((key)=>num(aging[key])>0).map((key)=>({ id:key,label:ageLabels[key],value:money(aging[key]),format:"MONEY",tone:["90_plus","61_90"].includes(key)?"CRITICAL":["31_60","16_30"].includes(key)?"HIGH":"TEAL",size:"HALF",action:homeActionRoute("SalesCollectionAnalytics",{initialPeriod:"MONTHLY"}) }));
+    const agingPriority = num(aging["90_plus"]) > 0 ? 106 : num(aging["61_90"]) > 0 ? 102 : overdue > 0 ? 97 : 78;
+    push({ id:"pending-age",kind:"METRIC_GRID",title:"Pending Amount by Age",subtitle:`Total outstanding ${outstanding.toLocaleString("en-IN")}`,priority:agingPriority,cards:agingCards });
+
+    const topPendingPriority = topPendingParties.some((x)=>num(x.maxOverdueDays)>=60) ? 104 : overdue > 0 ? 94 : 76;
+    push({ id:"top-pending",kind:"LIST",title:"Top Pending Parties",subtitle:"Tap party name to open ledger",priority:topPendingPriority,items:topPendingParties.map((row)=>({
+      id:row.customer.id,title:row.customer.name,subtitle:`${row.openBills||0} open bill(s) • Oldest ${row.oldestPendingDays||0} days${row.maxOverdueDays?` • ${row.maxOverdueDays}d overdue`:""}`,
+      value:row.outstanding,format:"MONEY",badge:row.maxOverdueDays?`${row.maxOverdueDays}d overdue`:`${row.oldestPendingDays||0}d pending`,tone:row.maxOverdueDays>60?"CRITICAL":row.maxOverdueDays>15?"HIGH":"TEAL",
+      action:homeActionNested("Customers","CustomerLedger",{customerId:row.customer.id,customerName:row.customer.name,financialYear})
+    })) });
+
+    const marketItems = market.areas.map((x)=>({
+      id:x.pincode,title:x.pincode === "NO_PINCODE" ? "Pincode Missing" : x.pincode,subtitle:[x.area,x.city,x.district,x.state].filter(Boolean).join(" • ") || "Market area",
+      value:x.count,format:"NUMBER",badge:[x.highPriority?`${x.highPriority} high`:"",x.followUpDue?`${x.followUpDue} follow-up due`:""].filter(Boolean).join(" • "),tone:x.highPriority?"HIGH":x.followUpDue?"TEAL":"MUTED",
+      action:x.pincode !== "NO_PINCODE"?homeActionNested("Leads","LeadList",{initialTab:"leads",initialPincode:x.pincode}):homeActionNested("Leads","LeadList",{initialTab:"leads"})
+    }));
+    const marketUrgent = market.areas.reduce((a,x)=>a+num(x.highPriority)+num(x.followUpDue),0);
+    const marketPriority = market.nearestLead && num(market.nearestLead.distanceKm) <= 2 ? 101 : marketUrgent > 0 ? 95 : 84;
+    push({ id:"market",kind:"MARKET",title:"Lead Market Areas",subtitle:`${market.totalOpenLeads} open lead(s) across ${market.totalAreas} pincode area(s)`,priority:marketPriority,nearest:market.nearestLead?{
+      title:market.nearestLead.companyName||market.nearestLead.contactPerson||"Nearest lead",subtitle:`${market.nearestLead.distanceKm.toFixed(1)} km away • ${market.nearestLead.pincode||""}`,tone:"TEAL",
+      action:homeActionNested("Leads","LeadList",{initialTab:"leads",initialPincode:market.nearestLead.pincode||"",initialSearch:market.nearestLead.companyName||market.nearestLead.mobile||"",focusLeadId:String(market.nearestLead._id)})
+    }:null,items:marketItems });
+
+    const targetCards = [];
+    if (salesTarget>0) targetCards.push({id:"sales-target",label:"Sales Target",current:salesMonth,target:salesTarget,pct:salesAchievementPct,remaining:salesRemaining,format:"MONEY",tone:salesAchievementPct>=100?"GOOD":salesAchievementPct<60?"HIGH":"TEAL",action:homeActionRoute("SalesCollectionAnalytics",{initialPeriod:"MONTHLY"})});
+    if (collectionTarget?.configured) targetCards.push({id:"collection-target",label:"Collection Target",current:num(collectionTarget.achieved),target:num(collectionTarget.target),pct:num(collectionTarget.achievementPct),remaining:num(collectionTarget.remaining),format:"MONEY",tone:num(collectionTarget.achievementPct)>=100?"GOOD":num(collectionTarget.achievementPct)<60?"HIGH":"TEAL",action:homeActionRoute("SalesCollectionAnalytics",{initialPeriod:"MONTHLY"})});
+    const daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+    const expectedPacePct = daysInMonth ? now.getDate()/daysInMonth*100 : 0;
+    const targetBehind = (salesTarget>0 && salesAchievementPct+12<expectedPacePct) || (collectionTarget?.configured && num(collectionTarget.achievementPct)+12<expectedPacePct);
+    push({id:"targets",kind:"PROGRESS",title:"Target Pace",priority:targetBehind?99:82,items:targetCards});
+
+    push({id:"opportunities",kind:"LIST",title:"Best Opportunities",subtitle:`${opportunities.length} ranked sales / collection opportunity signal(s)`,priority:80,items:opportunities.slice(0,8).map((x)=>({
+      id:x.id,title:x.title,subtitle:x.subtitle,value:num(x.amount),format:num(x.amount)>0?"MONEY":"",badge:x.priority||"",tone:x.priority||"TEAL",action:actionForOpportunity(x,financialYear)
+    })).filter((x)=>x.action)});
+
+    const quick = [
+      overdue>0?{id:"collection",icon:"account-cash-outline",label:"Collection Priority",tone:"HIGH",action:homeActionNested("Customers","CollectionPriority",{financialYear})}:null,
+      market.totalOpenLeads>0?{id:"lead-areas",icon:"map-marker-radius-outline",label:"Leads by Pincode",tone:"TEAL",action:homeActionNested("Leads","LeadList",{initialTab:"leads",initialMarketMode:"AREA"})}:null,
+      {id:"analytics",icon:"chart-bar",label:"Sales vs Collection",tone:"TEAL",action:homeActionRoute("SalesCollectionAnalytics")},
+      {id:"route",icon:"map-marker-path",label:routePlan?"Today's Route":"Build Daily Route",tone:routePlan?"GOOD":"TEAL",action:homeActionRoute("PriorityRoute")},
+      {id:"cash",icon:"wallet-outline",label:"Cash & Collection",tone:num(cash.cashInHand)>0?"HIGH":"TEAL",action:homeActionRoute("Cash")},
+      {id:"priority",icon:"bell-alert-outline",label:"Priority Center",tone:"TEAL",action:homeActionRoute("PriorityCenter")},
+    ].filter(Boolean);
+    push({id:"quick-actions",kind:"ACTION_GRID",title:"Quick Actions",priority:50,items:quick});
+
+    sections.sort((a,b)=>num(b.priority)-num(a.priority));
+    const heroTitle = heroSource?.title || "You're caught up";
+    const heroSubtitle = heroSource?.subtitle || "No urgent sales or collection action is waiting right now.";
     return ok(res, {
       financialYear,
-      today: { orderSales: todayOrderSales, orders: todayOrders, collections: todayCollections, receipts: todayReceiptCount, promisedToday, cashInHand: cash.cashInHand },
-      month: { sales: salesMonth, invoices: invoicesMonth, salesTarget, salesRemaining, salesAchievementPct, collectionTarget },
-      receivables: { outstanding, overdue, priorityCustomers: priority.length, brokenPromises },
+      generatedAt:new Date(),
+      context:{greeting,role:upper(req.auth.role||req.auth.appRoleCode||"SALES_PERSON"),locationAvailable:hasLocation,dayPart:hour<12?"MORNING":hour<17?"AFTERNOON":"EVENING"},
+      hero:{eyebrow:`${greeting.toUpperCase()} • DYNAMIC SALES HOME`,title:heroTitle,subtitle:heroSubtitle,tone:heroSource?.priority||"TEAL",action:heroAction,confidence:heroSource?.confidence||null},
+      dynamicLayout:{version:2,sections},
+      // Backward-compatible values are retained for older app builds.
+      today:{orderSales:todayOrderSales,orders:todayOrders,collections:todayCollections,receipts:todayReceiptCount,promisedToday,cashInHand:cash.cashInHand},
+      month:{sales:salesMonth,invoices:invoicesMonth,salesTarget,salesRemaining,salesAchievementPct,collectionTarget},
+      receivables:{outstanding,overdue,priorityCustomers:priority.length,brokenPromises},
       cash,
-      nextBestAction: top ? { ...top, headline, headlineSub } : { headline, headlineSub },
-      opportunities: opportunities.slice(0, 10),
-      opportunityCount: opportunities.length,
+      market,
+      route:{plan:routePlan||null,progressPct:routeProgress,nextStop:nextStop||null},
+      salesCollection:{periods:periodComparisons,aging},
+      nextBestAction:heroSource?{...heroSource,headline:heroTitle,headlineSub:heroSubtitle}:{headline:heroTitle,headlineSub:heroSubtitle},
+      opportunities:opportunities.slice(0,10),opportunityCount:opportunities.length,
     });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });

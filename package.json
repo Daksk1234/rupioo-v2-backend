@@ -1,0 +1,36 @@
+{
+  "name": "rupioo-global-v2-backend",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "seed": "node src/seed/seed.js",
+    "check": "node --check src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^3.2.2",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.2.1",
+    "g": "^2.0.1",
+    "googleapis": "^144.0.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.9.4",
+    "morgan": "^1.10.1",
+    "multer": "^2.3.0",
+    "nanoid": "^5.1.5",
+    "nodemailer": "^7.0.6",
+    "nodemon": "^3.1.14",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.17.2",
+    "qrcode": "^1.5.4",
+    "xlsx": "^0.18.5"
+  }
+}

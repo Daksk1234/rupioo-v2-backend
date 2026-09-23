@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import crypto from "crypto";
-import { MailQueue } from "../../model/mailQueue.model.js";
+import { MailQueue } from "../../models/mailQueue.model.js";
 import { encryptBuffer, decryptBuffer } from "./crypto.js";
 import { sendCompanyMail } from "./mail.service.js";
 

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import mongoose from "mongoose";
-import { User } from "../model/user.model.js";
-import { MailConnection } from "../model/mailConnection.model.js";
+import { User } from "../models/index.js";
+import { MailConnection } from "../models/mailConnection.model.js";
 import { encryptSecret } from "../services/mail/crypto.js";
 
 const uri = process.env.MONGO_URI || process.env.MONGODB_URI;

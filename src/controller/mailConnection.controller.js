@@ -1,6 +1,6 @@
 import Jwt from "jsonwebtoken";
-import { MailConnection } from "../model/mailConnection.model.js";
-import { MailQueue } from "../model/mailQueue.model.js";
+import { MailConnection } from "../models/mailConnection.model.js";
+import { MailQueue } from "../models/mailQueue.model.js";
 import { detectMailProvider, normalizeEmail, isValidEmail } from "../services/mail/providerDetection.service.js";
 import {
   exchangeGoogleMailCode,

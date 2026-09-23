@@ -23,9 +23,11 @@ const customerContact = (customer = {}) => {
 };
 const customerAddress = (customer = {}, invoice = {}) => {
   const addresses = Array.isArray(customer.addresses) ? customer.addresses : [];
-  const billing = addresses.find((x) => String(x?.type || "").toUpperCase() === "BILLING") || addresses[0] || {};
+  const billing = addresses.find((x) => String(x?.type || "BILLING").toUpperCase() === "BILLING") || {};
   return {
-    address: first(invoice.addressSnapshot, billing.address, customer.ownerAddress),
+    // Invoice print must always prefer the customer's principal/business (BILLING) address.
+    // addressSnapshot is only a fallback for historical records that have no billing address.
+    address: first(billing.address, customer.ownerAddress, invoice.addressSnapshot),
     city: first(billing.city, customer.ownerCity),
     state: first(billing.state, customer.ownerState),
     pincode: first(billing.pincode, customer.ownerPincode),
@@ -349,6 +351,11 @@ function addContinuationPage(doc, ctx, pageNo) {
 }
 
 export async function buildMasterSalesInvoicePdf({ invoice = {}, company = {}, customer = {}, bank = {}, ledgerSigned = null, lastPayment = null, companyLogo = null, signature = null, appLogo = null } = {}) {
+  // Database lookups return null when optional profile/bank records are absent.
+  // Parameter defaults only handle undefined, so normalize before reading fields.
+  company = company ?? {};
+  customer = customer ?? {};
+  bank = bank ?? {};
   const companyName = first(company.companyName, company.tradeName, "Company");
   const upiId = text(bank.upiId);
   let qrBuffer = null;

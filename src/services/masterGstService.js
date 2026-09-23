@@ -11,13 +11,12 @@ function serviceError(message, status = 502, details = undefined) {
 
 export function configurationStatus() {
   const missing = [];
-  if (!env.masterGst.email) missing.push("MASTERGST_EMAIL");
-  if (!env.masterGst.clientId) missing.push("MASTERGST_CLIENT_ID");
-  if (!env.masterGst.clientSecret) missing.push("MASTERGST_CLIENT_SECRET");
+  if (!env.appyflow.keySecret) missing.push("APPYFLOW_KEY_SECRET");
   return {
+    provider: "APPYFLOW",
     configured: missing.length === 0,
     missing,
-    baseUrl: env.masterGst.baseUrl
+    baseUrl: env.appyflow.gstUrl,
   };
 }
 
@@ -29,9 +28,9 @@ function assertConfigured() {
   const status = configurationStatus();
   if (!status.configured) {
     throw serviceError(
-      `MasterGST is not configured. Missing: ${status.missing.join(", ")}. ` +
-      "If you use Docker, rebuild/restart after updating backend/.env.",
-      503
+      `AppyFlow GST lookup is not configured. Missing: ${status.missing.join(", ")}. ` +
+        "Add the value to backend/.env and restart the backend.",
+      503,
     );
   }
 }
@@ -48,49 +47,25 @@ function assertValidGstin(gstin) {
   return value;
 }
 
-function maybeParseJson(value) {
-  if (typeof value !== "string") return value;
-  const text = value.trim();
-  if (!text) return value;
-  if (!(text.startsWith("{") || text.startsWith("["))) return value;
-  try { return JSON.parse(text); } catch { return value; }
-}
-
-function unwrapData(payload) {
-  let current = payload;
-  for (let i = 0; i < 4; i += 1) {
-    if (!current || typeof current !== "object") break;
-    if (!("data" in current)) break;
-    const next = maybeParseJson(current.data);
-    if (next === undefined || next === null || next === "") break;
-    current = next;
-  }
-  return maybeParseJson(current);
-}
-
 function providerMessage(payload) {
-  if (!payload) return "Unknown MasterGST error";
+  if (!payload) return "Unknown AppyFlow error";
   if (typeof payload === "string") return payload;
   return (
     payload?.error?.message ||
-    payload?.error?.desc ||
+    payload?.error ||
     payload?.message ||
-    payload?.status_desc ||
-    payload?.statusDesc ||
-    "MasterGST request failed"
+    payload?.msg ||
+    payload?.statusMessage ||
+    "AppyFlow GST request failed"
   );
 }
 
-async function publicGet(pathname, query) {
+async function appyflowGet(gstin) {
   assertConfigured();
-
-  const url = new URL(pathname, env.masterGst.baseUrl);
-  url.searchParams.set("email", env.masterGst.email);
-  Object.entries(query || {}).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  });
+  const value = assertValidGstin(gstin);
+  const url = new URL(env.appyflow.gstUrl);
+  url.searchParams.set("key_secret", env.appyflow.keySecret);
+  url.searchParams.set("gstNo", value);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000);
@@ -99,106 +74,147 @@ async function publicGet(pathname, query) {
   try {
     response = await fetch(url, {
       method: "GET",
-      headers: {
-        Accept: "application/json",
-        client_id: env.masterGst.clientId,
-        client_secret: env.masterGst.clientSecret
-      },
-      signal: controller.signal
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
     });
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw serviceError("MasterGST request timed out after 15 seconds.", 504);
+      throw serviceError("AppyFlow GST request timed out after 15 seconds.", 504);
     }
-    throw serviceError(`Unable to connect to MasterGST: ${error.message}`, 502);
+    throw serviceError(`Unable to connect to AppyFlow: ${error.message}`, 502);
   } finally {
     clearTimeout(timer);
   }
 
   const text = await response.text();
   let payload;
-  try { payload = text ? JSON.parse(text) : {}; } catch { payload = { message: text }; }
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { message: text };
+  }
 
   if (!response.ok) {
     throw serviceError(
-      `MasterGST returned HTTP ${response.status}: ${providerMessage(payload)}`,
-      response.status >= 500 ? 502 : 400
+      `AppyFlow returned HTTP ${response.status}: ${providerMessage(payload)}`,
+      response.status >= 500 ? 502 : 400,
     );
   }
 
-  // MasterGST can return HTTP 200 while reporting a provider-level error.
-  const hasUsefulData = payload?.data !== undefined && payload?.data !== null && payload?.data !== "";
-  if (payload?.error && !hasUsefulData) {
-    throw serviceError(providerMessage(payload), 400);
+  if (!payload?.taxpayerInfo) {
+    throw serviceError(providerMessage(payload) || "GSTIN details were not found.", 404);
   }
 
   return payload;
 }
 
-function addressToText(addr) {
-  if (!addr) return "";
-  if (typeof addr === "string") return addr;
-  const ordered = [
-    addr.bno, addr.bnm, addr.flno, addr.st, addr.loc, addr.dst,
-    addr.city, addr.stcd, addr.pncd
-  ];
-  return ordered.filter(Boolean).join(", ");
+function text(value) {
+  return String(value ?? "").trim();
 }
 
-function normalizeTaxpayer(rawPayload, requestedGstin) {
-  const data = unwrapData(rawPayload) || {};
-  const principalAddress = data?.pradr?.addr || data?.principalAddress || data?.address || null;
+// The customer form uses this exact readable order:
+// Floor, building/door no., street, building name, locality, location, district.
+function addressToText(addr = {}) {
+  return [
+    addr.flno,
+    addr.bno,
+    addr.st,
+    addr.bnm,
+    addr.locality,
+    addr.loc,
+    addr.dst,
+  ]
+    .map(text)
+    .filter(Boolean)
+    .join(", ");
+}
+
+function geoFromAddress(addr = {}) {
+  const latitude = Number(addr.lt);
+  const longitude = Number(addr.lg);
+  return {
+    latitude: Number.isFinite(latitude) ? latitude : null,
+    longitude: Number.isFinite(longitude) ? longitude : null,
+  };
+}
+
+function normalizeTaxpayer(payload, requestedGstin) {
+  const data = payload?.taxpayerInfo || {};
+  const principalAddressRaw = data?.pradr?.addr || {};
   const additionalPlaces = Array.isArray(data?.adadr) ? data.adadr : [];
-  const gstin = normalizeGstin(data?.gstin || data?.gstinNo || data?.gstinno || requestedGstin);
+  const additionalAddressRaw = additionalPlaces[0]?.addr || {};
+  const gstin = normalizeGstin(data?.gstin || requestedGstin);
+  const natureOfBusiness = Array.isArray(data?.nba)
+    ? data.nba.map(text).filter(Boolean)
+    : data?.nba
+      ? [text(data.nba)]
+      : [];
+  const filingFrequency = payload?.compliance?.filingFrequency ?? null;
 
   return {
-    source: "MASTERGST",
+    source: "APPYFLOW",
     gstin,
-    pan: gstin.length === 15 ? gstin.slice(2, 12) : "",
+    pan: text(data?.panNo) || (gstin.length === 15 ? gstin.slice(2, 12) : ""),
     stateCode: gstin.slice(0, 2),
-    legalName: data?.lgnm || data?.legalName || data?.legal_name || data?.taxpayerName || "",
-    tradeName: data?.tradeNam || data?.tradeName || data?.trade_name || "",
-    status: data?.sts || data?.status || data?.gstStatus || "",
-    taxpayerType: data?.dty || data?.taxpayerType || data?.taxpayer_type || "",
-    constitution: data?.ctb || data?.constitution || data?.constitutionOfBusiness || "",
-    registrationDate: data?.rgdt || data?.registrationDate || data?.registration_date || null,
-    cancellationDate: data?.cxdt || data?.cancellationDate || data?.cancellation_date || null,
-    jurisdictionState: data?.stj || data?.stateJurisdiction || "",
-    jurisdictionCentre: data?.ctj || data?.centreJurisdiction || "",
-    natureOfBusiness: data?.nba || data?.natureOfBusiness || [],
-    principalAddress: addressToText(principalAddress),
-    principalAddressRaw: principalAddress,
+
+    // GST/legal identity
+    legalName: text(data?.lgnm),
+    ownerName: text(data?.lgnm),
+    tradeName: text(data?.tradeNam),
+    businessName: text(data?.tradeNam),
+    status: text(data?.sts),
+    taxpayerType: text(data?.dty),
+    constitution: text(data?.ctb),
+    registrationDate: text(data?.rgdt) || null,
+    cancellationDate: text(data?.cxdt) || null,
+    jurisdictionState: text(data?.stj),
+    jurisdictionCentre: text(data?.ctj),
+    jurisdictionStateCode: text(data?.stjCd),
+    jurisdictionCentreCode: text(data?.ctjCd),
+    natureOfBusiness,
+    businessType: natureOfBusiness.join(", "),
+    eInvoiceStatus: text(data?.einvoiceStatus),
+    filingFrequency,
+
+    // Principal/business address
+    principalAddress: addressToText(principalAddressRaw),
+    principalAddressRaw,
+    principalGeo: geoFromAddress(principalAddressRaw),
+
+    // First additional place of business (the UI has one Additional Address box).
     additionalPlaces,
-    eInvoiceStatus: data?.einvoiceStatus || data?.einvStatus || null,
-    rawStatusCode: rawPayload?.status_cd ?? rawPayload?.statusCode ?? null,
-    rawStatusDescription: rawPayload?.status_desc ?? rawPayload?.statusDesc ?? null
+    additionalAddress: addressToText(additionalAddressRaw),
+    additionalAddressRaw,
+    additionalGeo: geoFromAddress(additionalAddressRaw),
+
+    compliance: payload?.compliance || {},
+    filing: Array.isArray(payload?.filing) ? payload.filing : [],
   };
 }
 
 export async function searchTaxpayer(gstin) {
   const value = assertValidGstin(gstin);
-  const payload = await publicGet("/public/search", { gstin: value });
+  const payload = await appyflowGet(value);
   const taxpayer = normalizeTaxpayer(payload, value);
 
   if (!taxpayer.legalName && !taxpayer.tradeName && !taxpayer.status) {
-    const msg = providerMessage(payload);
-    throw serviceError(`GSTIN lookup returned no taxpayer details${msg ? `: ${msg}` : ""}`, 404);
+    throw serviceError("GSTIN lookup returned no taxpayer details.", 404);
   }
-
   return taxpayer;
 }
 
+// Kept for the existing customer GST-verification workflow.
+// AppyFlow already returns compliance/filing data in the same GST response.
 export async function getReturnFilingStatus(gstin) {
   const value = assertValidGstin(gstin);
-  const payload = await publicGet("/public/rettrack", { gstin: value });
-  const data = unwrapData(payload);
+  const payload = await appyflowGet(value);
+  const frequency = payload?.compliance?.filingFrequency ?? null;
   return {
-    source: "MASTERGST",
+    source: "APPYFLOW",
     gstin: value,
-    filingStatus: data?.filingStatus || data?.status || data?.returnStatus || "UNKNOWN",
-    data,
-    rawStatusCode: payload?.status_cd ?? payload?.statusCode ?? null,
-    rawStatusDescription: payload?.status_desc ?? payload?.statusDesc ?? null
+    filingStatus: frequency || "UNKNOWN",
+    filingFrequency: frequency,
+    data: Array.isArray(payload?.filing) ? payload.filing : [],
   };
 }
 
@@ -206,6 +222,6 @@ export async function searchHsn(query) {
   return {
     source: configured() ? "PROVIDER_ADAPTER_REQUIRED" : "NOT_CONFIGURED",
     query,
-    items: []
+    items: [],
   };
 }

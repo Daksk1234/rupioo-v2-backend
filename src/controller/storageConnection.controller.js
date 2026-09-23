@@ -1,6 +1,6 @@
 import { google } from "googleapis";
-import { StorageConnection } from "../model/storageConnection.model.js";
-import { StorageObject } from "../model/storageObject.model.js";
+import { StorageConnection } from "../models/storageConnection.model.js";
+import { StorageObject } from "../models/storageObject.model.js";
 import { encryptSecret, decryptSecret } from "../services/storage/crypto.js";
 import {
   ensureGoogleFolder,

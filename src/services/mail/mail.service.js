@@ -1,4 +1,4 @@
-import { MailConnection } from "../../model/mailConnection.model.js";
+import { MailConnection } from "../../models/mailConnection.model.js";
 import { sendWithGoogle, testGoogleConnection } from "./googleMail.service.js";
 import {
   sendWithMicrosoft,

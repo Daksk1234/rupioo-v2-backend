@@ -19,6 +19,7 @@ import otpRoutes from "./routes/otp.js";
 import fileRoutes from "./routes/files.js";
 import genericRoutes from "./routes/generic.js";
 import transactionRoutes from "./routes/transactions.js";
+import salesInvoiceBulkRoutes from "./routes/salesInvoiceBulk.js";
 import referenceRoutes from "./routes/reference.js";
 import accessRoutes from "./routes/access.js";
 import employeeRoutes from "./routes/employees.js";
@@ -34,6 +35,8 @@ import documentAiRoutes from "./routes/documentAi.js";
 import migrationRoutes from "./routes/migration.js";
 import storageRoutes from "./routes/storage.js";
 import salesAppRoutes from "./routes/salesApp.js";
+import orderFlowRoutes from "./routes/orderFlow.js";
+import purchaseAiRoutes, { vendorRouter as purchaseAiVendorRoutes, startPurchaseAiAutomation } from "./routes/purchaseAi.js";
 
 await connectDb();
 const app = express();
@@ -50,6 +53,40 @@ app.use("/api/registration", registrationRoutes);
 app.use("/api/profile", optionalAuth, profileRoutes);
 // Storage OAuth callbacks and Superadmin/Master storage setup use their own auth guard.
 app.use("/api/storage", storageRoutes);
+
+// IMPORTANT: Order Flow is mounted BEFORE the generic /api permission middleware
+// and BEFORE the broad /api/sales-app router. This guarantees that requests like
+// GET /api/sales-app/order-flow/orders reach this router first. The orderFlow
+// router still performs its own requireAuth check for all business endpoints.
+app.get("/api/sales-app/order-flow/health", (_req, res) =>
+  res.json({
+    ok: true,
+    module: "order-flow",
+    mount: "server-priority",
+    build: "2026-09-20-priority-mount",
+    time: new Date().toISOString(),
+  }),
+);
+app.use("/api/sales-app/order-flow", orderFlowRoutes);
+// Backward-compatible alias for older frontend/mobile builds.
+app.use("/api/order-flow", orderFlowRoutes);
+// Vendor Portal is public only through its signed vendor token. It must be mounted before company auth guards.
+app.use("/api/purchase-ai/vendor", purchaseAiVendorRoutes);
+
+// Sales Invoice Bulk is mounted before the generic /api guard and before the large
+// transactions router. The bulk router performs its own authentication and DMS checks.
+// This keeps LOAD XLS / MANUAL MAPPING available through one deterministic route.
+app.get("/api/transactions/sales-invoices/bulk-health-live", (_req, res) =>
+  res.json({
+    ok: true,
+    module: "sales-invoice-bulk",
+    build: "2026-09-20-manual-mapping-v7",
+    mode: "LOAD XLS -> MANUAL PARTY/PRODUCT MAP -> VALIDATE -> POST",
+    time: new Date().toISOString(),
+  }),
+);
+app.use("/api/transactions/sales-invoices", salesInvoiceBulkRoutes);
+
 // Resolve the signed company session once, then enforce the Plan Group's page/action ceiling across business APIs.
 app.use("/api", optionalAuth, companyPermissionGuard);
 app.use("/api/master", masterRoutes);
@@ -73,8 +110,15 @@ app.use("/api/files", fileRoutes);
 app.use("/api/document-ai", documentAiRoutes);
 app.use("/api/migration", migrationRoutes);
 app.use("/api/transactions", transactionRoutes);
+app.use("/api/purchase-ai", purchaseAiRoutes);
 app.use("/api/sales-app", salesAppRoutes);
 app.use("/api/modules", genericRoutes);
+
+
+// Recalculate AI purchase triggers in the background. The scan is idempotent and
+// preserves buyer-edited quantities while refreshing AI-owned recommendations.
+startPurchaseAiAutomation();
+
 app.use(errorHandler);
 app.listen(env.port, () =>
   console.log(`Rupioo Global V2 API listening on http://localhost:${env.port}`),

@@ -1,6 +1,6 @@
 import { ConfidentialClientApplication } from "@azure/msal-node";
 import { Readable } from "stream";
-import { StorageConnection } from "../../model/storageConnection.model.js";
+import { StorageConnection } from "../../models/storageConnection.model.js";
 import { decryptSecret } from "./crypto.js";
 
 const GRAPH = "https://graph.microsoft.com/v1.0";

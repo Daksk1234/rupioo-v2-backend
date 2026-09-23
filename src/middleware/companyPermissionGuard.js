@@ -1,5 +1,6 @@
 import { fail } from "../utils/http.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
+import { isTenantMigrationActive } from "../services/tenantMigrationLock.js";
 import {
   canPageAction,
   REPORT_PERMISSION_MAP,
@@ -43,6 +44,11 @@ function mappedPageForApi(req) {
   if (path.startsWith("/operations/territories")) return "/dms/territories";
   if (path.startsWith("/operations/transporters")) return "/dms/transporters";
 
+  if (path.startsWith("/purchase-ai/grns") || path.startsWith("/purchase-ai/incoming") || path.includes("/qc-complete") || path.includes("/inward") || /^\/purchase-ai\/purchase-orders\/[^/]+\/grn/.test(path)) return "/dms/grn";
+  if (path.startsWith("/purchase-ai/complaints")) return "/dms/purchase-returns";
+  if (path.startsWith("/purchase-ai/accounts")) return "/dms/purchase-invoices";
+  if (path.startsWith("/purchase-ai")) return "/dms/purchase-orders";
+
   if (path.startsWith("/transactions/sales-invoices")) return "/dms/sales-invoices";
   if (path.startsWith("/transactions/purchase-invoices")) return "/dms/purchase-invoices";
   if (path.startsWith("/transactions/receipts")) return "/dms/receipts";
@@ -71,6 +77,9 @@ function reportKeysForName(name) {
 }
 
 export function companyPermissionGuard(req, res, next) {
+  if (req.auth && req.auth.role !== "MASTER" && isTenantMigrationActive(req.auth.originalTenantKey || req.auth.tenantKey)) {
+    return fail(res, "Company GST/tenant migration is in progress. Please retry after it completes.", 423, { code: "TENANT_MIGRATION_RUNNING" });
+  }
   // Authentication routes and public registration are mounted before this
   // middleware. Supporting lookups/files/OTP are intentionally left to their
   // own route security; this guard controls business-page operations.

@@ -5,6 +5,7 @@ import { fail, ok } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
 import { createCompanyBaseLedgers, defaultStakeholderRelationships, ensureLegalAccountTemplates, syncStakeholderLedgers } from "../services/companyAccountingService.js";
+import { gstChangeConfirmation, migrateCompanyTenantKey, normalizeCompanyGstin, validateGstinChangeTarget } from "../services/tenantMigrationService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -83,11 +84,42 @@ router.put("/profile", async (req,res) => {
   if(req.body.companyType && typeOf(req.body.companyType) !== current.companyType) {
     return fail(res,"Legal constitution cannot be changed from normal Edit. Use Change Legal Constitution so history and accounting mappings are preserved.",409);
   }
-  for(const key of ["companyName","tradeName","gstin","pan","registeredAddress","financialYear","status"]) {
+
+  const requestedGstin=normalizeCompanyGstin(req.body.gstin ?? current.gstin ?? current.tenantKey);
+  let tenantMigration=null;
+  const gstChanged=requestedGstin!==normalizeCompanyGstin(current.gstin);
+  const tenantMoveRequested=req.body.migrateTenantData===true&&requestedGstin!==String(current.tenantKey||"").trim();
+  if(gstChanged||tenantMoveRequested){
+    try{await validateGstinChangeTarget({profile:current,nextGstin:requestedGstin});}
+    catch(error){return fail(res,error.message,error.status||409,{code:error.code||"GST_CHANGE_FAILED"});}
+    const gstPan=requestedGstin.slice(2,12);
+    const requestedPan=clean(req.body.pan||gstPan||current.pan).toUpperCase();
+    if(gstPan&&requestedPan!==gstPan)return fail(res,`PAN must match the PAN embedded in GSTIN (${gstPan})`,400);
+    if(gstChanged&&typeof req.body.migrateTenantData!=="boolean")return fail(
+      res,
+      "GST Number changed. Confirm whether all company data should move to the new GST tenantKey.",
+      409,
+      gstChangeConfirmation(current,requestedGstin)
+    );
+    if(tenantMoveRequested){
+      try{tenantMigration=await migrateCompanyTenantKey({companyProfileId:String(current._id),oldTenantKey:current.tenantKey,newGstin:requestedGstin,actorId:req.auth.sub,actorRole:req.auth.role});}
+      catch(error){return fail(res,error.message,error.status||500,{code:error.code||"TENANT_MIGRATION_FAILED"});}
+      current.tenantKey=requestedGstin;
+      req.auth.tenantKey=requestedGstin;
+    }
+    current.gstin=requestedGstin;
+    current.pan=requestedPan;
+  }else if(req.body.pan!==undefined){
+    current.pan=clean(req.body.pan).toUpperCase();
+  }
+
+
+  for(const key of ["companyName","tradeName","registeredAddress","financialYear","status"]) {
     if(req.body[key] !== undefined) current[key] = typeof req.body[key] === "string" ? clean(req.body[key]) : req.body[key];
   }
   await current.save();
-  return ok(res,current,"Company profile updated");
+  const result={...current.toObject(),gstChanged,tenantMigration,tenantKeyChanged:Boolean(tenantMigration?.changed),newTenantKey:tenantMigration?.newTenantKey||current.tenantKey};
+  return ok(res,result,tenantMigration?.changed?"GSTIN updated and company data moved to the new tenantKey":"Company profile updated");
 });
 
 router.post("/change-constitution", async (req,res) => {

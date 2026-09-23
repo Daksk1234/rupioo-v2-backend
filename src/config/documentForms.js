@@ -68,6 +68,32 @@ export const DOCUMENT_FORM_TEMPLATES = {
     sections: [
       { title: "Delivery", fields: [f("invoiceNo","Invoice No.","text",true),f("deliveredAt","Delivery Date / Time","datetime",true),f("deliveredTo","Received By","text",true),f("mobile","Receiver Mobile","phone"),f("vehicleNo","Vehicle No."),f("biltyNo","Bilty / LR No."),f("transporterName","Transporter"),f("deliveryStation","Delivery Station"),f("remarks","Remarks","textarea")] }
     ]
+  },
+  VENDOR_QUOTATION: {
+    type: "VENDOR_QUOTATION", version: 1, title: "Vendor Quotation", subtitle: "Purchase AI • Vendor Document Scan",
+    sections: [
+      { title: "Quotation", fields: [f("quoteNo","Quotation No."),f("quoteDate","Quotation Date","date"),f("validityDate","Valid Till","date"),f("vendorName","Vendor Name"),f("vendorGstin","Vendor GSTIN"),f("creditDays","Credit Days","number"),f("deliveryDays","Delivery Days","number"),f("freight","Freight","number"),f("freightTerms","Freight Terms"),f("grandTotal","Grand Total","number"),f("remarks","Remarks","textarea")] }
+    ],
+    table: { key: "items", title: "Quoted Products", columns: [f("name","Product","text",true),f("sku","SKU"),f("hsnCode","HSN"),f("qty","Qty","number",true),f("unit","Unit"),f("rate","Basic Rate","number",true),f("discountPct","Discount %","number"),f("gstRate","GST %","number"),f("landedRate","Landed Rate","number")] }
+  },
+  LR_COPY: {
+    type: "LR_COPY", version: 1, title: "LR / Bilty / Consignment Note", subtitle: "Purchase AI • Dispatch Scan",
+    sections: [
+      { title: "Transport", fields: [f("transporterName","Transporter","text",true),f("lrNo","LR / CN / Bilty No.","text",true),f("lrDate","LR Date","date"),f("fromLocation","From"),f("destination","Destination"),f("packages","No. of Packages","number"),f("weight","Weight","number"),f("freight","Freight","number"),f("freightMode","Paid / To Pay"),f("vehicleNo","Vehicle No."),f("expectedArrival","Expected Arrival","date"),f("remarks","Remarks","textarea")] }
+    ]
+  },
+  SUPPLIER_INVOICE: {
+    type: "SUPPLIER_INVOICE", version: 1, title: "Supplier Invoice", subtitle: "Purchase AI • Vendor Invoice Scan",
+    sections: [
+      { title: "Invoice", fields: [f("supplierName","Supplier Name","text",true),f("supplierGstin","Supplier GSTIN"),f("invoiceNo","Invoice No.","text",true),f("date","Invoice Date","date",true),f("poNo","PO No."),f("packages","Packages","number"),f("taxableValue","Taxable Value","number"),f("cgstAmount","CGST","number"),f("sgstAmount","SGST","number"),f("igstAmount","IGST","number"),f("freight","Freight","number"),f("invoiceValue","Invoice Value","number"),f("remarks","Remarks","textarea")] }
+    ],
+    table: { key: "items", title: "Invoice Products", columns: [f("name","Product","text",true),f("sku","SKU"),f("hsnCode","HSN"),f("qty","Qty","number",true),f("unit","Unit"),f("rate","Basic Rate","number",true),f("discountPct","Discount %","number"),f("gstRate","GST %","number")] }
+  },
+  SUPPLIER_CREDIT_NOTE: {
+    type: "SUPPLIER_CREDIT_NOTE", version: 1, title: "Supplier Credit Note", subtitle: "Purchase AI • Claim Resolution Scan",
+    sections: [
+      { title: "Credit Note", fields: [f("creditNoteNo","Credit Note No.","text",true),f("date","Credit Note Date","date",true),f("invoiceNo","Against Invoice No."),f("poNo","PO No."),f("taxableValue","Taxable Value","number"),f("tax","GST","number"),f("total","Credit Note Total","number"),f("reason","Reason","textarea")] }
+    ]
   }
 };
 

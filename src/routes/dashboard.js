@@ -6,10 +6,11 @@ import { companyHealth } from "../services/healthService.js";
 import { buildInsights } from "../services/aiService.js";
 import { financialModels } from "../services/accountingService.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
+import { resolveFinancialYear } from "../utils/financialYear.js";
 const router=express.Router();router.use(requireAuth);
 const sum=(arr,key)=>arr.reduce((s,x)=>s+Number(x[key]||0),0);
 router.get("/",async(req,res)=>{
- const app=String(req.query.app||"dms"),financialYear=String(req.query.financialYear||"2026-27"),tenantKey=req.auth.tenantKey;
+ const app=String(req.query.app||"dms"),tenantKey=req.auth.tenantKey,financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
  if(req.auth.role!=="MASTER" && !(req.auth.apps||[]).includes(app)) return res.status(403).json({success:false,message:`${app} is not enabled for this user`});
  if(app==="hr"){
    const today=new Date();today.setHours(0,0,0,0);const tomorrow=new Date(today);tomorrow.setDate(today.getDate()+1);

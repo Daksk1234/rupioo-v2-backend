@@ -122,6 +122,9 @@ const userSchema = new Schema({
   fieldAccess: { type: Schema.Types.Mixed, default: {} },
   workflowTransitions: { type: Schema.Types.Mixed, default: {} },
   accountingRequired: { type: Boolean, default: false },
+  systemManaged: { type: Boolean, default: false, index: true },
+  systemKey: { type: String, uppercase: true, trim: true, index: true, sparse: true },
+  systemNote: String,
   accountingMappings: [{
     relationshipType: { type: String, required: true },
     systemAccountCode: { type: String, required: true, index: true },
@@ -132,6 +135,7 @@ const userSchema = new Schema({
     status: { type: String, default: "ACTIVE" }
   }]
 }, { timestamps: true });
+userSchema.index({ tenantKey: 1, systemKey: 1 }, { unique: true, partialFilterExpression: { systemKey: { $type: "string" } } });
 
 const roleSchema = new Schema({
   tenantKey: { type: String, required: true, index: true },
@@ -285,6 +289,15 @@ const customerLinkSchema = new Schema({
 
   partyType: { type: String, default: "DEBITOR" },
   registrationType: { type: String, default: "UNKNOWN" },
+
+  // GST profile fields populated by the AppyFlow GSTIN lookup.
+  businessType: String,
+  firmType: String,
+  gstStatus: String,
+  gstRange: String,
+  eInvoiceStatus: String,
+  filingFrequency: String,
+
   customerCode: String,
   dealsInProducts: String,
   annualTurnover: { type: Number, default: 0 },
@@ -345,9 +358,13 @@ const customerLinkSchema = new Schema({
     systemAccountCode: { type:String, default:"SYS_SUNDRY_DEBTORS" }, ledgerName:String,
     openingBalance:Number, openingBalanceType:{ type:String, enum:["DR","CR"], default:"DR" }, financialYear:String
   },
+  systemManaged: { type: Boolean, default: false, index: true },
+  systemKey: { type: String, uppercase: true, trim: true, index: true, sparse: true },
+  systemNote: String,
   companyHealth: { score: Number, grade: String, color: String, updatedAt: Date }
 }, { timestamps: true });
 customerLinkSchema.index({ tenantKey: 1, globalCustomerId: 1 }, { unique: true });
+customerLinkSchema.index({ tenantKey: 1, systemKey: 1 }, { unique: true, partialFilterExpression: { systemKey: { $type: "string" } } });
 customerLinkSchema.index({ tenantKey:1, status:1, salespersonId:1, territoryId:1 });
 
 const pincodeSchema = new Schema({
@@ -420,6 +437,7 @@ const globalTransporterStationSchema = new Schema({
   city: { type: String, trim: true, index: true },
   district: { type: String, trim: true, index: true },
   state: { type: String, trim: true, index: true },
+  latitude: Number, longitude: Number,
   contacts: [{ name: String, designation: String, phone: String, email: String, active: { type: Boolean, default: true } }],
   servicePincodes: [{ type: String, trim: true, index: true }],
   serviceCities: [{ type: String, trim: true, index: true }],
@@ -612,8 +630,16 @@ const companyProfileSchema = new Schema({
   email:String,
   registeredAddress:String,
   pincode:String,
+  area:String,
   city:String,
+  district:String,
   state:String,
+  bankDetails: {
+    ifsc: { type: String, uppercase: true, trim: true },
+    bankName: String, branchName: String, branchArea: String, bankAddress: String,
+    city: String, state: String, stdCode: String, phone: String, contactNo: String,
+    accountNumber: String, accountName: String
+  },
   // Multiple financial years may be enabled for the same company.
   // financialYear is retained as the default/current FY for legacy transaction flows.
   financialYear:String,
@@ -671,6 +697,42 @@ const companyProfileSchema = new Schema({
   createdBy:String
 },{timestamps:true});
 
+const tenantKeyAliasSchema = new Schema({
+  oldTenantKey: { type: String, required: true, unique: true, index: true },
+  newTenantKey: { type: String, required: true, index: true },
+  companyProfileId: { type: String, index: true },
+  oldGstin: String,
+  newGstin: String,
+  changedBy: String,
+  changedAt: { type: Date, default: Date.now },
+  status: { type: String, default: "ACTIVE", index: true },
+}, { timestamps: true });
+tenantKeyAliasSchema.index({ newTenantKey: 1, status: 1 });
+
+const tenantMigrationSchema = new Schema({
+  migrationId: { type: String, required: true, unique: true, index: true },
+  companyProfileId: { type: String, required: true, index: true },
+  oldTenantKey: { type: String, required: true, index: true },
+  newTenantKey: { type: String, required: true, index: true },
+  oldGstin: String,
+  newGstin: String,
+  requestedBy: String,
+  requestedByRole: String,
+  status: { type: String, enum: ["RUNNING", "COMPLETED", "FAILED"], default: "RUNNING", index: true },
+  phase: String,
+  masterCollections: [{ name: String, matched: Number, modified: Number, _id: false }],
+  financialDatabases: [{
+    source: String, target: String, sourceDocuments: Number, copiedDocuments: Number,
+    collections: Number, sourceDropped: Boolean, backupRetained: Boolean, error: String, _id: false
+  }],
+  sourceDatabasesRetained: { type: Boolean, default: false },
+  startedAt: { type: Date, default: Date.now },
+  completedAt: Date,
+  error: String,
+}, { timestamps: true });
+tenantMigrationSchema.index({ oldTenantKey: 1, status: 1, createdAt: -1 });
+tenantMigrationSchema.index({ newTenantKey: 1, status: 1, createdAt: -1 });
+
 const platformPaymentSchema = new Schema({
   paymentRef:{type:String,required:true,unique:true,index:true},
   tenantKey:{type:String,index:true},
@@ -712,6 +774,8 @@ const productSchema = new Schema({
   openingStock: { type: Number, default: 0 },
   openingRate: { type: Number, default: 0 },
   currentStock: { type: Number, default: 0 },
+  // Quantity committed to verified sales orders but not yet invoiced. Available-to-Promise = currentStock - reservedStock.
+  reservedStock: { type: Number, default: 0, min: 0 },
   lastPurchasePrice: { type: Number, default: 0 },
   averagePurchasePrice: { type: Number, default: 0 },
   purchaseQtyAccumulated: { type: Number, default: 0 },
@@ -720,6 +784,18 @@ const productSchema = new Schema({
   mrp: { type: Number, default: 0 },
   salePrice: { type: Number, default: 0 },
   minStockAlert: { type: Number, default: 0 },
+  // Smart Purchase Automation policy. AUTO trend is recalculated from real sales velocity.
+  purchaseAutomation: {
+    enabled: { type: Boolean, default: true },
+    trendOverride: { type: String, enum: ["AUTO", "HIGH", "MEDIUM", "LOW"], default: "AUTO" },
+    targetStock: { type: Number, default: 0, min: 0 },
+    safetyDays: { type: Number, default: 7, min: 0, max: 180 },
+    leadDays: { type: Number, default: 7, min: 0, max: 365 },
+    moq: { type: Number, default: 1, min: 0 },
+    orderMultiple: { type: Number, default: 1, min: 0 },
+    preferredSupplierGlobalId: { type: String, default: "" },
+    preferredSupplierName: { type: String, default: "" },
+  },
   minimumProfitPct: { type: Number, default: 3 },
   // Old-DMS price-list fields: actual pricing margin, highest grade baseline and colour band.
   profitPercentage: { type: Number, default: 3 },
@@ -1187,6 +1263,8 @@ export const PriceList = mongoose.model("PriceList", priceListSchema);
 export const PriceListItem = mongoose.model("PriceListItem", priceListItemSchema);
 export const AccountTemplate = mongoose.model("AccountTemplate", accountTemplateSchema);
 export const CompanyProfile = mongoose.model("CompanyProfile", companyProfileSchema);
+export const TenantKeyAlias = mongoose.model("TenantKeyAlias", tenantKeyAliasSchema);
+export const TenantMigration = mongoose.model("TenantMigration", tenantMigrationSchema);
 export const PlatformPayment = mongoose.model("PlatformPayment", platformPaymentSchema);
 export const CompanyLedger = mongoose.model("CompanyLedger", companyLedgerSchema);
 export const BankAccount = mongoose.model("BankAccount", bankAccountSchema);

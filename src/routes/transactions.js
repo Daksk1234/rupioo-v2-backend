@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import fs from "fs/promises";
 import path from "path";
-import { Product, CustomerLink, CompanyProfile, CompanyUnit, Unit, GenericRecord, Transporter, GlobalTransporterStation, BankAccount, Branding } from "../models/index.js";
+import { Product, CustomerLink, GlobalCustomer, CompanyProfile, CompanyUnit, Unit, GenericRecord, Transporter, GlobalTransporterStation, BankAccount, Branding } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
@@ -17,13 +17,19 @@ import { buildMasterSalesInvoicePdf } from "../services/masterInvoicePdfService.
 import { readFile } from "../services/storageService.js";
 import { resolveCustomerDeliveryMode, resolveFirmDeliveryLocation, gstTypeFromLocations } from "../services/deliveryLocalityService.js";
 import { enrichTransactionRows, resolvePartyDisplayMap } from "../services/transactionDisplayService.js";
+import { financialYearFromDate, resolveFinancialYear, transactionDate } from "../utils/financialYear.js";
+import personalFinanceRoutes from "./personalFinance.js";
 
 const router = express.Router();
 router.use(requireAuth);
 router.use((req,res,next)=>{if(req.auth?.role==="MASTER"||(req.auth?.apps||[]).includes("dms"))return next();return fail(res,"DMS access required",403);});
+router.use("/personal-finance", personalFinanceRoutes);
 
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:30*1024*1024}});
+
 const upper=v=>cleanText(v).toUpperCase();
+const isObjectIdText = (value) => /^[0-9a-fA-F]{24}$/.test(cleanText(value));
+const requireObjectIdParam = (req, res, next) => isObjectIdText(req.params.id) ? next() : next("route");
 
 const salesInvoiceForAuth=(invoice,auth)=>{
   if(!invoice||isAdminAuth(auth))return invoice;
@@ -102,34 +108,36 @@ router.post("/:type/bulk-upload",upload.single("file"),async(req,res,next)=>{
     const type=req.params.type;if(!["receipts","payments","expenses"].includes(type))return next();
     if(!req.file?.buffer)return fail(res,"Excel/CSV file is required",400);
     let rows;try{rows=readRows(req.file.buffer);}catch{return fail(res,"Unable to read Excel/CSV file",400);}if(!rows.length)return fail(res,"Uploaded file has no rows",400);
-    const fy=req.body.financialYear||"2026-27";
+    const requestedFy=req.body.financialYear||"";
     const common=[{key:"date",label:"Date",type:"date"},{key:"amount",label:"Amount",type:"number",required:true},{key:"reference",label:"Reference"}];
     const fields=type==="receipts"?[{key:"receiptNo",label:"Receipt No.",aliases:["voucher no","voucher"]},{key:"customer",label:"Customer ID / GSTIN / PAN",aliases:["customer","party","gstin","pan"],required:true},...common,{key:"mode",label:"Mode"},{key:"bounceStatus",label:"Bounce Status"}]
       :type==="payments"?[{key:"paymentNo",label:"Payment No.",aliases:["voucher no","voucher"]},{key:"partyGlobalId",label:"Party / Supplier ID",aliases:["party","supplier"],required:true},...common,{key:"mode",label:"Mode"}]
       :[{key:"expenseNo",label:"Expense No.",aliases:["voucher no","voucher"]},{key:"accountCode",label:"Expense Account",aliases:["account","account code"],required:true},...common,{key:"paymentMode",label:"Payment Mode"},{key:"nature",label:"Nature"},{key:"allocationMethod",label:"Allocation Method",aliases:["allocation"]},{key:"narration",label:"Narration"}];
     const cols=resolveColumns(rows[0],fields);const missing=fields.filter(f=>f.required&&!cols[f.key]).map(f=>f.label);if(missing.length)return fail(res,`Missing column(s): ${missing.join(", ")}`,400);
     const errors=[];let inserted=0,duplicates=0;
-    const models=financialModels(req.auth.tenantKey,fy);
     for(let i=0;i<rows.length;i++){
-      const body={financialYear:fy};for(const f of fields){const v=valueFor(rows[i],cols[f.key],f.type);if(v!==undefined&&v!=="")body[f.key]=v;}
+      const body={financialYear:requestedFy};for(const f of fields){const v=valueFor(rows[i],cols[f.key],f.type);if(v!==undefined&&v!=="")body[f.key]=v;}
       const amount=Number(body.amount||0);if(amount<=0){if(errors.length<100)errors.push({row:i+2,error:"Amount must be greater than zero"});continue;}
       try{
+        const date=transactionDate(body.date);
+        const fy=financialYearFromDate(body.date)||financialYearFromDate(date)||await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:requestedFy});
+        const models=financialModels(req.auth.tenantKey,fy);
         if(type==="receipts"){
           const customer=await resolveReceiptCustomer(req.auth.tenantKey,body.customer);if(!customer){if(errors.length<100)errors.push({row:i+2,error:`Customer not found: ${body.customer||""}`});continue;}
           const receiptNo=cleanText(body.receiptNo)||makeId("RCT");if(await models.Receipt.exists({tenantKey:req.auth.tenantKey,financialYear:fy,receiptNo})){duplicates++;continue;}
-          const date=body.date?new Date(body.date):new Date(),mode=upper(body.mode||"BANK");
+          const mode=upper(body.mode||"BANK");
           await models.Receipt.create({tenantKey:req.auth.tenantKey,financialYear:fy,receiptNo,date,customerGlobalId:customer.globalCustomerId,partyNameSnapshot:customer.localName||customer.displayIdentifier||body.customer||"Customer",amount,mode,reference:body.reference||"",bounceStatus:upper(body.bounceStatus||"CLEAR"),createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||"",status:"POSTED"});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear:fy,transactionId:receiptNo,transactionType:"RECEIPT",date,partyGlobalId:customer.globalCustomerId,narration:`Receipt ${receiptNo}`,entries:[{accountCode:mode==="CASH"?"SYS_CASH":"SYS_BANK_ACCOUNT",debit:amount},{accountCode:"SYS_SUNDRY_DEBTORS",credit:amount}]});
         }else if(type==="payments"){
           const paymentNo=cleanText(body.paymentNo)||makeId("PAY");if(await models.Payment.exists({tenantKey:req.auth.tenantKey,financialYear:fy,paymentNo})){duplicates++;continue;}
-          const date=body.date?new Date(body.date):new Date(),mode=upper(body.mode||"BANK"),party=cleanText(body.partyGlobalId);
+          const mode=upper(body.mode||"BANK"),party=cleanText(body.partyGlobalId);
           const partyMap=await resolvePartyDisplayMap(req.auth.tenantKey,[party]);
           const partyName=partyMap.get(party)?.name||party||"Party";
           await models.Payment.create({tenantKey:req.auth.tenantKey,financialYear:fy,paymentNo,date,partyGlobalId:party,partyNameSnapshot:partyName,amount,mode,reference:body.reference||"",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||"",status:"POSTED"});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear:fy,transactionId:paymentNo,transactionType:"PAYMENT",date,partyGlobalId:party,narration:`Payment ${paymentNo}`,entries:[{accountCode:"SYS_SUNDRY_CREDITORS",debit:amount},{accountCode:mode==="CASH"?"SYS_CASH":"SYS_BANK_ACCOUNT",credit:amount}]});
         }else{
           const expenseNo=cleanText(body.expenseNo)||makeId("EXP");if(await models.Expense.exists({tenantKey:req.auth.tenantKey,financialYear:fy,expenseNo})){duplicates++;continue;}
-          const date=body.date?new Date(body.date):new Date(),paymentMode=upper(body.paymentMode||"BANK");
+          const paymentMode=upper(body.paymentMode||"BANK");
           await models.Expense.create({tenantKey:req.auth.tenantKey,financialYear:fy,expenseNo,date,accountCode:body.accountCode,amount,nature:upper(body.nature||"FIXED"),allocationMethod:upper(body.allocationMethod||"TURNOVER"),status:"POSTED"});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear:fy,transactionId:expenseNo,transactionType:"EXPENSE",date,narration:body.narration||`Expense ${expenseNo}`,entries:[{accountCode:body.accountCode,debit:amount},{accountCode:paymentMode==="BANK"?"SYS_BANK_ACCOUNT":"SYS_CASH",credit:amount}]});
         }
@@ -143,7 +151,7 @@ router.post("/:type/bulk-upload",upload.single("file"),async(req,res,next)=>{
 router.post("/:type/bulk-edit",async(req,res,next)=>{
   const type=req.params.type;if(!["receipts","payments","expenses"].includes(type))return next();
   const ids=(req.body.selection?.ids||[]).filter(Boolean);if(!ids.length)return fail(res,"Select at least one record",400);
-  const fy=req.body.financialYear||"2026-27",models=financialModels(req.auth.tenantKey,fy),raw=req.body.changes||{};
+  const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.financialYear}),models=financialModels(req.auth.tenantKey,fy),raw=req.body.changes||{};
   const Model=type==="receipts"?models.Receipt:type==="payments"?models.Payment:models.Expense;
   const allowed=type==="receipts"?["reference","bounceStatus"]:type==="payments"?["reference"]:["nature","allocationMethod"];
   const changes={};for(const k of allowed)if(raw[k]!==undefined&&raw[k]!=="")changes[k]=k==="reference"?cleanText(raw[k]):upper(raw[k]);
@@ -155,7 +163,7 @@ router.post("/:type/bulk-edit",async(req,res,next)=>{
 router.post("/:type/bulk-delete",async(req,res,next)=>{
   const type=req.params.type;if(!["receipts","payments","expenses"].includes(type))return next();
   const ids=(req.body.selection?.ids||[]).filter(Boolean);if(!ids.length)return fail(res,"Select at least one record",400);
-  const fy=req.body.financialYear||"2026-27",models=financialModels(req.auth.tenantKey,fy),Model=type==="receipts"?models.Receipt:type==="payments"?models.Payment:models.Expense;
+  const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.financialYear}),models=financialModels(req.auth.tenantKey,fy),Model=type==="receipts"?models.Receipt:type==="payments"?models.Payment:models.Expense;
   const docs=await Model.find({_id:{$in:ids},tenantKey:req.auth.tenantKey,financialYear:fy,status:"POSTED"});let cancelled=0;
   for(const doc of docs){const transactionId=type==="receipts"?doc.receiptNo:type==="payments"?doc.paymentNo:doc.expenseNo;if(!transactionId)continue;await reversePostedTransaction({tenantKey:req.auth.tenantKey,financialYear:fy,transactionId,reason:`Bulk cancelled ${type.slice(0,-1)}`});doc.status="CANCELLED";await doc.save();cancelled++;}
   return ok(res,{deleted:cancelled,reversed:true},`${cancelled} ${type} cancelled and reversed`);
@@ -222,14 +230,14 @@ function applySalesInvoiceScope(filter,auth){
   return filter;
 }
 
-async function calculateSalesInvoice({auth,body,existingInvoice=null}){
-  const tenantKey=auth.tenantKey,financialYear=body.financialYear||existingInvoice?.financialYear||"2026-27";
+export async function calculateSalesInvoice({auth,body,existingInvoice=null}){
+  const tenantKey=auth.tenantKey,date=transactionDate(body.date),financialYear=financialYearFromDate(body.date)||financialYearFromDate(date)||await resolveFinancialYear({tenantKey,requested:body.financialYear||existingInvoice?.financialYear});
   const customer=await CustomerLink.findOne({tenantKey,globalCustomerId:body.customerGlobalId,status:"ACTIVE"}).lean();
   if(!customer)throw Object.assign(new Error("Active approved customer is required"),{statusCode:400});
   const transportAssignment=await customerTransportSnapshot({tenantKey,customer});
   const firm=await resolveFirmDeliveryLocation(tenantKey);
   const customerGstin=customer.displayIdentifier?.length===15?customer.displayIdentifier:"";
-  const customerAddress=(customer.addresses||[]).find(x=>upper(x.type||"BILLING")==="BILLING")||(customer.addresses||[])[0]||{};
+  const customerAddress=(customer.addresses||[]).find(x=>upper(x.type||"BILLING")==="BILLING")||{};
   // Tax locality and delivery locality are intentionally separate:
   // GSTIN/state decides CGST+SGST vs IGST; city decides Local vs Transport.
   const gstType=gstTypeFromLocations({companyGstin:firm.company?.gstin,customerGstin,companyState:firm.state,customerState:customerAddress.state,requested:body.gstType});
@@ -296,14 +304,16 @@ async function calculateSalesInvoice({auth,body,existingInvoice=null}){
     const adjustedBalance=balance-Number(existingInvoice?.grandTotal||0);
     if(adjustedBalance+grandTotal>customer.creditLimit)throw Object.assign(new Error("Customer credit limit would be exceeded"),{statusCode:409,details:{currentOutstanding:adjustedBalance,newOrder:grandTotal,creditLimit:customer.creditLimit}});
   }
-  return {tenantKey,financialYear,customer,transportAssignment,gstType,warehouse,warehouseId,items,lineSubtotal,taxTotal,grossProfit,taxableTotal,grandTotal,roundOff,date:body.date?new Date(body.date):new Date()};
+  return {tenantKey,financialYear,customer,customerAddress,transportAssignment,gstType,warehouse,warehouseId,items,lineSubtotal,taxTotal,grossProfit,taxableTotal,grandTotal,roundOff,date};
 }
 
-async function postSalesAccounting({tenantKey,financialYear,invoiceNo,date,customer,grandTotal,taxableTotal,taxTotal,roundOff}){
-  await postBalancedEntries({tenantKey,financialYear,transactionId:invoiceNo,transactionType:"SALES_INVOICE",date,partyGlobalId:customer.globalCustomerId,narration:`Sales Invoice ${invoiceNo}`,entries:[{accountCode:"SYS_SUNDRY_DEBTORS",debit:grandTotal},{accountCode:"SYS_SALES",credit:taxableTotal},{accountCode:"SYS_DUTIES_TAXES",credit:taxTotal},{accountCode:roundOff>=0?"SYS_INDIRECT_INCOME":"SYS_INDIRECT_EXPENSE",credit:roundOff>0?roundOff:0,debit:roundOff<0?Math.abs(roundOff):0}].filter(x=>Number(x.debit||0)||Number(x.credit||0))});
+export async function postSalesAccounting({tenantKey,financialYear,invoiceNo,date,customer,grandTotal,taxableTotal,taxTotal,roundOff}){
+  const partyAccountCode=partyAccountCodeOf(customer);
+  await postBalancedEntries({tenantKey,financialYear,transactionId:invoiceNo,transactionType:"SALES_INVOICE",date,partyGlobalId:customer.globalCustomerId,narration:`Sales Invoice ${invoiceNo}`,entries:[{accountCode:partyAccountCode,debit:grandTotal},{accountCode:"SYS_SALES",credit:taxableTotal},{accountCode:"SYS_DUTIES_TAXES",credit:taxTotal},{accountCode:roundOff>=0?"SYS_INDIRECT_INCOME":"SYS_INDIRECT_EXPENSE",credit:roundOff>0?roundOff:0,debit:roundOff<0?Math.abs(roundOff):0}].filter(x=>Number(x.debit||0)||Number(x.credit||0))});
 }
 
-function normalizedEInvoice(body = {}, existing = {}) {
+
+export function normalizedEInvoice(body = {}, existing = {}) {
   const source = body?.eInvoice && typeof body.eInvoice === "object" ? body.eInvoice : {};
   const previous = existing && typeof existing === "object" ? existing : {};
   const rawStatus = upper(source.status ?? previous.status ?? "NOT_GENERATED");
@@ -329,7 +339,7 @@ router.get("/sales-invoices/next-number",async(req,res)=>{
 });
 
 router.get("/sales-invoices", async (req, res) => {
-  const financialYear = req.query.financialYear || "2026-27";
+  const financialYear = await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
   const { SalesInvoice } = financialModels(req.auth.tenantKey, financialYear);
   const page = Number(req.query.page || 1), limit = Math.min(100, Number(req.query.limit || 25));
   const filter = applySalesInvoiceScope({ tenantKey: req.auth.tenantKey, financialYear }, req.auth);
@@ -346,8 +356,8 @@ router.get("/sales-invoices", async (req, res) => {
   ok(res, { items, meta: pageMeta(page, limit, total) });
 });
 
-router.get("/sales-invoices/:id",async(req,res)=>{
-  const financialYear=req.query.financialYear||"2026-27",{SalesInvoice}=financialModels(req.auth.tenantKey,financialYear);
+router.get("/sales-invoices/:id", requireObjectIdParam, async(req,res)=>{
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),{SalesInvoice}=financialModels(req.auth.tenantKey,financialYear);
   const filter=applySalesInvoiceScope({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear},req.auth);
   const invoice=await SalesInvoice.findOne(filter).lean();
   if(!invoice)return fail(res,"Sales invoice not found",404);
@@ -355,9 +365,9 @@ router.get("/sales-invoices/:id",async(req,res)=>{
   return ok(res,salesInvoiceForAuth(enriched,req.auth));
 });
 
-router.get("/sales-invoices/:id/pdf", async (req, res) => {
+router.get("/sales-invoices/:id/pdf", requireObjectIdParam, async (req, res) => {
   try {
-    const financialYear = req.query.financialYear || "2026-27";
+    const financialYear = await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
     const { SalesInvoice } = financialModels(req.auth.tenantKey, financialYear);
     const filter = applySalesInvoiceScope({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear }, req.auth);
     const invoice = await SalesInvoice.findOne(filter).lean();
@@ -379,21 +389,68 @@ router.post("/sales-invoices", async (req, res) => {
     const preserveRequestedInvoiceNo=new Set(["SCAN_FILL","QUICK_ENTRY"]).has(importSource);
     const requestedInvoiceNo=cleanText(req.body.invoiceNo||"");
     const series=preserveRequestedInvoiceNo&&requestedInvoiceNo?{invoiceNo:requestedInvoiceNo}:await salesInvoiceSeries(req.auth.tenantKey,{consume:true});
-    const {SalesInvoice,StockMovement}=financialModels(calc.tenantKey,calc.financialYear);
+    const models=financialModels(calc.tenantKey,calc.financialYear);
+    const {SalesInvoice,StockMovement,SalesOrder,OrderEvent}=models;
     if(await SalesInvoice.exists({tenantKey:calc.tenantKey,financialYear:calc.financialYear,invoiceNo:series.invoiceNo}))return fail(res,preserveRequestedInvoiceNo?`Sales invoice ${series.invoiceNo} already exists in FY ${calc.financialYear}`:"Generated invoice number already exists. Update the series in Super Admin Profile.",409);
-    const invoice=await SalesInvoice.create({tenantKey:calc.tenantKey,financialYear:calc.financialYear,invoiceNo:series.invoiceNo,date:calc.date,customerGlobalId:calc.customer.globalCustomerId,customerNameSnapshot:calc.customer.localName||calc.customer.displayIdentifier||"Customer",gstinSnapshot:calc.customer.displayIdentifier?.length===15?calc.customer.displayIdentifier:"",addressSnapshot:req.body.addressSnapshot||calc.customer.addresses?.[0]?.address||"",items:calc.items,subtotal:calc.lineSubtotal,billDiscount:Number(req.body.billDiscount||0),otherCharges:Number(req.body.otherCharges||0),taxableTotal:calc.taxableTotal,taxTotal:calc.taxTotal,roundOff:calc.roundOff,grandTotal:calc.grandTotal,grossProfit:calc.grossProfit,grossMarginPct:calc.taxableTotal?calc.grossProfit/calc.taxableTotal*100:0,orderNo:req.body.orderNo,arn:req.body.arn,noOfPackages:Number(req.body.noOfPackages||0),deliveryBoy:req.body.deliveryBoy,gstType:calc.gstType,remarks:req.body.remarks,eInvoice:normalizedEInvoice(req.body),transportAssignment:calc.transportAssignment,branchId:req.body.branchId||req.auth.branch||"",warehouseId:calc.warehouseId,warehouseNameSnapshot:calc.warehouse.title||calc.warehouse.reference||"",assignedTo:req.body.assignedTo||"",workflowStatus:req.body.workflowStatus||"POSTED",releasedToWarehouseAt:req.body.workflowStatus==="RELEASED_TO_WAREHOUSE"?new Date():undefined,status:"POSTED",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
-    for(const it of calc.items){await Product.updateOne({_id:it.productId,tenantKey:calc.tenantKey},{$inc:{currentStock:-it.qty}});await StockMovement.create({tenantKey:calc.tenantKey,financialYear:calc.financialYear,date:calc.date,productId:it.productId,warehouseId:calc.warehouseId,type:"SALE",qtyIn:0,qtyOut:it.qty,landedCost:it.landedCostSnapshot,referenceId:series.invoiceNo});}
+
+    // DIRECT billing remains independent. Only a sourceOrderId explicitly supplied by
+    // the Order Desk enables order-linked stock reservation and lifecycle updates.
+    const sourceOrderId=cleanText(req.body.sourceOrderId||"");
+    let sourceOrder=null;
+    if(sourceOrderId){
+      sourceOrder=await SalesOrder.findOne({_id:sourceOrderId,tenantKey:calc.tenantKey,financialYear:calc.financialYear});
+      if(!sourceOrder)return fail(res,"Source sales order not found in this financial year",404);
+      if(String(sourceOrder.customerGlobalId)!==String(calc.customer.globalCustomerId))return fail(res,"Invoice customer does not match the sales order customer",409);
+      if(!["PACKED","SENT_TO_ORDER_DESK","INVOICED_PARTIAL"].includes(upper(sourceOrder.workflowStatus)))return fail(res,`Order ${sourceOrder.orderNo} is not ready for invoicing`,409);
+      const orderItems=new Map((sourceOrder.items||[]).map(x=>[String(x.productId),x]));
+      for(const it of calc.items){
+        const oi=orderItems.get(String(it.productId));
+        if(!oi)return fail(res,`${it.nameSnapshot||it.sku||"Product"} is not part of order ${sourceOrder.orderNo}`,409);
+        const available=Math.max(0,Number(oi.packedQty||0)-Number(oi.invoicedQty||0));
+        if(Number(it.qty||0)>available+0.000001)return fail(res,`${it.nameSnapshot||it.sku||"Product"}: invoice quantity ${it.qty} exceeds newly packed quantity ${available}`,409);
+      }
+    }
+
+    const invoice=await SalesInvoice.create({tenantKey:calc.tenantKey,financialYear:calc.financialYear,invoiceNo:series.invoiceNo,date:calc.date,customerGlobalId:calc.customer.globalCustomerId,customerNameSnapshot:calc.customer.localName||calc.customer.displayIdentifier||"Customer",gstinSnapshot:calc.customer.displayIdentifier?.length===15?calc.customer.displayIdentifier:"",addressSnapshot:calc.customerAddress?.address||"",items:calc.items,subtotal:calc.lineSubtotal,billDiscount:Number(req.body.billDiscount||0),otherCharges:Number(req.body.otherCharges||0),taxableTotal:calc.taxableTotal,taxTotal:calc.taxTotal,roundOff:calc.roundOff,grandTotal:calc.grandTotal,grossProfit:calc.grossProfit,grossMarginPct:calc.taxableTotal?calc.grossProfit/calc.taxableTotal*100:0,billingMode:sourceOrder?"ORDER":"DIRECT",sourceOrderId:sourceOrder?String(sourceOrder._id):"",orderNo:sourceOrder?.orderNo||req.body.orderNo,arn:req.body.arn,noOfPackages:Number(req.body.noOfPackages||sourceOrder?.packing?.packageCount||0),deliveryBoy:req.body.deliveryBoy,gstType:calc.gstType,remarks:req.body.remarks,eInvoice:normalizedEInvoice(req.body),transportAssignment:calc.transportAssignment,branchId:req.body.branchId||req.auth.branch||"",warehouseId:calc.warehouseId,warehouseNameSnapshot:calc.warehouse.title||calc.warehouse.reference||"",assignedTo:req.body.assignedTo||"",workflowStatus:req.body.workflowStatus||(sourceOrder?"READY_FOR_DISPATCH":"POSTED"),releasedToWarehouseAt:req.body.workflowStatus==="RELEASED_TO_WAREHOUSE"?new Date():undefined,status:"POSTED",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+
+    for(const it of calc.items){
+      if(sourceOrder){
+        const usedQty=Number(it.qty||0);
+        await Product.updateOne({_id:it.productId,tenantKey:calc.tenantKey},{$inc:{currentStock:-usedQty,reservedStock:-usedQty}});
+        await Product.updateOne({_id:it.productId,tenantKey:calc.tenantKey,reservedStock:{$lt:0}},{$set:{reservedStock:0}});
+      }else{
+        await Product.updateOne({_id:it.productId,tenantKey:calc.tenantKey},{$inc:{currentStock:-it.qty}});
+      }
+      await StockMovement.create({tenantKey:calc.tenantKey,financialYear:calc.financialYear,date:calc.date,productId:it.productId,warehouseId:calc.warehouseId,type:sourceOrder?"ORDER_SALE":"SALE",qtyIn:0,qtyOut:it.qty,landedCost:it.landedCostSnapshot,referenceId:series.invoiceNo});
+    }
     await postSalesAccounting({...calc,invoiceNo:series.invoiceNo});
-    return ok(res,salesInvoiceForAuth(invoice,req.auth),"Sales invoice posted",201);
+
+    if(sourceOrder){
+      const invMap=new Map(calc.items.map(x=>[String(x.productId),Number(x.qty||0)]));
+      for(const oi of sourceOrder.items||[]){
+        const used=Number(invMap.get(String(oi.productId))||0);
+        if(used){oi.invoicedQty=Number(oi.invoicedQty||0)+used;oi.reservedQty=Math.max(0,Number(oi.reservedQty||0)-used);}
+      }
+      sourceOrder.invoice={invoiceId:String(invoice._id),invoiceNo:invoice.invoiceNo,invoiceDate:invoice.date};
+      sourceOrder.invoices=[...(sourceOrder.invoices||[]),{invoiceId:String(invoice._id),invoiceNo:invoice.invoiceNo,invoiceDate:invoice.date,grandTotal:invoice.grandTotal}];
+      const complete=(sourceOrder.items||[]).every(x=>Number(x.invoicedQty||0)>=Number(x.qty||0)-0.000001);
+      const packedConsumed=(sourceOrder.items||[]).every(x=>Number(x.invoicedQty||0)>=Number(x.packedQty||0)-0.000001);
+      sourceOrder.workflowStatus=complete?"INVOICED":"INVOICED_PARTIAL";
+      sourceOrder.status="PROCESSING";sourceOrder.lastWorkflowAt=new Date();sourceOrder.nextAction=complete?"Prepare dispatch":packedConsumed?"Pack / invoice remaining quantity":"Invoice remaining packed quantity";
+      await sourceOrder.save();
+      if(OrderEvent){await OrderEvent.create({tenantKey:calc.tenantKey,financialYear:calc.financialYear,eventNo:makeId("EVT"),orderId:String(sourceOrder._id),orderNo:sourceOrder.orderNo,invoiceId:String(invoice._id),invoiceNo:invoice.invoiceNo,type:"INVOICE_GENERATED",fromStatus:"SENT_TO_ORDER_DESK",toStatus:sourceOrder.workflowStatus,note:`Invoice ${invoice.invoiceNo} generated from actual packed quantity`,meta:{grandTotal:invoice.grandTotal},audience:["DMS","CUSTOMER","SALESPERSON"],actorId:req.auth.sub,actorNameSnapshot:req.auth.name||"",actorRole:req.auth.role||"",occurredAt:new Date()});}
+    }
+    return ok(res,salesInvoiceForAuth(invoice,req.auth),sourceOrder?`Sales invoice ${invoice.invoiceNo} generated from order ${sourceOrder.orderNo}`:"Sales invoice posted",201);
   }catch(e){return fail(res,e.message,e.statusCode||400,e.details);}
 });
 
-router.put("/sales-invoices/:id",async(req,res)=>{
-  const financialYear=req.body.financialYear||req.query.financialYear||"2026-27",models=financialModels(req.auth.tenantKey,financialYear);
+router.put("/sales-invoices/:id", requireObjectIdParam, async(req,res)=>{
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.sourceFinancialYear||req.query.financialYear||req.body.financialYear}),models=financialModels(req.auth.tenantKey,financialYear);
   const existing=await models.SalesInvoice.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear,status:"POSTED"});
   if(!existing)return fail(res,"Posted sales invoice not found",404);
   try{
-    const calc=await calculateSalesInvoice({auth:req.auth,body:{...req.body,financialYear},existingInvoice:existing.toObject()});
+    const calc=await calculateSalesInvoice({auth:req.auth,body:req.body,existingInvoice:existing.toObject()});
+    if(calc.financialYear!==financialYear)return fail(res,`The selected date belongs to FY ${calc.financialYear}. An existing invoice cannot be moved across financial-year databases. Delete/recreate it with the new date.`,409);
     await reversePostedTransaction({tenantKey:req.auth.tenantKey,financialYear,transactionId:existing.invoiceNo,reason:"Sales invoice edited"});
     for(const it of existing.items||[]){await Product.updateOne({_id:it.productId,tenantKey:req.auth.tenantKey},{$inc:{currentStock:Number(it.qty||0)}});await models.StockMovement.create({tenantKey:req.auth.tenantKey,financialYear,date:new Date(),productId:String(it.productId),warehouseId:existing.warehouseId||"",type:"SALE_EDIT_REVERSAL",qtyIn:Number(it.qty||0),qtyOut:0,landedCost:Number(it.landedCostSnapshot||0),referenceId:existing.invoiceNo});}
     existing.date=calc.date;existing.customerGlobalId=calc.customer.globalCustomerId;existing.customerNameSnapshot=calc.customer.localName;existing.gstinSnapshot=calc.customer.displayIdentifier?.length===15?calc.customer.displayIdentifier:"";existing.addressSnapshot=req.body.addressSnapshot||calc.customer.addresses?.[0]?.address||"";existing.items=calc.items;existing.subtotal=calc.lineSubtotal;existing.billDiscount=Number(req.body.billDiscount||0);existing.otherCharges=Number(req.body.otherCharges||0);existing.taxableTotal=calc.taxableTotal;existing.taxTotal=calc.taxTotal;existing.roundOff=calc.roundOff;existing.grandTotal=calc.grandTotal;existing.grossProfit=calc.grossProfit;existing.grossMarginPct=calc.taxableTotal?calc.grossProfit/calc.taxableTotal*100:0;existing.orderNo=req.body.orderNo;existing.arn=req.body.arn;existing.noOfPackages=Number(req.body.noOfPackages||0);existing.deliveryBoy=req.body.deliveryBoy;existing.gstType=calc.gstType;existing.remarks=req.body.remarks;existing.eInvoice=normalizedEInvoice(req.body,existing.eInvoice||{});existing.transportAssignment=calc.transportAssignment;existing.branchId=req.body.branchId||existing.branchId||req.auth.branch||"";existing.warehouseId=calc.warehouseId;existing.warehouseNameSnapshot=calc.warehouse.title||calc.warehouse.reference||"";existing.assignedTo=req.body.assignedTo||existing.assignedTo||"";existing.workflowStatus=req.body.workflowStatus||existing.workflowStatus||"POSTED";existing.status="POSTED";await existing.save();
@@ -403,8 +460,8 @@ router.put("/sales-invoices/:id",async(req,res)=>{
   }catch(e){return fail(res,e.message,e.statusCode||400,e.details);}
 });
 
-router.delete("/sales-invoices/:id",async(req,res)=>{
-  const financialYear=req.body?.financialYear||req.query.financialYear||"2026-27",models=financialModels(req.auth.tenantKey,financialYear);
+router.delete("/sales-invoices/:id", requireObjectIdParam, async(req,res)=>{
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear||req.query.financialYear}),models=financialModels(req.auth.tenantKey,financialYear);
   const invoice=await models.SalesInvoice.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear});
   if(!invoice)return fail(res,"Sales invoice not found",404);
   if(invoice.status==="DELETED"||invoice.status==="CANCELLED")return ok(res,salesInvoiceForAuth(invoice,req.auth),"Sales invoice already deleted");
@@ -510,10 +567,11 @@ async function emailDeliveredInvoice({ tenantKey, financialYear, invoice, custom
 }
 
 router.post("/sales-invoices/:id/process",
+  requireObjectIdParam,
   requireAnyPermission("dms.sales.sales_invoice.process","dms.sales.sales_invoices.process","dms.sales.dispatch.process","dms.sales.dispatch_details.process"),
   upload.fields([{ name:"deliveryProof", maxCount:1 }, { name:"biltyCopy", maxCount:1 }]),
   async(req,res)=>{
-    const financialYear=req.body.financialYear||req.query.financialYear||"2026-27";
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.financialYear||req.query.financialYear});
     const {SalesInvoice}=financialModels(req.auth.tenantKey,financialYear);
     const invoice=await SalesInvoice.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear});
     if(!invoice)return fail(res,"Sales invoice not found",404);
@@ -569,7 +627,7 @@ router.post("/sales-invoices/:id/process",
 );
 
 async function calculatePurchaseInvoice({auth,body}){
-  const tenantKey=auth.tenantKey,financialYear=body.financialYear||"2026-27",requested=Array.isArray(body.items)?body.items:[];
+  const tenantKey=auth.tenantKey,date=transactionDate(body.date),financialYear=financialYearFromDate(body.date)||financialYearFromDate(date)||await resolveFinancialYear({tenantKey,requested:body.financialYear}),requested=Array.isArray(body.items)?body.items:[];
   if(!requested.length)throw Object.assign(new Error("At least one product row is required"),{statusCode:400});
   const ids=Array.from(new Set(requested.map(x=>String(x.productId||"")).filter(Boolean)));
   const products=await Product.find({tenantKey,_id:{$in:ids},status:"ACTIVE"});
@@ -602,7 +660,7 @@ async function calculatePurchaseInvoice({auth,body}){
   }
 
   const beforeRound=round2(taxableTotal+taxTotal),grandTotal=body.roundGrandTotal===false?beforeRound:Math.round(beforeRound),roundOff=round2(grandTotal-beforeRound);
-  return {tenantKey,financialYear,items,subtotal:round2(subtotal),billTax,taxableTotal,taxTotal,transportationCost,labourCost,localFreight,miscellaneousCost,landedCharges,landedTax,landedExpensePercentage,beforeRound,grandTotal,roundOff,date:body.date?new Date(body.date):new Date()};
+  return {tenantKey,financialYear,items,subtotal:round2(subtotal),billTax,taxableTotal,taxTotal,transportationCost,labourCost,localFreight,miscellaneousCost,landedCharges,landedTax,landedExpensePercentage,beforeRound,grandTotal,roundOff,date};
 }
 
 function summarizePurchaseItems(items=[]){
@@ -652,15 +710,17 @@ async function applyPurchaseProductChanges({tenantKey,financialYear,invoiceNo,da
 }
 
 async function postPurchaseAccounting({tenantKey,financialYear,invoiceNo,date,supplierGlobalId,taxableTotal,taxTotal,roundOff,grandTotal}){
-  await postBalancedEntries({tenantKey,financialYear,transactionId:invoiceNo,transactionType:"PURCHASE_INVOICE",date,partyGlobalId:supplierGlobalId||"",narration:`Purchase Invoice ${invoiceNo}`,entries:[{accountCode:"SYS_PURCHASE",debit:taxableTotal},{accountCode:"SYS_DUTIES_TAXES",debit:taxTotal},{accountCode:"SYS_SUNDRY_CREDITORS",credit:grandTotal},{accountCode:roundOff>=0?"SYS_INDIRECT_EXPENSE":"SYS_INDIRECT_INCOME",debit:roundOff>0?roundOff:0,credit:roundOff<0?Math.abs(roundOff):0}].filter(x=>Number(x.debit||0)||Number(x.credit||0))});
+  const supplier=supplierGlobalId?await resolvePostingParty(tenantKey,supplierGlobalId):null;
+  const partyAccountCode=supplier?partyAccountCodeOf(supplier):"SYS_SUNDRY_CREDITORS";
+  await postBalancedEntries({tenantKey,financialYear,transactionId:invoiceNo,transactionType:"PURCHASE_INVOICE",date,partyGlobalId:supplierGlobalId||"",narration:`Purchase Invoice ${invoiceNo}`,entries:[{accountCode:"SYS_PURCHASE",debit:taxableTotal},{accountCode:"SYS_DUTIES_TAXES",debit:taxTotal},{accountCode:partyAccountCode,credit:grandTotal},{accountCode:roundOff>=0?"SYS_INDIRECT_EXPENSE":"SYS_INDIRECT_INCOME",debit:roundOff>0?roundOff:0,credit:roundOff<0?Math.abs(roundOff):0}].filter(x=>Number(x.debit||0)||Number(x.credit||0))});
 }
 
 router.get("/purchase-invoices",async(req,res)=>{
-  const financialYear=req.query.financialYear||"2026-27",page=Math.max(1,Number(req.query.page||1)),limit=Math.min(100,Math.max(10,Number(req.query.limit||25)));const {PurchaseInvoice}=financialModels(req.auth.tenantKey,financialYear);const f={tenantKey:req.auth.tenantKey,financialYear};if(req.query.includeDeleted!=="true")f.status={$ne:"DELETED"};let[items,total]=await Promise.all([PurchaseInvoice.find(f).sort({date:-1,createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),PurchaseInvoice.countDocuments(f)]);items=await enrichTransactionRows({tenantKey:req.auth.tenantKey,rows:items,partyIdKey:"supplierGlobalId",partySnapshotKey:"supplierNameSnapshot"});ok(res,{items,meta:pageMeta(page,limit,total)});
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),page=Math.max(1,Number(req.query.page||1)),limit=Math.min(100,Math.max(10,Number(req.query.limit||25)));const {PurchaseInvoice}=financialModels(req.auth.tenantKey,financialYear);const f={tenantKey:req.auth.tenantKey,financialYear};if(req.query.includeDeleted!=="true")f.status={$ne:"DELETED"};let[items,total]=await Promise.all([PurchaseInvoice.find(f).sort({date:-1,createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),PurchaseInvoice.countDocuments(f)]);items=await enrichTransactionRows({tenantKey:req.auth.tenantKey,rows:items,partyIdKey:"supplierGlobalId",partySnapshotKey:"supplierNameSnapshot"});ok(res,{items,meta:pageMeta(page,limit,total)});
 });
 
 router.get("/purchase-invoices/:id",async(req,res)=>{
-  const financialYear=req.query.financialYear||"2026-27",{PurchaseInvoice}=financialModels(req.auth.tenantKey,financialYear);
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),{PurchaseInvoice}=financialModels(req.auth.tenantKey,financialYear);
   const invoice=await PurchaseInvoice.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear}).lean();
   if(!invoice)return fail(res,"Purchase invoice not found",404);
   const [enriched]=await enrichTransactionRows({tenantKey:req.auth.tenantKey,rows:[invoice],partyIdKey:"supplierGlobalId",partySnapshotKey:"supplierNameSnapshot"});
@@ -683,11 +743,12 @@ router.post("/purchase-invoices",async(req,res)=>{
 });
 
 router.put("/purchase-invoices/:id",async(req,res)=>{
-  const financialYear=req.body.financialYear||req.query.financialYear||"2026-27",models=financialModels(req.auth.tenantKey,financialYear);
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.sourceFinancialYear||req.query.financialYear||req.body.financialYear}),models=financialModels(req.auth.tenantKey,financialYear);
   const existing=await models.PurchaseInvoice.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear,status:"POSTED"});
   if(!existing)return fail(res,"Posted purchase invoice not found",404);
   try{
-    const calc=await calculatePurchaseInvoice({auth:req.auth,body:{...req.body,financialYear}});
+    const calc=await calculatePurchaseInvoice({auth:req.auth,body:req.body});
+    if(calc.financialYear!==financialYear)return fail(res,`The selected date belongs to FY ${calc.financialYear}. An existing invoice cannot be moved across financial-year databases. Delete/recreate it with the new date.`,409);
     await applyPurchaseProductChanges({tenantKey:req.auth.tenantKey,financialYear,invoiceNo:existing.invoiceNo,date:calc.date,oldItems:existing.items||[],newItems:calc.items,reason:"EDIT"});
     await reversePostedTransaction({tenantKey:req.auth.tenantKey,financialYear,transactionId:existing.invoiceNo,reason:"Purchase invoice edited"});
     existing.date=calc.date;existing.supplierGlobalId=cleanText(req.body.supplierGlobalId||"");const supplierMap=await resolvePartyDisplayMap(req.auth.tenantKey,[existing.supplierGlobalId]);existing.supplierNameSnapshot=supplierMap.get(existing.supplierGlobalId)?.name||cleanText(req.body.supplierName)||existing.supplierNameSnapshot||"Supplier";existing.supplierGstinSnapshot=upper(req.body.supplierGstin);existing.purchaseType=upper(req.body.purchaseType||"GST");existing.items=calc.items;existing.subtotal=calc.subtotal;existing.billDiscount=calc.billTax.discount;existing.otherCharges=calc.billTax.charges;existing.taxableTotal=calc.taxableTotal;existing.taxTotal=calc.taxTotal;existing.roundOff=calc.roundOff;existing.grandTotal=calc.grandTotal;existing.landedCharges=calc.landedCharges;existing.transportationCost=calc.transportationCost;existing.labourCost=calc.labourCost;existing.localFreight=calc.localFreight;existing.miscellaneousCost=calc.miscellaneousCost;existing.landedTax=calc.landedTax;existing.landedExpensePercentage=calc.landedExpensePercentage;existing.maxGstPercentage=0;existing.remarks=req.body.remarks;existing.status="POSTED";await existing.save();
@@ -697,7 +758,7 @@ router.put("/purchase-invoices/:id",async(req,res)=>{
 });
 
 router.delete("/purchase-invoices/:id",async(req,res)=>{
-  const financialYear=req.body?.financialYear||req.query.financialYear||"2026-27",models=financialModels(req.auth.tenantKey,financialYear);
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear||req.query.financialYear}),models=financialModels(req.auth.tenantKey,financialYear);
   const invoice=await models.PurchaseInvoice.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear});
   if(!invoice)return fail(res,"Purchase invoice not found",404);
   if(invoice.status==="DELETED")return ok(res,invoice,"Purchase invoice already deleted");
@@ -710,24 +771,24 @@ router.delete("/purchase-invoices/:id",async(req,res)=>{
 });
 
 router.get("/receipts", async (req,res)=>{
-  const financialYear=req.query.financialYear||"2026-27",page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=String(req.query.q||"").trim(); const {Receipt}=financialModels(req.auth.tenantKey,financialYear);
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=String(req.query.q||"").trim(); const {Receipt}=financialModels(req.auth.tenantKey,financialYear);
   const filter={tenantKey:req.auth.tenantKey,financialYear};if(q)filter.$or=[{receiptNo:new RegExp(q,"i")},{customerGlobalId:new RegExp(q,"i")},{partyNameSnapshot:new RegExp(q,"i")},{reference:new RegExp(q,"i")},{remarks:new RegExp(q,"i")},{bankNameSnapshot:new RegExp(q,"i")},{mode:new RegExp(q,"i")}];
   const [items,total]=await Promise.all([Receipt.find(filter).sort({date:-1,createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),Receipt.countDocuments(filter)]);
   ok(res,{items,meta:pageMeta(page,limit,total)});
 });
 
 router.get("/payments", async (req,res)=>{
-  const financialYear=req.query.financialYear||"2026-27",page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=String(req.query.q||"").trim(); const {Payment}=financialModels(req.auth.tenantKey,financialYear);
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=String(req.query.q||"").trim(); const {Payment}=financialModels(req.auth.tenantKey,financialYear);
   const filter={tenantKey:req.auth.tenantKey,financialYear};if(q)filter.$or=[{paymentNo:new RegExp(q,"i")},{partyGlobalId:new RegExp(q,"i")},{partyNameSnapshot:new RegExp(q,"i")},{reference:new RegExp(q,"i")},{remarks:new RegExp(q,"i")},{bankNameSnapshot:new RegExp(q,"i")},{mode:new RegExp(q,"i")}];
   const [items,total]=await Promise.all([Payment.find(filter).sort({date:-1,createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),Payment.countDocuments(filter)]);
   ok(res,{items,meta:pageMeta(page,limit,total)});
 });
 router.post("/payments", async (req,res)=>{
   try{
-    const tenantKey=req.auth.tenantKey,financialYear=req.body.financialYear||"2026-27",amount=Number(req.body.amount||0); if(amount<=0)return fail(res,"Payment amount must be greater than zero");
+    const tenantKey=req.auth.tenantKey,date=transactionDate(req.body.date),financialYear=financialYearFromDate(req.body.date)||financialYearFromDate(date)||await resolveFinancialYear({tenantKey,requested:req.body.financialYear}),amount=Number(req.body.amount||0); if(amount<=0)return fail(res,"Payment amount must be greater than zero");
     const partyId=req.body.partyGlobalId||req.body.party||"";const party=await resolvePostingParty(tenantKey,partyId);if(!party)return fail(res,"Party is not ACTIVE. Complete and verify the migrated profile before Purchase/Payment.",400);
     const mode=upper(req.body.mode||"BANK"),bank=await resolveTransactionBank(tenantKey,mode,req.body.bankAccountId);
-    const {Payment}=financialModels(tenantKey,financialYear); const paymentNo=req.body.paymentNo||makeId("PAY"),date=req.body.date?new Date(req.body.date):new Date();
+    const {Payment}=financialModels(tenantKey,financialYear); const paymentNo=req.body.paymentNo||makeId("PAY");
     const payment=await Payment.create({tenantKey,financialYear,paymentNo,date,partyGlobalId:party.globalCustomerId,partyNameSnapshot:party.localName||party.displayIdentifier,amount,mode,reference:req.body.reference||"",remarks:req.body.remarks||req.body.narration||"",bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,status:"POSTED",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
     await postBalancedEntries({tenantKey,financialYear,transactionId:paymentNo,transactionType:"PAYMENT",date,partyGlobalId:party.globalCustomerId,narration:req.body.remarks||req.body.narration||`Payment ${paymentNo}`,entries:[{accountCode:partyAccountCodeOf(party),debit:amount},{accountCode:bank.accountCode,ledgerId:bank.ledgerId,bankAccountId:bank.bankAccountId,credit:amount}]});
     return ok(res,payment,"Payment posted",201);
@@ -735,7 +796,7 @@ router.post("/payments", async (req,res)=>{
 });
 
 router.get("/expenses", async (req,res)=>{
-  const financialYear=req.query.financialYear||"2026-27",page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=String(req.query.q||"").trim(); const {Expense}=financialModels(req.auth.tenantKey,financialYear);
+  const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=String(req.query.q||"").trim(); const {Expense}=financialModels(req.auth.tenantKey,financialYear);
   const filter={tenantKey:req.auth.tenantKey,financialYear};if(q)filter.$or=[{expenseNo:new RegExp(q,"i")},{accountCode:new RegExp(q,"i")},{nature:new RegExp(q,"i")},{allocationMethod:new RegExp(q,"i")}];
   const [items,total]=await Promise.all([Expense.find(filter).sort({date:-1,createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),Expense.countDocuments(filter)]);
   ok(res,{items,meta:pageMeta(page,limit,total)});
@@ -743,11 +804,11 @@ router.get("/expenses", async (req,res)=>{
 
 router.post("/receipts", async (req, res) => {
   try{
-    const tenantKey=req.auth.tenantKey,financialYear=req.body.financialYear||"2026-27";
+    const tenantKey=req.auth.tenantKey,date=transactionDate(req.body.date),financialYear=financialYearFromDate(req.body.date)||financialYearFromDate(date)||await resolveFinancialYear({tenantKey,requested:req.body.financialYear});
     const amount=Number(req.body.amount||0);if(amount<=0)return fail(res,"Receipt amount must be greater than zero");
     const party=await resolvePostingParty(tenantKey,req.body.customerGlobalId);if(!party)return fail(res,"Party is not ACTIVE. Complete and verify the migrated profile before Receipt/Sales.",400);
     const mode=upper(req.body.mode||"BANK"),bank=await resolveTransactionBank(tenantKey,mode,req.body.bankAccountId);
-    const {Receipt}=financialModels(tenantKey,financialYear);const receiptNo=req.body.receiptNo||makeId("RCT"),date=req.body.date?new Date(req.body.date):new Date();
+    const {Receipt}=financialModels(tenantKey,financialYear);const receiptNo=req.body.receiptNo||makeId("RCT");
     const receipt=await Receipt.create({tenantKey,financialYear,receiptNo,date,customerGlobalId:party.globalCustomerId,partyNameSnapshot:party.localName||party.displayIdentifier,amount,mode,reference:req.body.reference||"",remarks:req.body.remarks||"",bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,bounceStatus:"CLEAR",status:"POSTED",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
     await postBalancedEntries({tenantKey,financialYear,transactionId:receiptNo,transactionType:"RECEIPT",date,partyGlobalId:party.globalCustomerId,narration:req.body.remarks||`Receipt ${receiptNo}`,entries:[{accountCode:bank.accountCode,ledgerId:bank.ledgerId,bankAccountId:bank.bankAccountId,debit:amount},{accountCode:partyAccountCodeOf(party),credit:amount}]});
     return ok(res,receipt,"Receipt posted",201);
@@ -755,10 +816,10 @@ router.post("/receipts", async (req, res) => {
 });
 
 router.post("/expenses", async (req, res) => {
-  const tenantKey = req.auth.tenantKey, financialYear = req.body.financialYear || "2026-27";
+  const tenantKey = req.auth.tenantKey, date = transactionDate(req.body.date), financialYear = financialYearFromDate(req.body.date) || financialYearFromDate(date) || await resolveFinancialYear({tenantKey,requested:req.body.financialYear});
   const amount = Number(req.body.amount || 0); if (amount <= 0) return fail(res, "Expense amount must be greater than zero");
   const { Expense } = financialModels(tenantKey, financialYear);
-  const transactionId = req.body.expenseNo || makeId("EXP"), date = req.body.date ? new Date(req.body.date) : new Date();
+  const transactionId = req.body.expenseNo || makeId("EXP");
   const expense = await Expense.create({ tenantKey, financialYear, expenseNo: transactionId, date, accountCode: req.body.accountCode || "SYS_INDIRECT_EXPENSE", amount, nature: req.body.nature || "FIXED", allocationMethod: req.body.allocationMethod || "TURNOVER", branchId: req.body.branchId, productId: req.body.productId, customerGlobalId: req.body.customerGlobalId, status: "POSTED" });
   await postBalancedEntries({ tenantKey, financialYear, transactionId, transactionType: "EXPENSE", date, partyGlobalId: req.body.customerGlobalId, narration: req.body.narration || "Expense", entries: [
     { accountCode: req.body.accountCode || "SYS_INDIRECT_EXPENSE", debit: amount },

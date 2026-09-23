@@ -1,7 +1,7 @@
 import { google } from "googleapis";
 import { Readable } from "stream";
 import { decryptSecret } from "./crypto.js";
-import { StorageConnection } from "../../model/storageConnection.model.js";
+import { StorageConnection } from "../../models/storageConnection.model.js";
 
 const oauthClient = () => {
   const clientId = process.env.GOOGLE_DRIVE_CLIENT_ID;

@@ -1,5 +1,5 @@
-import { DocumentAsset } from "../model/documentAsset.model.js";
-import { StorageObject } from "../model/storageObject.model.js";
+import { DocumentAsset } from "../models/documentAsset.model.js";
+import { StorageObject } from "../models/storageObject.model.js";
 import { putPrivateFile, getPrivateFileStream } from "../services/storage/storage.service.js";
 
 const ALLOWED_ENTITY_TYPES = new Set([

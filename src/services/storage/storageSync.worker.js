@@ -1,5 +1,5 @@
-import { StorageObject } from "../../model/storageObject.model.js";
-import { StorageConnection } from "../../model/storageConnection.model.js";
+import { StorageObject } from "../../models/storageObject.model.js";
+import { StorageConnection } from "../../models/storageConnection.model.js";
 import { retryStorageObject } from "./storage.service.js";
 import { testGoogleDriveConnection } from "./googleDrive.service.js";
 import { testOneDriveConnection } from "./oneDrive.service.js";

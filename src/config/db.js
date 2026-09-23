@@ -47,7 +47,10 @@ export function getTenantDbName(tenantKey) {
 }
 
 export function getFinancialYearDbName(tenantKey, financialYear) {
-  const fy = String(financialYear || "2026-27").replace(/[^0-9-]/g, "");
+  const now = new Date();
+  const start = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+  const fallback = `${start}-${String((start + 1) % 100).padStart(2, "0")}`;
+  const fy = String(financialYear || fallback).replace(/[^0-9-]/g, "");
   return `${getTenantDbName(tenantKey)}_${fy}`;
 }
 

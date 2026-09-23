@@ -2,7 +2,7 @@ import express from "express";
 import { Pincode, Hsn, IfscMaster, Unit, AccountTemplate, Branding } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok } from "../utils/http.js";
-import { searchTaxpayer, configurationStatus } from "../services/masterGstService.js";
+import { searchTaxpayer, configurationStatus } from "../services/gstService.js";
 import { ensureDefaultTallyAccountTypes } from "../config/defaultTallyAccountTypes.js";
 import { formatIfscContact, getIfscMaster, ifscSnapshot } from "../services/ifscMasterService.js";
 

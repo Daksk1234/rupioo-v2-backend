@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { StorageConnection } from "../model/storageConnection.model.js";
+import { StorageConnection } from "../models/storageConnection.model.js";
 
 const run = async () => {
   const uri = process.env.MONGO_URI || process.env.MONGODB_URI;

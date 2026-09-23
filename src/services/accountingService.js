@@ -1,7 +1,14 @@
 import { useDatabase, getFinancialYearDbName } from "../config/db.js";
 import { fyModels } from "../models/fyModels.js";
+import { isTenantMigrationActive } from "./tenantMigrationLock.js";
 
 export function financialModels(tenantKey, financialYear) {
+  if (isTenantMigrationActive(tenantKey)) {
+    const error = new Error("Company GST/tenant migration is in progress. Retry this request after the migration completes.");
+    error.status = 423;
+    error.code = "TENANT_MIGRATION_RUNNING";
+    throw error;
+  }
   const db = useDatabase(getFinancialYearDbName(tenantKey, financialYear));
   return fyModels(db);
 }

@@ -11,10 +11,27 @@ import { isAdminAuth } from "../utils/adminAccess.js";
 import { getDocumentTemplate } from "../config/documentForms.js";
 import { extractDocument, enrichExtractedValues } from "../services/documentAiService.js";
 import { saveUploadedFile } from "../services/storageService.js";
+import { configuredFinancialYear, financialYearFromDate } from "../utils/financialYear.js";
+import orderFlowRoutes from "./orderFlow.js";
 
 const router = express.Router();
+
+// Order Flow is intentionally mounted INSIDE the long-standing /api/sales-app
+// router. The original V2 server has always mounted /api/sales-app, so this
+// endpoint does not depend on adding a new top-level server route.
+router.get("/order-flow/health", (_req, res) => res.json({
+  ok: true,
+  module: "order-flow",
+  build: "2026-09-20-sales-order-existing-router-v3",
+  time: new Date().toISOString(),
+}));
+router.use("/order-flow", orderFlowRoutes);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 router.use(requireAuth);
+router.use(async (req, _res, next) => {
+  try { req.defaultFinancialYear = await configuredFinancialYear(req.auth?.tenantKey); next(); }
+  catch (error) { next(error); }
+});
 
 const clean = (v) => String(v ?? "").trim();
 const upper = (v) => clean(v).toUpperCase();
@@ -22,13 +39,9 @@ const num = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
 const money = (v) => Math.round((num(v) + Number.EPSILON) * 100) / 100;
 const escapeRx = (v) => clean(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const objectIdText = (v) => /^[a-fA-F0-9]{24}$/.test(clean(v));
-const currentFY = (date = new Date()) => {
-  const d = new Date(date);
-  const y = d.getFullYear();
-  const start = d.getMonth() >= 3 ? y : y - 1;
-  return `${start}-${String(start + 1).slice(-2)}`;
-};
-const fyOf = (req) => clean(req.query.financialYear || req.body?.financialYear) || currentFY();
+const fyOf = (req) => financialYearFromDate(req.body?.date || req.query?.date)
+  || clean(req.query.financialYear || req.body?.financialYear)
+  || clean(req.defaultFinancialYear);
 const startOfDay = (value = new Date()) => {
   const d = new Date(value); d.setHours(0, 0, 0, 0); return d;
 };
@@ -1120,8 +1133,13 @@ router.get("/products", async (req, res) => {
   try {
     const q = clean(req.query.q), page = Math.max(1, Number(req.query.page || 1)), limit = Math.min(100, Math.max(10, Number(req.query.limit || 50)));
     const filter = { tenantKey: req.auth.tenantKey, status: "ACTIVE" }; if (q) { const rx = new RegExp(escapeRx(q), "i"); filter.$or = [{ name: rx }, { sku: rx }, { category: rx }, { hsnCode: rx }]; }
-    const [rows, total] = await Promise.all([Product.find(filter).select("sku name category subCategory hsnCode gstRate basicUnit packingUnit qtyInBag currentStock mrp salePrice").sort({ name: 1 }).skip((page - 1) * limit).limit(limit).lean(), Product.countDocuments(filter)]);
-    const items = rows.map((p) => ({ productId: String(p._id), sku: p.sku, name: p.name, category: p.category, subCategory: p.subCategory, hsnCode: p.hsnCode, gstRate: num(p.gstRate), unit: p.basicUnit || "PCS", packingUnit: p.packingUnit || "", qtyInBag: num(p.qtyInBag || 1), currentStock: num(p.currentStock), mrp: num(p.mrp), listRate: num(p.salePrice) }));
+    const [rows, total] = await Promise.all([Product.find(filter).select("sku name category subCategory hsnCode gstRate basicUnit packingUnit qtyInBag currentStock reservedStock mrp salePrice").sort({ name: 1 }).skip((page - 1) * limit).limit(limit).lean(), Product.countDocuments(filter)]);
+    const items = rows.map((p) => {
+      const physicalStock = num(p.currentStock);
+      const reservedStock = Math.max(0, num(p.reservedStock));
+      const availableStock = Math.max(0, physicalStock - reservedStock);
+      return { productId: String(p._id), sku: p.sku, name: p.name, category: p.category, subCategory: p.subCategory, hsnCode: p.hsnCode, gstRate: num(p.gstRate), unit: p.basicUnit || "PCS", packingUnit: p.packingUnit || "", qtyInBag: num(p.qtyInBag || 1), currentStock: availableStock, availableStock, physicalStock, reservedStock, mrp: num(p.mrp), listRate: num(p.salePrice) };
+    });
     return ok(res, { items, meta: pageMeta(page, limit, total) });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
@@ -1167,7 +1185,7 @@ router.post("/orders", async (req, res) => {
       items.push({ productId: String(p._id), sku: p.sku, nameSnapshot: p.name, hsnSnapshot: p.hsnCode, qty, unit: p.basicUnit || "PCS", packingUnit: p.packingUnit || "", qtyInBag: num(p.qtyInBag || 1), listRate, rate, discountPct, taxable, gstRateSnapshot: gstRate, tax, lineTotal });
     }
     if (!items.length) return fail(res, "Enter quantity for at least one product", 400);
-    const { SalesOrder } = financialModels(req.auth.tenantKey, financialYear);
+    const { SalesOrder, OrderEvent, OrderNotification } = financialModels(req.auth.tenantKey, financialYear);
     const [balanceMap, pendingAgg] = await Promise.all([
       receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: [customer.globalCustomerId] }),
       SalesOrder.aggregate([
@@ -1184,6 +1202,11 @@ router.post("/orders", async (req, res) => {
     const creditHold = creditLimit > 0 && exceededBy > 0;
     let orderNo = clean(req.body.orderNo) || makeId("SO");
     while (await SalesOrder.exists({ tenantKey: req.auth.tenantKey, financialYear, orderNo })) orderNo = makeId("SO");
+    const orderChannel = ["DMS", "CUSTOMER", "SALESPERSON_ON_BEHALF"].includes(upper(req.body.orderChannel))
+      ? upper(req.body.orderChannel)
+      : "SALESPERSON_ON_BEHALF";
+    const customerOtpRequired = orderChannel === "SALESPERSON_ON_BEHALF";
+    const workflowStatus = creditHold ? "CREDIT_HOLD" : customerOtpRequired ? "OTP_PENDING" : "ORDER_PLACED";
     const order = await SalesOrder.create({
       tenantKey: req.auth.tenantKey,
       financialYear,
@@ -1192,6 +1215,11 @@ router.post("/orders", async (req, res) => {
       customerGlobalId: customer.globalCustomerId,
       customerNameSnapshot: customerName(customer),
       salespersonId: clean(customer.salespersonId || req.auth.sub),
+      orderChannel,
+      customerOtpRequired,
+      workflowStatus,
+      nextAction: creditHold ? "Credit approval required" : customerOtpRequired ? "Customer OTP verification required" : "Verify order",
+      lastWorkflowAt: new Date(),
       source: ["MANUAL", "REPEAT", "SUGGESTED"].includes(upper(req.body.source)) ? upper(req.body.source) : "MANUAL",
       repeatFromOrderNo: clean(req.body.repeatFromOrderNo),
       repeatFromInvoiceNo: clean(req.body.repeatFromInvoiceNo),
@@ -1213,7 +1241,23 @@ router.post("/orders", async (req, res) => {
       createdBy: req.auth.sub,
       createdByNameSnapshot: req.auth.name || "",
     });
-    return ok(res, order, creditHold ? "Order saved on credit hold for approval" : "Sales order submitted", 201);
+    const eventNo = makeId("EVT");
+    await OrderEvent.create({
+      tenantKey: req.auth.tenantKey, financialYear, eventNo, orderId: String(order._id), orderNo: order.orderNo,
+      type: "ORDER_CREATED", fromStatus: "", toStatus: workflowStatus,
+      note: orderChannel === "CUSTOMER" ? "Order placed directly by customer" : orderChannel === "SALESPERSON_ON_BEHALF" ? "Order placed by salesperson on behalf of customer" : "Order created from DMS",
+      meta: { orderChannel, grandTotal: money(grandTotal), creditHold }, audience: ["DMS", "CUSTOMER", "SALESPERSON"],
+      actorId: req.auth.sub, actorNameSnapshot: req.auth.name || "", actorRole: req.auth.role || "", occurredAt: new Date(),
+    });
+    await OrderNotification.insertMany([
+      { recipientType: "CUSTOMER", recipientId: customer.globalCustomerId },
+      ...(clean(customer.salespersonId || req.auth.sub) ? [{ recipientType: "SALESPERSON", recipientId: clean(customer.salespersonId || req.auth.sub) }] : []),
+    ].map((row) => ({ tenantKey: req.auth.tenantKey, financialYear, notificationNo: makeId("NTF"), orderId: String(order._id), orderNo: order.orderNo, eventNo, ...row, channel: "IN_APP", title: `Order ${order.orderNo} received`, body: creditHold ? "Order received and waiting for credit approval" : customerOtpRequired ? "Order received; customer OTP verification is required" : "Order received and waiting for verification", data: { workflowStatus }, status: "PENDING" })));
+    return ok(res, {
+      ...order.toObject(),
+      requiresCustomerOtp: customerOtpRequired && !creditHold,
+      customerOtpEndpoint: customerOtpRequired && !creditHold ? `/api/sales-app/order-flow/orders/${order._id}/customer-otp?financialYear=${encodeURIComponent(financialYear)}` : "",
+    }, creditHold ? "Order saved on credit hold for approval" : customerOtpRequired ? "Order saved; customer OTP verification is required" : "Sales order submitted", 201);
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
@@ -1221,13 +1265,20 @@ router.patch("/orders/:id/credit-decision", async (req, res) => {
   try {
     if (!isAdminAuth(req.auth)) return fail(res, "Administrator approval is required", 403);
     const financialYear = fyOf(req);
-    const { SalesOrder } = financialModels(req.auth.tenantKey, financialYear);
+    const { SalesOrder, OrderEvent, OrderNotification } = financialModels(req.auth.tenantKey, financialYear);
     const order = await SalesOrder.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear });
     if (!order) return fail(res, "Sales order not found", 404);
     if (order.status !== "CREDIT_HOLD") return ok(res, order, `Order is already ${order.status}`);
     const action = upper(req.body.action || "APPROVE");
     if (!["APPROVE", "REJECT"].includes(action)) return fail(res, "Action must be APPROVE or REJECT", 400);
     order.status = action === "APPROVE" ? "APPROVED" : "REJECTED";
+    order.workflowStatus = action === "APPROVE"
+      ? (order.customerOtpRequired && !order.customerOtpVerifiedAt ? "OTP_PENDING" : "ORDER_PLACED")
+      : "REJECTED";
+    order.nextAction = action === "APPROVE"
+      ? (order.customerOtpRequired && !order.customerOtpVerifiedAt ? "Customer OTP verification required" : "Verify order")
+      : "Rejected";
+    order.lastWorkflowAt = new Date();
     order.creditControl = {
       ...(order.creditControl?.toObject?.() || order.creditControl || {}),
       decision: action,
@@ -1237,6 +1288,12 @@ router.patch("/orders/:id/credit-decision", async (req, res) => {
       decisionRemark: clean(req.body.remarks),
     };
     await order.save();
+    const eventNo = makeId("EVT");
+    await OrderEvent.create({ tenantKey: req.auth.tenantKey, financialYear, eventNo, orderId: String(order._id), orderNo: order.orderNo, type: action === "APPROVE" ? "CREDIT_APPROVED" : "CREDIT_REJECTED", fromStatus: "CREDIT_HOLD", toStatus: order.workflowStatus, note: action === "APPROVE" ? "Credit hold approved" : "Credit hold rejected", meta: { remarks: clean(req.body.remarks), exceededBy: num(order.creditControl?.exceededBy) }, audience: ["DMS", "CUSTOMER", "SALESPERSON"], actorId: req.auth.sub, actorNameSnapshot: req.auth.name || "", actorRole: req.auth.role || "", occurredAt: new Date() });
+    await OrderNotification.insertMany([
+      { recipientType: "CUSTOMER", recipientId: order.customerGlobalId },
+      ...(order.salespersonId ? [{ recipientType: "SALESPERSON", recipientId: order.salespersonId }] : []),
+    ].map((row) => ({ tenantKey: req.auth.tenantKey, financialYear, notificationNo: makeId("NTF"), orderId: String(order._id), orderNo: order.orderNo, eventNo, ...row, channel: "IN_APP", title: `Order ${order.orderNo}: credit ${action === "APPROVE" ? "approved" : "rejected"}`, body: clean(req.body.remarks) || (action === "APPROVE" ? "Order can continue for verification" : "Order was rejected during credit approval"), data: { workflowStatus: order.workflowStatus }, status: "PENDING" })));
     return ok(res, order, action === "APPROVE" ? "Credit hold approved" : "Credit hold rejected");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });

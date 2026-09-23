@@ -1,4 +1,4 @@
-import { Product } from "../model/product.model.js";
+import { Product } from "../models/product.model.js";
 
 const isTrue = (v) =>
   v === true || String(v).toLowerCase() === "true" || v === 1 || v === "1";

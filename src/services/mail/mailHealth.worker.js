@@ -1,4 +1,4 @@
-import { MailConnection } from "../../model/mailConnection.model.js";
+import { MailConnection } from "../../models/mailConnection.model.js";
 import { testCompanyMailConnection } from "./mail.service.js";
 
 let timer = null;

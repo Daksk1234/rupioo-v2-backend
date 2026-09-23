@@ -20,6 +20,9 @@ import { defaultRoleTemplates, MASTER_TEMPLATE_TENANT } from "../config/defaultR
 import { userReferenceDetails } from "../services/referenceIntegrityService.js";
 import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { reassignOpenLeadsForPincodes } from "../services/leadAssignmentService.js";
+import { ensureSystemCashAccount, isSystemCashRecord } from "../services/systemCashAccountService.js";
+import { gstChangeConfirmation, migrateCompanyTenantKey, validateGstinChangeTarget } from "../services/tenantMigrationService.js";
+import { isTenantKeyReserved, resolveTenantKeyAlias } from "../services/tenantKeyService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -84,7 +87,10 @@ const pincodeProfile = async (value, fallback={}) => {
     state:String(row?.state||fallback.state||"").trim(),
   };
 };
-const tenantFilter = (req) => req.auth.role === "MASTER" && req.query.tenantKey ? String(req.query.tenantKey) : req.auth.tenantKey;
+const tenantFilter = async (req) => {
+  const raw = req.auth.role === "MASTER" && req.query.tenantKey ? String(req.query.tenantKey) : req.auth.tenantKey;
+  return req.auth.role === "MASTER" ? resolveTenantKeyAlias(raw) : raw;
+};
 
 // Shared authenticated MASTER-pincode lookup used by both User and Customer.
 // It intentionally does not require User-management permission because a user
@@ -117,7 +123,7 @@ const salesHeadAncestorForUser=async(tenantKey,startUserId)=>{
 const pincodeTreeScope=async(req)=>{
   const scopeUserId=String(req.query.scopeUserId||"").trim();
   if(!scopeUserId)return {};
-  const head=await salesHeadAncestorForUser(tenantFilter(req),scopeUserId);
+  const head=await salesHeadAncestorForUser(await tenantFilter(req),scopeUserId);
   if(!head)return {};
   const pins=Array.from(new Set((head.coveragePincodes||[]).map(x=>cleanDigits(x).slice(0,6)).filter(x=>x.length===6)));
   return pins.length?{pincode:{$in:pins}}:{_id:{$exists:false}};
@@ -245,7 +251,7 @@ router.get("/pincode-tree/list",async(req,res)=>{
 });
 
 router.get("/user-assignment-options",async(req,res)=>{
-  const tenantKey=tenantFilter(req);
+  const tenantKey=await tenantFilter(req);
   const role=await Role.findOne({_id:req.query.roleId,tenantKey,status:"ACTIVE"}).lean();
   if(!role)return fail(res,"Select a valid Role",404);
   const department=role.departmentId?await Department.findOne({_id:role.departmentId,tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).lean():null;
@@ -794,13 +800,13 @@ const branchLimitForTenant=async(tenantKey,planCode="")=>{
   return {limit,profile,plan};
 };
 router.get("/branches", async (req,res) => {
-  const tenantKey=req.auth.role==="MASTER"&&req.query.tenantKey?normalizeCode(req.query.tenantKey):req.auth.tenantKey;
+  const tenantKey=req.auth.role==="MASTER"&&req.query.tenantKey?await resolveTenantKeyAlias(normalizeCode(req.query.tenantKey)):req.auth.tenantKey;
   const [rows,cap]=await Promise.all([BranchOffice.find({tenantKey,status:{$ne:"INACTIVE"}}).sort({name:1}).lean(),branchLimitForTenant(tenantKey,req.auth.planCode)]);
   return ok(res,{items:rows,limit:cap.limit,used:rows.length,remaining:Math.max(0,cap.limit-rows.length)});
 });
 router.post("/branches", async (req,res) => {
   if(!["SUPERADMIN","MASTER"].includes(req.auth.role))return fail(res,"Only SUPERADMIN or MASTER can create a branch",403);
-  const tenantKey=req.auth.role==="MASTER"?normalizeCode(req.body.tenantKey):req.auth.tenantKey;
+  const tenantKey=req.auth.role==="MASTER"?await resolveTenantKeyAlias(normalizeCode(req.body.tenantKey)):req.auth.tenantKey;
   const branchCode=normalizeCode(req.body.branchCode||req.body.name);
   if(!tenantKey||!branchCode||!req.body.name)return fail(res,"Branch code and name are required",400);
   const cap=await branchLimitForTenant(tenantKey,req.auth.planCode);
@@ -939,14 +945,14 @@ router.delete("/roles/:id", async (req,res) => {
 
 // ---------- Company permission groups ----------
 router.get("/groups", async (req,res) => {
-  const tenantKey=tenantFilter(req);
+  const tenantKey=await tenantFilter(req);
   const rows=await Group.find({tenantKey}).sort({name:1}).lean();
   return ok(res,rows);
 });
 
 router.post("/groups", async (req,res) => {
   if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
-  const tenantKey=req.auth.role==="MASTER"&&req.body.tenantKey?req.body.tenantKey:req.auth.tenantKey;
+  const tenantKey=req.auth.role==="MASTER"&&req.body.tenantKey?await resolveTenantKeyAlias(req.body.tenantKey):req.auth.tenantKey;
   const payload=groupPayload(req.body);
   if(!payload.name||!payload.code) return fail(res,"Group name and code are required",400);
   if(req.auth.role!=="MASTER"){
@@ -984,7 +990,7 @@ router.delete("/groups/:id", async (req,res) => {
 });
 
 router.get("/users", async (req,res) => {
-  const tenantKey=tenantFilter(req), page=Number(req.query.page||1), limit=Math.min(200,Number(req.query.limit||50)), q=String(req.query.q||"").trim();
+  const tenantKey=await tenantFilter(req), page=Number(req.query.page||1), limit=Math.min(200,Number(req.query.limit||50)), q=String(req.query.q||"").trim();
   const filter={tenantKey};
   if(q) filter.$or=[
     {name:new RegExp(q,"i")},{email:new RegExp(q,"i")},{accountType:new RegExp(q,"i")},
@@ -1028,7 +1034,7 @@ function buildAccessExportWorkbook(columns,rows,sheetName){
 router.get("/users/export-data.xlsx",async(req,res)=>{
   if(String(req.auth?.role||"").toUpperCase()!=="SUPERADMIN")return fail(res,"Superadmin access required",403);
   try{
-    const tenantKey=tenantFilter(req);
+    const tenantKey=await tenantFilter(req);
     const docs=await User.find({tenantKey}).select("-passwordHash -aadhaarHash -coveragePincodes").populate("roleId","name code hierarchyOrder departmentId").populate("departmentId","name code status").populate("assignedToUserId","name role designation").populate("branchId","name branchCode").sort({createdAt:-1}).lean();
     const idText=v=>String(v?._id||v||"");
     const rows=docs.map(u=>{const ledger=(u.accountingMappings||[]).find(x=>x?.status!=="INACTIVE")||(u.accountingMappings||[])[0]||{};return {
@@ -1042,8 +1048,8 @@ router.get("/users/export-data.xlsx",async(req,res)=>{
 });
 
 router.get("/users/options", async (req,res) => {
-  const tenantKey=tenantFilter(req);
-  const docs=await User.find({tenantKey,status:"ACTIVE"}).select("name email mobile accountType tallyAccountTypeName tallyAccountTypeCode designation salary role roleId departmentId department pincode city district state loginEnabled").populate("roleId","name code hierarchyOrder departmentId").populate("departmentId","name code").sort({name:1}).lean();
+  const tenantKey=await tenantFilter(req);
+  const docs=await User.find({tenantKey,status:"ACTIVE"}).select("name email mobile accountType tallyAccountTypeName tallyAccountTypeCode designation salary role roleId departmentId department pincode city district state loginEnabled systemManaged systemKey systemNote").populate("roleId","name code hierarchyOrder departmentId").populate("departmentId","name code").sort({name:1}).lean();
   return ok(res,docs.map(publicUser));
 });
 
@@ -1361,7 +1367,7 @@ const replaceSalesRolePincodes=async({tenantKey,user,roleDoc,pincodes,actorId})=
 
 router.post("/users", async (req,res) => {
   if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
-  const tenantKey=req.auth.role==="MASTER" && req.body.tenantKey ? req.body.tenantKey : req.auth.tenantKey;
+  const tenantKey=req.auth.role==="MASTER" && req.body.tenantKey ? await resolveTenantKeyAlias(req.body.tenantKey) : req.auth.tenantKey;
   const name=String(req.body.name||"").trim();
   if(!name) return fail(res,"Name is required");
 
@@ -1476,6 +1482,7 @@ router.put("/users/:id", async (req,res) => {
   if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
   const user=await User.findById(req.params.id); if(!user) return fail(res,"User not found",404);
   if(req.auth.role!=="MASTER" && user.tenantKey!==req.auth.tenantKey) return fail(res,"User not found",404);
+  if(isSystemCashRecord(user)) return fail(res,"CASH is a system-managed account and cannot be edited, assigned or deleted",409);
   const oldDepartmentId=user.departmentId?String(user.departmentId):"";
   const payload={};
   let nextTallyForMode=null;
@@ -1600,6 +1607,7 @@ router.post("/users/:id/reset-password", async (req,res) => {
   const password=String(req.body.password||""); if(password.length<8) return fail(res,"Password must be at least 8 characters");
   const user=await User.findById(req.params.id); if(!user) return fail(res,"User not found",404);
   if(req.auth.role!=="MASTER" && user.tenantKey!==req.auth.tenantKey) return fail(res,"User not found",404);
+  if(isSystemCashRecord(user)) return fail(res,"CASH is system-managed and does not have a login password",409);
   if(user.loginEnabled===false)return fail(res,"System Login is disabled for this person. Edit the person and enable System Login first.",409);
   user.passwordHash=await bcrypt.hash(password,12); await user.save(); return ok(res,{reset:true},"Password reset");
 });
@@ -1608,6 +1616,7 @@ router.post("/users/:id/status", async (req,res) => {
   if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
   const user=await User.findById(req.params.id); if(!user) return fail(res,"User not found",404);
   if(req.auth.role!=="MASTER" && user.tenantKey!==req.auth.tenantKey) return fail(res,"User not found",404);
+  if(isSystemCashRecord(user)) return fail(res,"CASH is a protected system account and cannot be deactivated or deleted",409);
   const nextStatus=req.body.status === "INACTIVE" ? "INACTIVE" : "ACTIVE";
   if(nextStatus==="INACTIVE"&&user.status!=="INACTIVE"){
     const references=await userReferenceDetails(user.tenantKey,String(user._id));
@@ -2060,7 +2069,7 @@ router.put("/department-role-assignment/:departmentId", async (req,res) => {
 });
 
 router.get("/hierarchy", async (req,res) => {
-  const tenantKey=tenantFilter(req);
+  const tenantKey=await tenantFilter(req);
   if(req.auth.role!=="MASTER")await migrateLegacyTenantDepartments(tenantKey);
   const [departments,roles,users,assignments]=await Promise.all([
     Department.find({tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).sort({name:1}).lean(),
@@ -2079,7 +2088,7 @@ router.get("/hierarchy", async (req,res) => {
 });
 
 router.get("/sales-pincode-users", async (req,res) => {
-  const tenantKey=tenantFilter(req),q=String(req.query.q||"").trim().toLowerCase();
+  const tenantKey=await tenantFilter(req),q=String(req.query.q||"").trim().toLowerCase();
   const roles=await Role.find({tenantKey,status:"ACTIVE"}).select("name code departmentId hierarchyOrder").lean();
   const roleMap=new Map(roles.map(r=>[String(r._id),r]));
   const geoRoles=roles.filter(r=>["SALES_HEAD","SALES_PERSON"].includes(String(r.code||"").toUpperCase()));
@@ -2107,7 +2116,7 @@ router.get("/sales-pincode-users", async (req,res) => {
 });
 
 router.get("/users/:id/pincodes", async (req,res) => {
-  const tenantKey=tenantFilter(req);
+  const tenantKey=await tenantFilter(req);
   const user=await User.findOne({_id:req.params.id,tenantKey}).select("name role roleId departmentId assignedToUserId coveragePincodes status").lean();
   if(!user)return fail(res,"User not found",404);
   const role=await Role.findOne({_id:user.roleId,tenantKey}).select("name code departmentId").lean();
@@ -2120,7 +2129,7 @@ router.get("/users/:id/pincodes", async (req,res) => {
 
 router.put("/users/:id/pincodes", async (req,res) => {
   if(!canManageAccess(req))return fail(res,"Access administration permission required",403);
-  const tenantKey=tenantFilter(req);
+  const tenantKey=await tenantFilter(req);
   const user=await User.findOne({_id:req.params.id,tenantKey});
   if(!user)return fail(res,"User not found",404);
   const roleDoc=await Role.findOne({_id:user.roleId,tenantKey,status:"ACTIVE"});
@@ -2141,13 +2150,13 @@ router.put("/users/:id/pincodes", async (req,res) => {
 });
 
 router.get("/pincode-assignments", async (req,res) => {
-  const tenantKey=tenantFilter(req),filter={tenantKey};if(req.query.departmentId)filter.departmentId=req.query.departmentId;if(req.query.pincode)filter.pincode=String(req.query.pincode).replace(/\D/g,"").slice(0,6);
+  const tenantKey=await tenantFilter(req),filter={tenantKey};if(req.query.departmentId)filter.departmentId=req.query.departmentId;if(req.query.pincode)filter.pincode=String(req.query.pincode).replace(/\D/g,"").slice(0,6);
   const rows=await PincodeAssignment.find(filter).populate("departmentId","name code status").populate("userIds","name email role").sort({pincode:1}).lean();return ok(res,rows);
 });
 
 router.post("/pincode-assignments", async (req,res) => {
   if(!canManageAccess(req))return fail(res,"Access administration permission required",403);
-  const tenantKey=tenantFilter(req),departmentId=req.body.departmentId;
+  const tenantKey=await tenantFilter(req),departmentId=req.body.departmentId;
   const department=await Department.findOne({_id:departmentId,tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).lean();if(!department)return fail(res,"Department not found",404);
   const rawPins=Array.isArray(req.body.pincodes)?req.body.pincodes:String(req.body.pincodes||req.body.pincode||"").split(/[,;\s]+/);
   const pincodes=Array.from(new Set(rawPins.map(x=>String(x||"").replace(/\D/g,"").slice(0,6)).filter(x=>x.length===6)));
@@ -2170,7 +2179,7 @@ router.post("/pincode-assignments", async (req,res) => {
 
 router.delete("/pincode-assignments/:id", async (req,res) => {
   if(!canManageAccess(req))return fail(res,"Access administration permission required",403);
-  const tenantKey=tenantFilter(req);const row=await PincodeAssignment.findOneAndUpdate({_id:req.params.id,tenantKey},{$set:{status:"INACTIVE",updatedBy:req.auth.sub}},{new:true});if(!row)return fail(res,"Pincode assignment not found",404);
+  const tenantKey=await tenantFilter(req);const row=await PincodeAssignment.findOneAndUpdate({_id:req.params.id,tenantKey},{$set:{status:"INACTIVE",updatedBy:req.auth.sub}},{new:true});if(!row)return fail(res,"Pincode assignment not found",404);
   const options=await getAssignmentOptions(tenantKey,row.pincode);
   if(options.users.length===0)await CustomerLink.updateMany({tenantKey,"addresses.pincode":row.pincode},{$set:{salespersonId:""}});
   else if(options.users.length===1)await CustomerLink.updateMany({tenantKey,"addresses.pincode":row.pincode},{$set:{salespersonId:options.users[0]._id}});
@@ -2180,7 +2189,7 @@ router.delete("/pincode-assignments/:id", async (req,res) => {
 });
 
 router.get("/assignment-options", async (req,res) => {
-  return ok(res,await getAssignmentOptions(tenantFilter(req),req.query.pincode));
+  return ok(res,await getAssignmentOptions(await tenantFilter(req),req.query.pincode));
 });
 
 router.get("/superadmins", async (req,res) => {
@@ -2372,6 +2381,28 @@ router.put("/superadmins/:id", async (req,res) => {
   if(!profile) return fail(res,"Company profile not found",404);
   if(String(profile.status).toUpperCase()==="DELETED") return fail(res,"Restore this company before editing it",409);
 
+  const requestedGstin=normalizeGstin(req.body.gstin ?? profile.gstin ?? profile.tenantKey);
+  let tenantMigration=null;
+  const gstChanged=requestedGstin!==normalizeGstin(profile.gstin);
+  const tenantMoveRequested=req.body.migrateTenantData===true&&requestedGstin!==String(profile.tenantKey||"").trim();
+  if(gstChanged||tenantMoveRequested){
+    try{await validateGstinChangeTarget({profile,nextGstin:requestedGstin});}
+    catch(error){return fail(res,error.message,error.status||409,{code:error.code||"GST_CHANGE_FAILED"});}
+    const gstPan=panFromGstin(requestedGstin);
+    const requestedPan=normalizePan(req.body.pan||gstPan||profile.pan);
+    if(gstPan&&requestedPan!==gstPan) return fail(res,`PAN must match the PAN embedded in GSTIN (${gstPan})`,400);
+    if(gstChanged&&typeof req.body.migrateTenantData!=="boolean") return fail(
+      res,
+      "GST Number changed. Confirm whether all company data should move to the new GST tenantKey.",
+      409,
+      gstChangeConfirmation(profile,requestedGstin)
+    );
+    profile.gstin=requestedGstin;
+    profile.pan=requestedPan;
+  }else if(req.body.pan!==undefined){
+    profile.pan=normalizePan(req.body.pan);
+  }
+
   const email=String(req.body.email ?? profile.email ?? user.email).trim().toLowerCase();
   if(!/^\S+@\S+\.\S+$/.test(email)) return fail(res,"Enter a valid email ID",400);
   const duplicate=await User.exists({email,_id:{$ne:user._id}});
@@ -2397,14 +2428,27 @@ router.put("/superadmins/:id", async (req,res) => {
   profile.email=email;
   profile.registeredAddress=String(req.body.registeredAddress ?? req.body.address ?? profile.registeredAddress ?? "").trim();
   profile.pincode=digits(req.body.pincode ?? profile.pincode).slice(0,6);
+  profile.area=String(req.body.area ?? profile.area ?? "").trim();
   profile.city=String(req.body.city ?? profile.city ?? "").trim();
+  profile.district=String(req.body.district ?? profile.district ?? "").trim();
   profile.state=String(req.body.state ?? profile.state ?? "").trim();
+  if(req.body.bankDetails && typeof req.body.bankDetails === "object") profile.bankDetails={...(profile.bankDetails?.toObject?.()||profile.bankDetails||{}),...req.body.bankDetails};
+  if(req.body.gstVerified!==undefined) profile.gstVerification={...(profile.gstVerification?.toObject?.()||profile.gstVerification||{}),verified:Boolean(req.body.gstVerified),source:String(req.body.gstSource||profile.gstVerification?.source||""),status:String(req.body.gstStatus||profile.gstVerification?.status||""),taxpayerType:String(req.body.gstTaxpayerType||profile.gstVerification?.taxpayerType||""),constitution:String(req.body.gstConstitution||profile.gstVerification?.constitution||""),verifiedAt:req.body.gstVerified?new Date():profile.gstVerification?.verifiedAt};
   profile.financialYear=financialYear;
   profile.financialYears=financialYears;
   profile.hasMultipleBranches=hasMultipleBranches;
   profile.branchCount=branchCount;
   profile.autoRenew=Boolean(req.body.autoRenew ?? profile.autoRenew);
   profile.graceDays=Math.max(0,Math.min(365,Number(req.body.graceDays ?? profile.graceDays ?? 0)));
+
+  // Run the tenant move only after every normal edit validation above has
+  // passed, so a later form validation error can never leave a half-changed tenant.
+  if(tenantMoveRequested){
+    try{tenantMigration=await migrateCompanyTenantKey({companyProfileId:String(profile._id),oldTenantKey:profile.tenantKey,newGstin:requestedGstin,actorId:req.auth.sub,actorRole:req.auth.role});}
+    catch(error){return fail(res,error.message,error.status||500,{code:error.code||"TENANT_MIGRATION_FAILED"});}
+    profile.tenantKey=requestedGstin;
+    user.tenantKey=requestedGstin;
+  }
   await profile.save();
 
   user.name=profile.companyName;
@@ -2415,7 +2459,15 @@ router.put("/superadmins/:id", async (req,res) => {
   const safeUser=user.toObject();delete safeUser.passwordHash;
   const safeProfile=profile.toObject();delete safeProfile.aadhaarHash;
   if(Array.isArray(safeProfile.stakeholders)) safeProfile.stakeholders=safeProfile.stakeholders.map(({aadhaarHash,...rest})=>rest);
-  return ok(res,{user:safeUser,companyProfile:safeProfile,subscription:subscriptionSnapshot(safeProfile)},"Superadmin company details updated");
+  return ok(res,{
+    user:safeUser,
+    companyProfile:safeProfile,
+    subscription:subscriptionSnapshot(safeProfile),
+    gstChanged,
+    tenantMigration,
+    tenantKeyChanged:Boolean(tenantMigration?.changed),
+    newTenantKey:tenantMigration?.newTenantKey||safeProfile.tenantKey
+  },tenantMigration?.changed?"GSTIN updated and company data moved to the new tenantKey":"Superadmin company details updated");
 });
 
 router.post("/superadmins/:id/company-status", async (req,res) => {
@@ -2536,8 +2588,11 @@ router.post("/superadmins", async (req,res) => {
   const companyType=normalizeCode(req.body.companyType||"");
   const address=String(req.body.address||req.body.registeredAddress||"").trim();
   const pincode=digits(req.body.pincode).slice(0,6);
+  const area=String(req.body.area||"").trim();
   const city=String(req.body.city||"").trim();
+  const district=String(req.body.district||"").trim();
   const state=String(req.body.state||"").trim();
+  const bankDetails=req.body.bankDetails&&typeof req.body.bankDetails==="object"?req.body.bankDetails:{};
   const mobile=digits(req.body.mobile).slice(-10);
   const email=String(req.body.email||"").trim().toLowerCase();
   const password=String(req.body.password||"");
@@ -2569,6 +2624,7 @@ router.post("/superadmins", async (req,res) => {
   if(await User.exists({email})) return fail(res,"A user with this email already exists",409);
   if(await User.exists({tenantKey,role:"SUPERADMIN"})) return fail(res,"This GSTIN already has a Superadmin",409);
   if(await CompanyProfile.exists({$or:[{tenantKey},{gstin}]})) return fail(res,"This GSTIN already has a company profile",409);
+  if(await isTenantKeyReserved(tenantKey)) return fail(res,"This GSTIN is reserved by a previous tenant migration and cannot be reused",409);
 
   await ensureLegalAccountTemplates();
   const plan=await Plan.findOne({code:planCode,status:"ACTIVE"}).lean();
@@ -2633,7 +2689,7 @@ router.post("/superadmins", async (req,res) => {
       tenantKey,companyName,tradeName,companyType,gstin,pan,
       aadhaarHash:aadhaar.length===12?hashAadhaar(aadhaar):"",
       aadhaarMasked:aadhaar.length===12?maskAadhaar(aadhaar):"",
-      mobile,email,registeredAddress:address,pincode,city,state,financialYear,financialYears,
+      mobile,email,registeredAddress:address,pincode,area,city,district,state,bankDetails,financialYear,financialYears,
       hasMultipleBranches,branchCount,planCode:plan.code,planGroupCode:plan.groupCode||"",billingCycle,
       paymentStatus:payment.status,paymentRef:payment.paymentRef,
       subscriptionStartAt,subscriptionEndAt,renewalDate:subscriptionEndAt,lastRenewedAt:subscriptionStartAt,subscriptionStatus:"ACTIVE",
@@ -2648,6 +2704,8 @@ router.post("/superadmins", async (req,res) => {
     await createCompanyBaseLedgers(createdProfile);
     for(const stakeholder of createdProfile.stakeholders.filter(x=>x.active)) await syncStakeholderLedgers({tenantKey,companyType,stakeholder,financialYear});
     payment.tenantKey=tenantKey;payment.linkedUserId=String(createdUser._id);payment.linkedCompanyProfileId=String(createdProfile._id);payment.subscriptionStartAt=subscriptionStartAt;payment.subscriptionEndAt=subscriptionEndAt;await payment.save();
+
+    await ensureSystemCashAccount({tenantKey,tenantId:String(createdProfile._id),planCode:plan.code,actorId:String(createdUser._id)});
 
     const safe=createdUser.toObject();delete safe.passwordHash;
     return ok(res,{...safe,companyProfile:createdProfile,payment:{paymentRef:payment.paymentRef,status:payment.status,amountRupees:payment.amountRupees,billingCycle:payment.billingCycle}},"Company and Superadmin created successfully",201);

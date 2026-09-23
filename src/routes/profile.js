@@ -4,6 +4,7 @@ import { CompanyProfile, Group, Plan, PlatformPayment, User } from "../models/in
 import { requireAuth } from "../middleware/auth.js";
 import { fail, ok } from "../utils/http.js";
 import { subscriptionSnapshot } from "../utils/subscription.js";
+import { gstChangeConfirmation, migrateCompanyTenantKey, normalizeCompanyGstin, validateGstinChangeTarget } from "../services/tenantMigrationService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -85,6 +86,30 @@ router.put("/", async (req, res) => {
   const company = await CompanyProfile.findOne({ tenantKey: req.auth.tenantKey });
   if (!user || !company) return fail(res, "Superadmin/company profile not found", 404);
 
+  const requestedGstin = normalizeCompanyGstin(req.body.gstin ?? company.gstin ?? company.tenantKey);
+  let tenantMigration = null;
+  const gstChanged = requestedGstin !== normalizeCompanyGstin(company.gstin);
+  const tenantMoveRequested = req.body.migrateTenantData === true && requestedGstin !== String(company.tenantKey || "").trim();
+  if (gstChanged || tenantMoveRequested) {
+    try { await validateGstinChangeTarget({ profile: company, nextGstin: requestedGstin }); }
+    catch (error) { return fail(res, error.message, error.status || 409, { code: error.code || "GST_CHANGE_FAILED" }); }
+    const gstPan = requestedGstin.slice(2, 12);
+    const requestedPan = clean(req.body.pan || gstPan || company.pan).toUpperCase();
+    if (gstPan && requestedPan !== gstPan) return fail(res, `PAN must match the PAN embedded in GSTIN (${gstPan})`, 400);
+    if (gstChanged && typeof req.body.migrateTenantData !== "boolean") {
+      return fail(
+        res,
+        "GST Number changed. Confirm whether all company data should move to the new GST tenantKey.",
+        409,
+        gstChangeConfirmation(company, requestedGstin),
+      );
+    }
+    company.gstin = requestedGstin;
+    company.pan = requestedPan;
+  } else if (req.body.pan !== undefined) {
+    company.pan = clean(req.body.pan).toUpperCase();
+  }
+
   const nextEmail = lower(req.body.email ?? user.email);
   if (!nextEmail || !/^\S+@\S+\.\S+$/.test(nextEmail)) {
     return fail(res, "Enter a valid email address", 400);
@@ -98,8 +123,25 @@ router.put("/", async (req, res) => {
   user.mobile = clean(req.body.mobile ?? user.mobile);
   await user.save();
 
-  for (const key of ["companyName", "tradeName", "mobile", "email", "registeredAddress", "pincode", "city", "state", "logoFileId", "signatureFileId", "invoiceTerms", "gpayNumber"]) {
+  for (const key of ["companyName", "tradeName", "mobile", "email", "registeredAddress", "pincode", "area", "city", "district", "state", "logoFileId", "signatureFileId", "invoiceTerms", "gpayNumber"]) {
     if (req.body[key] !== undefined) company[key] = clean(req.body[key]);
+  }
+
+
+
+  if (req.body.bankDetails && typeof req.body.bankDetails === "object") {
+    company.bankDetails = { ...(company.bankDetails?.toObject?.() || company.bankDetails || {}), ...req.body.bankDetails };
+  }
+  if (req.body.gstVerified !== undefined) {
+    company.gstVerification = {
+      ...(company.gstVerification?.toObject?.() || company.gstVerification || {}),
+      verified: Boolean(req.body.gstVerified),
+      source: clean(req.body.gstSource || company.gstVerification?.source || ""),
+      status: clean(req.body.gstStatus || company.gstVerification?.status || ""),
+      taxpayerType: clean(req.body.gstTaxpayerType || company.gstVerification?.taxpayerType || ""),
+      constitution: clean(req.body.gstConstitution || company.gstVerification?.constitution || ""),
+      verifiedAt: req.body.gstVerified ? new Date() : company.gstVerification?.verifiedAt,
+    };
   }
 
   if (req.body.financialYear !== undefined) {
@@ -131,10 +173,31 @@ router.put("/", async (req, res) => {
     }
   }
 
+  // Tenant migration is the final structural operation after all editable
+  // fields above have passed validation.
+  if (tenantMoveRequested) {
+    try {
+      tenantMigration = await migrateCompanyTenantKey({
+        companyProfileId: String(company._id), oldTenantKey: company.tenantKey, newGstin: requestedGstin,
+        actorId: req.auth.sub, actorRole: req.auth.role,
+      });
+    } catch (error) {
+      return fail(res, error.message, error.status || 500, { code: error.code || "TENANT_MIGRATION_FAILED" });
+    }
+    company.tenantKey = requestedGstin;
+    user.tenantKey = requestedGstin;
+    req.auth.tenantKey = requestedGstin;
+  }
   await company.save();
 
   const data = await loadProfile(req);
-  return ok(res, data, "Superadmin profile updated");
+  return ok(res, {
+    ...data,
+    gstChanged,
+    tenantMigration,
+    tenantKeyChanged: Boolean(tenantMigration?.changed),
+    newTenantKey: tenantMigration?.newTenantKey || data?.company?.tenantKey || company.tenantKey,
+  }, tenantMigration?.changed ? "GSTIN updated and company data moved to the new tenantKey" : "Superadmin profile updated");
 });
 
 router.post("/change-password", async (req, res) => {

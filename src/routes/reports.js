@@ -8,6 +8,7 @@ import { sendBusinessEmail } from "../services/mailService.js";
 import { buildLedgerPdf } from "../services/simplePdfService.js";
 import XLSX from "xlsx";
 import { buildGstReport } from "../services/gstReportsService.js";
+import { resolveFinancialYear } from "../utils/financialYear.js";
 
 const router=express.Router();router.use(requireAuth);
 const reports=[
@@ -314,7 +315,7 @@ async function attachSourceDocuments({ tenantKey, financialYear, rows }) {
 }
 
 async function buildLedgerStatement({ tenantKey, financialYear, entityType = "PARTY", entityId, startDate = "", endDate = "" }) {
-  const fy = normalizeFY(financialYear || "2026-27");
+  const fy = normalizeFY(financialYear || await resolveFinancialYear({ tenantKey }));
   const entity = await resolveLedgerEntity({ tenantKey, entityType, entityId });
   const opening = await effectiveLedgerOpening({ tenantKey, entity, financialYear: fy });
   let source = await fetchLedgerSourceRows({ tenantKey, entity, financialYear: fy });
@@ -516,7 +517,7 @@ router.get("/ledger/pdf", async (req, res) => {
 
 router.post("/ledger/email", async(req,res)=>{
   try{
-    const financialYear=normalizeFY(req.body.financialYear||"2026-27");
+    const financialYear=normalizeFY(await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.financialYear}));
     const entityType=cleanText(req.body.entityType||"PARTY").toUpperCase();
     const entityId=cleanText(req.body.entityId||req.body.partyGlobalId);
     if(entityType!=="PARTY")return fail(res,"Ledger email is available for customer/supplier parties only",400);
@@ -557,16 +558,16 @@ async function partyLedgerRows({ tenantKey, financialYear, partyGlobalId }) {
 }
 
 
-const gstReportArgs = (req) => ({
+const gstReportArgs = async (req) => ({
   tenantKey: req.auth.tenantKey,
-  financialYear: String(req.query.financialYear || "2026-27"),
+  financialYear: await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),
   startDate: String(req.query.startDate || "").trim(),
   endDate: String(req.query.endDate || "").trim(),
 });
 
 router.get("/gst/:kind", async (req, res) => {
   try {
-    const data = await buildGstReport(req.params.kind, gstReportArgs(req));
+    const data = await buildGstReport(req.params.kind, await gstReportArgs(req));
     return ok(res, data, "GST report generated");
   } catch (error) {
     return fail(res, error.message, error.statusCode || 500);
@@ -586,7 +587,7 @@ const appendSheet = (wb, name, rows) => {
 
 router.get("/gst-export/:kind.xlsx", async (req, res) => {
   try {
-    const data = await buildGstReport(req.params.kind, gstReportArgs(req));
+    const data = await buildGstReport(req.params.kind, await gstReportArgs(req));
     const wb = XLSX.utils.book_new();
     const kind = String(data.report || req.params.kind).toUpperCase();
     if (data.sections) Object.entries(data.sections).forEach(([name, rows]) => appendSheet(wb, name, rows));
@@ -616,7 +617,7 @@ router.get("/gst-export/:kind.xlsx", async (req, res) => {
 });
 
 router.get("/run",async(req,res)=>{
-  const name=String(req.query.name||"Report"),financialYear=String(req.query.financialYear||"2026-27"),tenantKey=req.auth.tenantKey;
+  const name=String(req.query.name||"Report"),tenantKey=req.auth.tenantKey,financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
   const admin=isAdminAuth(req.auth);
   if(!admin && PROFIT_SENSITIVE_REPORT.test(name)) return fail(res,"Profit, margin and profitability reports are restricted to Admin users",403);
   const {LedgerEntry,SalesInvoice,PurchaseInvoice,Receipt,Payment,StockMovement,Expense}=financialModels(tenantKey,financialYear);

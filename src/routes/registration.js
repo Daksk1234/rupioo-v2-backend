@@ -23,8 +23,11 @@ import {
   MASTER_TEMPLATE_TENANT,
 } from "../config/defaultRoleTemplates.js";
 import { sanitizePermissionCodes } from "../config/permissionCatalogue.js";
-import { searchTaxpayer } from "../services/masterGstService.js";
+import { searchTaxpayer } from "../services/gstService.js";
+import { getIfscMaster, ifscSnapshot, formatIfscContact } from "../services/ifscMasterService.js";
 import { addBillingPeriod } from "../utils/subscription.js";
+import { ensureSystemCashAccount } from "../services/systemCashAccountService.js";
+import { isTenantKeyReserved } from "../services/tenantKeyService.js";
 
 const router = express.Router();
 
@@ -118,6 +121,17 @@ router.get("/pincode", async (req, res) => {
   return ok(res, rows);
 });
 
+router.get("/ifsc/:ifsc", async (req, res, next) => {
+  try {
+    const row = await getIfscMaster(req.params.ifsc);
+    return ok(res, { ...ifscSnapshot(row), contactNo: formatIfscContact(row) }, "IFSC details found in MASTER");
+  } catch (error) {
+    const code = error.statusCode || 500;
+    if (code < 500) return res.status(code).json({ ok:false, message:error.message });
+    return next(error);
+  }
+});
+
 router.post("/superadmin", async (req, res) => {
   const gstin = normalizeGstin(req.body.gstin);
   const embeddedPan = panFromGstin(gstin);
@@ -132,8 +146,11 @@ router.post("/superadmin", async (req, res) => {
   const aadhaar = digits(req.body.aadhaar);
   const address = String(req.body.address || req.body.registeredAddress || "").trim();
   const pincode = digits(req.body.pincode).slice(0, 6);
+  const area = String(req.body.area || "").trim();
   const city = String(req.body.city || "").trim();
+  const district = String(req.body.district || "").trim();
   const state = String(req.body.state || "").trim();
+  const bankDetails = req.body.bankDetails && typeof req.body.bankDetails === "object" ? req.body.bankDetails : {};
   const planCode = normalizeCode(req.body.planCode);
   const hasMultipleBranches = Boolean(req.body.hasMultipleBranches);
   const branchCount = hasMultipleBranches
@@ -190,6 +207,9 @@ router.post("/superadmin", async (req, res) => {
   if (await User.exists({ email })) return fail(res, "This email is already registered", 409);
   if (await CompanyProfile.exists({ $or: [{ tenantKey }, { gstin }] })) {
     return fail(res, "This GSTIN is already registered", 409);
+  }
+  if (await isTenantKeyReserved(tenantKey)) {
+    return fail(res, "This GSTIN is reserved by a previous tenant migration and cannot be reused", 409);
   }
 
   const plan = await Plan.findOne({ code: planCode, status: "ACTIVE" }).lean();
@@ -334,8 +354,11 @@ router.post("/superadmin", async (req, res) => {
       email,
       registeredAddress: address,
       pincode,
+      area,
       city,
+      district,
       state,
+      bankDetails,
       financialYear,
       financialYears,
       hasMultipleBranches,
@@ -423,6 +446,13 @@ router.post("/superadmin", async (req, res) => {
     payment.subscriptionStartAt = subscriptionStartAt;
     payment.subscriptionEndAt = subscriptionEndAt;
     await payment.save();
+
+    await ensureSystemCashAccount({
+      tenantKey,
+      tenantId: String(createdProfile._id),
+      planCode: plan.code,
+      actorId: String(createdUser._id),
+    });
 
     return ok(
       res,

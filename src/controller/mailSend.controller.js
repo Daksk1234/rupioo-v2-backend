@@ -1,5 +1,5 @@
-import { MailConnection } from "../model/mailConnection.model.js";
-import { MailQueue } from "../model/mailQueue.model.js";
+import { MailConnection } from "../models/mailConnection.model.js";
+import { MailQueue } from "../models/mailQueue.model.js";
 import { buildDocumentMail } from "../services/mail/mailTemplate.service.js";
 import { enqueueAndTryMail, retryMailNow } from "../services/mail/mailQueue.service.js";
 

@@ -8,7 +8,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { fail, ok, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import { readRows, resolveColumns, valueFor } from "../utils/bulkSpreadsheet.js";
-import { searchTaxpayer, getReturnFilingStatus } from "../services/masterGstService.js";
+import { searchTaxpayer, getReturnFilingStatus } from "../services/gstService.js";
 import { customerHealth } from "../services/healthService.js";
 import { syncCustomerLedger } from "../services/companyAccountingService.js";
 import { hierarchyVisibilityForUser, resolveCustomerSalesperson } from "../services/assignmentHierarchyService.js";
@@ -17,6 +17,7 @@ import { referencedPartyIds } from "../services/referenceIntegrityService.js";
 import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { resolveCustomerDeliveryMode } from "../services/deliveryLocalityService.js";
 import { resolveCompanyTransporter, ensureLegacyCustomerTransporter } from "../services/transporterAssignmentService.js";
+import { isSystemCashRecord } from "../services/systemCashAccountService.js";
 
 const router=express.Router();
 router.use(requireAuth);
@@ -115,7 +116,7 @@ const pinGeo=async(value,fallback={})=>{
 };
 
 async function applyPreviousDmsCustomerFields(link,body={},options={}){
-  const textFields=["firstName","lastName","ownerName","ownerMobile","ownerPan","passportNumber","ownerAddress","partyType","registrationType","customerCode","dealsInProducts","address2","companyContactNumber","shopSize","category","assignedTransport","assignedTransportGlobalId","assignedTransportBookingStationId","assignedTransportDeliveryStationId","serviceArea"];
+  const textFields=["firstName","lastName","ownerName","ownerMobile","ownerPan","passportNumber","ownerAddress","partyType","registrationType","businessType","firmType","gstStatus","gstRange","eInvoiceStatus","filingFrequency","customerCode","dealsInProducts","address2","companyContactNumber","shopSize","category","assignedTransport","assignedTransportGlobalId","assignedTransportBookingStationId","assignedTransportDeliveryStationId","serviceArea"];
   for(const key of textFields)if(body[key]!==undefined)link[key]=key==="ownerPan"?upper(body[key]):cleanText(body[key]);
   if(body.annualTurnover!==undefined)link.annualTurnover=Math.max(0,Number(body.annualTurnover||0));
   if(body.dueDate!==undefined)link.dueDate=validDate(body.dueDate);
@@ -287,11 +288,18 @@ async function enrichedItems(filter,{page=1,limit=50}={}){
 
 async function customerHierarchyFilter(req,filter){
   const visibility=await hierarchyVisibilityForUser(req.auth);
-  if(!visibility.unrestricted)filter.salespersonId={$in:visibility.userIds};
+  if(!visibility.unrestricted){
+    const hierarchyClause={$or:[{systemKey:"CASH"},{salespersonId:{$in:visibility.userIds}}]};
+    if(Array.isArray(filter.$or)&&filter.$or.length){
+      const searchClause={$or:filter.$or};delete filter.$or;
+      filter.$and=[...(Array.isArray(filter.$and)?filter.$and:[]),searchClause,hierarchyClause];
+    }else filter.$or=hierarchyClause.$or;
+  }
   return visibility;
 }
 async function canSeeCustomer(req,link){
   if(!link)return false;
+  if(isSystemCashRecord(link))return true;
   const visibility=await hierarchyVisibilityForUser(req.auth);
   return visibility.unrestricted||visibility.userIds.includes(String(link.salespersonId||""));
 }
@@ -328,9 +336,10 @@ async function protectedCustomerGlobalIds(tenantKey,links=[]){
 
 async function deactivateCustomerLinks(req,links=[],action="BULK_DEACTIVATED"){
   const protectedIds=await protectedCustomerGlobalIds(req.auth.tenantKey,links);
+  for(const link of links){if(isSystemCashRecord(link))protectedIds.add(String(link.globalCustomerId||""));}
   const deletableIds=links.map(x=>String(x.globalCustomerId||"")).filter(id=>id&&!protectedIds.has(id));
   const protectedRows=links.filter(x=>protectedIds.has(String(x.globalCustomerId))).map(x=>({
-    id:String(x.globalCustomerId||""),name:x.localName||x.globalCustomerId||"Customer",partyType:x.partyType||"PARTY"
+    id:String(x.globalCustomerId||""),name:x.localName||x.globalCustomerId||"Customer",partyType:x.partyType||"PARTY",systemManaged:isSystemCashRecord(x)
   }));
   let modifiedCount=0;
   if(deletableIds.length){
@@ -345,7 +354,7 @@ async function deactivateCustomerLinks(req,links=[],action="BULK_DEACTIVATED"){
 
 router.get("/",async(req,res)=>{
   const page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=cleanText(req.query.q);const filter={tenantKey:req.auth.tenantKey,status:{$ne:"DEACTIVATED"}};
-  if(req.query.status)filter.status=upper(req.query.status);if(req.query.approvalStatus)filter["approval.status"]=upper(req.query.approvalStatus);if(req.query.salespersonId)filter.salespersonId=req.query.salespersonId;
+  if(req.query.status)filter.status=upper(req.query.status);if(req.query.approvalStatus)filter["approval.status"]=upper(req.query.approvalStatus);if(String(req.query.unassigned||"").toLowerCase()==="true")filter.$and=[...(filter.$and||[]),{$or:[{salespersonId:""},{salespersonId:null},{salespersonId:{$exists:false}}]}];else if(req.query.salespersonId)filter.salespersonId=req.query.salespersonId;
   if(q)filter.$or=[{displayIdentifier:new RegExp(q,"i")},{localName:new RegExp(q,"i")},{"contacts.mobile":new RegExp(q,"i")},{"contacts.email":new RegExp(q,"i")}];
   await customerHierarchyFilter(req,filter);
   const {items,total}=await enrichedItems(filter,{page,limit});return ok(res,{items,meta:pageMeta(page,limit,total)});
@@ -423,7 +432,8 @@ router.post("/",async(req,res)=>{try{
 
 const customerBulkFields=[
   {key:"legalName",label:"Company Name",aliases:["customer name","legal name","name","CompanyName","companyname"],required:true},
-  {key:"tradeName",label:"Trade Name",aliases:["trade name"]},{key:"partyType",label:"Party Type",aliases:["party type"]},{key:"registrationType",label:"Registration Type",aliases:["registration type"]},
+  {key:"tradeName",label:"Business Name",aliases:["trade name","business name"]},{key:"partyType",label:"Party Type",aliases:["party type"]},{key:"registrationType",label:"GST Type",aliases:["registration type","gst type"]},
+  {key:"businessType",label:"Business Type",aliases:["nature of business","business type"]},{key:"firmType",label:"Firm Type",aliases:["constitution","firm type"]},{key:"gstStatus",label:"GST Status",aliases:["gst status"]},{key:"gstRange",label:"GST Range",aliases:["range","centre jurisdiction"]},{key:"eInvoiceStatus",label:"E-Invoice Status",aliases:["e invoice status","einvoice status"]},{key:"filingFrequency",label:"Filing Frequency",aliases:["filing frequency"]},
   {key:"gstin",label:"GSTIN",aliases:["gst no","gst number","gstNumber"]},{key:"pan",label:"Company PAN",aliases:["pan","comPanNo","company pan no"]},
   {key:"firstName",label:"First Name",aliases:["first name"]},{key:"lastName",label:"Last Name",aliases:["last name"]},{key:"ownerName",label:"Owner Name",aliases:["owner name"]},{key:"ownerMobile",label:"Owner Mobile",aliases:["owner mobile","mobileNumber"]},{key:"ownerPan",label:"Owner PAN",aliases:["owner pan","panNo"]},{key:"ownerAadhaar",label:"Owner Aadhaar",aliases:["aadhaar","aadhar","aadharNo","aadhaar no"]},{key:"passportNumber",label:"Passport Number",aliases:["passport","passPortNo"]},
   {key:"ownerAddress",label:"Owner Address",aliases:["owner address"]},{key:"ownerPincode",label:"Owner Pincode",aliases:["owner pincode","personalPincode"]},{key:"ownerArea",label:"Owner Area"},{key:"ownerCity",label:"Owner City",aliases:["Pcity"]},{key:"ownerDistrict",label:"Owner District"},{key:"ownerState",label:"Owner State",aliases:["Pstate"]},
@@ -553,7 +563,7 @@ router.post("/bulk-edit",async(req,res)=>{
   for(const k of allowed)if(req.body.changes?.[k]!==undefined&&req.body.changes[k]!=="")changes[k]=req.body.changes[k];
   if(changes.gradeCode){const g=await CustomerGrade.findOne({tenantKey:req.auth.tenantKey,code:upper(changes.gradeCode),status:"ACTIVE"}).lean();if(!g)return fail(res,"Customer Grade not found",400);changes.gradeCode=g.code;changes.gradeDiscountPct=Number(g.discountPct||0);}
   if(!Object.keys(changes).length)return fail(res,"Bulk edit can safely change Grade or Price List. Salesperson assignment is controlled by the hierarchy pincode page. Sensitive credit/accounting fields require approval.",400);
-  const filter={tenantKey:req.auth.tenantKey,globalCustomerId:{$in:ids}};await customerHierarchyFilter(req,filter);
+  const filter={tenantKey:req.auth.tenantKey,globalCustomerId:{$in:ids},$or:[{systemManaged:{$ne:true}},{systemKey:{$ne:"CASH"}}]};await customerHierarchyFilter(req,filter);
   const result=await CustomerLink.updateMany(filter,{$set:changes});
   return ok(res,{matched:result.matchedCount,updated:result.modifiedCount},`${result.modifiedCount} customer(s) updated`);
 });
@@ -561,7 +571,7 @@ router.post("/bulk-delete",async(req,res)=>{
   if(!canDelete(req))return fail(res,"Customer delete permission required",403);
   const ids=uniqueRefs(req.body.selection?.ids||[]);if(!ids.length)return fail(res,"Select at least one customer",400);
   const filter={tenantKey:req.auth.tenantKey,globalCustomerId:{$in:ids},status:{$ne:"DEACTIVATED"}};await customerHierarchyFilter(req,filter);
-  const visible=await CustomerLink.find(filter).select("globalCustomerId localName partyType migration status").lean();
+  const visible=await CustomerLink.find(filter).select("globalCustomerId localName partyType migration status systemManaged systemKey systemNote").lean();
   if(!visible.length)return ok(res,{requested:ids.length,deleted:0,protected:0,notVisible:ids.length,soft:true},"No active selected customers were available to delete");
   const outcome=await deactivateCustomerLinks(req,visible,"BULK_DEACTIVATED");
   const message=`${outcome.modifiedCount} customer(s) deleted from the active list${outcome.protectedRows.length?`; ${outcome.protectedRows.length} protected because they are used in transactions`:""}`;
@@ -572,7 +582,7 @@ router.post("/delete-all",async(req,res)=>{
   if(!canDelete(req))return fail(res,"Customer delete permission required",403);
   const filter={tenantKey:req.auth.tenantKey,status:{$ne:"DEACTIVATED"}};
   await customerHierarchyFilter(req,filter);
-  const visible=await CustomerLink.find(filter).select("globalCustomerId localName partyType migration status").lean();
+  const visible=await CustomerLink.find(filter).select("globalCustomerId localName partyType migration status systemManaged systemKey systemNote").lean();
   if(!visible.length)return ok(res,{requested:0,deleted:0,protected:0,soft:true},"No active customers to delete");
   const outcome=await deactivateCustomerLinks(req,visible,"DELETE_ALL_DEACTIVATED");
   const message=`${outcome.modifiedCount} customer(s) deleted from the active list${outcome.protectedRows.length?`; ${outcome.protectedRows.length} protected because they are used in transactions`:""}`;
@@ -597,7 +607,7 @@ router.get("/:globalId/360",async(req,res)=>{
 router.get("/:globalId",async(req,res)=>{const pair=await resolveCustomerPair(req.auth.tenantKey,req.params.globalId);if(!pair.global||!pair.link)return fail(res,"Customer not found",404);if(!(await canSeeCustomer(req,pair.link)))return fail(res,"Customer is outside your department hierarchy",403);const global=pair.global.toObject?pair.global.toObject():pair.global;delete global.aadhaarHash;return ok(res,{global,company:pair.link});});
 
 router.put("/:globalId",async(req,res)=>{
-  if(!canEdit(req))return fail(res,"Customer edit permission required",403);const pair=await resolveCustomerPair(req.auth.tenantKey,req.params.globalId);const link=pair.link;const global=pair.global;if(!link)return fail(res,"Customer relationship not found",404);if(!(await canSeeCustomer(req,link)))return fail(res,"Customer is outside your department hierarchy",403);const migrated=Boolean(link.migration?.legacyId);
+  if(!canEdit(req))return fail(res,"Customer edit permission required",403);const pair=await resolveCustomerPair(req.auth.tenantKey,req.params.globalId);const link=pair.link;const global=pair.global;if(!link)return fail(res,"Customer relationship not found",404);if(isSystemCashRecord(link))return fail(res,"CASH is a system-managed party and cannot be edited, assigned or deleted",409);if(!(await canSeeCustomer(req,link)))return fail(res,"Customer is outside your department hierarchy",403);const migrated=Boolean(link.migration?.legacyId);
   const normal=["localName","contacts","addresses","documents","verification","location"];
   for(const k of normal)if(req.body[k]!==undefined)link[k]=req.body[k];
   await applyPreviousDmsCustomerFields(link,req.body,{allowIncomplete:migrated});
@@ -619,6 +629,22 @@ router.put("/:globalId",async(req,res)=>{
   link.approvalHistory.push({action:"EDITED",by:req.auth.sub,at:new Date(),changes:req.body});await link.save();
   const missing=await refreshMigrationCompletion(link,global,req.auth.sub);
   return ok(res,{...link.toObject(),pendingProfileFields:missing},missing.length?`Customer updated. ${missing.length} profile field(s) can be completed later.`:"Customer updated");
+});
+
+router.post("/:globalId/assign-salesperson",async(req,res)=>{
+  if(!canEdit(req))return fail(res,"Customer edit permission required",403);
+  const link=await CustomerLink.findOne({tenantKey:req.auth.tenantKey,globalCustomerId:req.params.globalId,status:{$ne:"DEACTIVATED"}});
+  if(!link)return fail(res,"Customer relationship not found",404);
+  if(isSystemCashRecord(link))return fail(res,"CASH is a system-managed party and cannot be assigned",409);
+  const pincode=cleanText(req.body.pincode||link.addresses?.find?.(x=>upper(x?.type)==="BILLING")?.pincode||link.addresses?.[0]?.pincode).replace(/\D/g,"").slice(0,6);
+  if(pincode.length!==6)return fail(res,"Customer does not have a valid 6-digit pincode",409);
+  try{
+    const assignment=await resolveCustomerSalesperson({tenantKey:req.auth.tenantKey,pincode,requestedUserId:req.body.salespersonId,requireAssignment:true});
+    link.salespersonId=assignment.salespersonId;
+    link.approvalHistory.push({action:"SALESPERSON_ASSIGNED",by:req.auth.sub,at:new Date(),changes:{pincode,salespersonId:assignment.salespersonId}});
+    await link.save();
+    return ok(res,{globalCustomerId:link.globalCustomerId,salespersonId:link.salespersonId,pincode},"Customer assigned to Sales Person");
+  }catch(error){return fail(res,error.message,error.statusCode||409);}
 });
 
 router.post("/:globalId/submit",async(req,res)=>{
@@ -644,7 +670,7 @@ router.post("/:globalId/submit",async(req,res)=>{
 });
 
 router.post("/:globalId/approval",async(req,res)=>{
-  if(!canApprove(req))return fail(res,"Customer approval permission required",403);const link=await CustomerLink.findOne({tenantKey:req.auth.tenantKey,globalCustomerId:req.params.globalId});if(!link)return fail(res,"Customer relationship not found",404);const action=upper(req.body.action);
+  if(!canApprove(req))return fail(res,"Customer approval permission required",403);const link=await CustomerLink.findOne({tenantKey:req.auth.tenantKey,globalCustomerId:req.params.globalId});if(!link)return fail(res,"Customer relationship not found",404);if(isSystemCashRecord(link))return fail(res,"CASH is system-managed and its status/accounting cannot be changed",409);const action=upper(req.body.action);
   if(!["APPROVE","APPROVE_WITH_CHANGES","SEND_BACK","REJECT","HOLD","BLOCK","ACTIVATE"].includes(action))return fail(res,"Invalid approval action",400);
   const remarks=cleanText(req.body.remarks);let changes={};
   if(["APPROVE","APPROVE_WITH_CHANGES"].includes(action)){
@@ -691,6 +717,7 @@ router.delete("/:globalId",async(req,res)=>{
   if(!canDelete(req))return fail(res,"Customer delete permission required",403);
   const pair=await resolveCustomerPair(req.auth.tenantKey,req.params.globalId);const link=pair.link;
   if(!link)return fail(res,"Customer relationship not found",404);
+  if(isSystemCashRecord(link))return fail(res,"CASH is a protected system party and cannot be deleted or deactivated",409);
   if(!(await canSeeCustomer(req,link)))return fail(res,"Customer is outside your department hierarchy",403);
   if(link.status==="DEACTIVATED")return ok(res,{deleted:0,alreadyDeleted:true,soft:true},"Customer is already deleted from the active list");
   const protectedIds=await protectedCustomerGlobalIds(req.auth.tenantKey,[link.toObject?link.toObject():link]);

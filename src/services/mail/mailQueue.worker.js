@@ -1,4 +1,4 @@
-import { MailQueue } from "../../model/mailQueue.model.js";
+import { MailQueue } from "../../models/mailQueue.model.js";
 import { processMailQueueItem } from "./mailQueue.service.js";
 
 let timer = null;

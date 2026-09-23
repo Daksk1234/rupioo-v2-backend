@@ -11,6 +11,7 @@ import { sendPasswordResetEmail } from "../services/mailService.js";
 import { resolveEffectiveAccess } from "../services/accessResolutionService.js";
 import { encodePermissions } from "../utils/authToken.js";
 import { buildPageAccess, firstAllowedPath, reportAccessForPermissions } from "../config/permissionPageMap.js";
+import { ensureSystemCashAccount } from "../services/systemCashAccountService.js";
 
 const router = express.Router();
 
@@ -30,6 +31,10 @@ function signSessionToken({ user, tenantId = "", plan = null, effective }) {
       tenantKey: user.tenantKey,
       email: user.email,
       name: user.name,
+      warehouseId: user.warehouseId || "",
+      dataScope: effective?.dataScope || user.dataScope || "SELF",
+      departmentId: user.departmentId ? String(user.departmentId) : "",
+      branchId: user.branchId ? String(user.branchId) : "",
       role: user.role,
       apps,
       ...encodedPermissions,
@@ -82,6 +87,19 @@ router.post("/login", async (req, res) => {
     }
   }
 
+  if (user.role === "SUPERADMIN") {
+    try {
+      await ensureSystemCashAccount({
+        tenantKey: user.tenantKey,
+        tenantId: String(user.tenantId || companyProfile?._id || ""),
+        planCode: user.planCode,
+        actorId: String(user._id),
+      });
+    } catch (error) {
+      console.error("Unable to ensure system CASH account during Superadmin login", error?.message || error);
+    }
+  }
+
   const tenantId = user.role === "MASTER"
     ? ""
     : String(user.tenantId || companyProfile?._id || "");
@@ -128,6 +146,8 @@ router.post("/login", async (req, res) => {
     pageAccess,
     reportAccess,
     homePath,
+    dataScope: effective.dataScope || user.dataScope || "SELF",
+    warehouseId: user.warehouseId || "",
     accessGroup: effective.accessGroup || null,
     companyProfile,
     plan,
@@ -212,6 +232,8 @@ router.post("/app-login", async (req, res) => {
     pageAccess,
     reportAccess,
     homePath,
+    dataScope: effective.dataScope || user.dataScope || "SELF",
+    warehouseId: user.warehouseId || "",
     accessGroup: effective.accessGroup || null,
     appRoleCode,
     hierarchyOrder: Number(roleDoc?.hierarchyOrder || 0),
@@ -350,6 +372,9 @@ router.get("/me", requireAuth, async (req, res) => {
     role: user.role,
     roleId: user.roleId ? String(user.roleId) : "",
     departmentId: user.departmentId ? String(user.departmentId) : "",
+    branchId: user.branchId ? String(user.branchId) : "",
+    warehouseId: user.warehouseId || "",
+    dataScope: effective.dataScope || user.dataScope || "SELF",
     hierarchyOrder: Number(effective.role?.hierarchyOrder || 0),
     planCode: user.planCode,
     apps,
@@ -358,6 +383,8 @@ router.get("/me", requireAuth, async (req, res) => {
     pageAccess,
     reportAccess,
     homePath,
+    dataScope: effective.dataScope || user.dataScope || "SELF",
+    warehouseId: user.warehouseId || "",
     accessGroup: effective.accessGroup || null,
     sessionToken,
   });

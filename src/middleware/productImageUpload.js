@@ -3,7 +3,7 @@ import path from "path";
 import crypto from "crypto";
 import sharp from "sharp";
 import { fileURLToPath } from "url";
-import { Product } from "../model/product.model.js";
+import { Product } from "../models/product.model.js";
 import { putPrivateFile } from "../services/storage/storage.service.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

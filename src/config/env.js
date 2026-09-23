@@ -24,12 +24,12 @@ export const env = {
     pass: process.env.SMTP_PASS || "",
     from: process.env.SMTP_FROM || "",
   },
-  masterGst: {
-    baseUrl: process.env.MASTERGST_BASE_URL || "https://api.mastergst.com",
-    email: process.env.MASTERGST_EMAIL || "",
-    clientId: process.env.MASTERGST_CLIENT_ID || "",
-    clientSecret: process.env.MASTERGST_CLIENT_SECRET || "",
-    gstin: process.env.MASTERGST_GSTIN || "",
+  gstLookup: {
+    url:
+      process.env.GST_LOOKUP_URL ||
+      "https://appyflow.in/api/verifyGST",
+    // Keep the provider secret generic. In backend/.env use: key_secret=YOUR_SECRET
+    keySecret: process.env.key_secret || process.env.KEY_SECRET || "",
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY || "",

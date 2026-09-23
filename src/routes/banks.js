@@ -10,6 +10,7 @@ import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { financialModels, postBalancedEntries } from "../services/accountingService.js";
 import { readRows, resolveColumns, valueFor } from "../utils/bulkSpreadsheet.js";
 import { resolvePartyDisplayMap, resolveUserDisplayMap } from "../services/transactionDisplayService.js";
+import { financialYearFromDate } from "../utils/financialYear.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -216,7 +217,7 @@ async function buildSmartPartyMatcher(tenantKey) {
   const [links,users,userLedgers,customerLedgers] = await Promise.all([
     CustomerLink.find({tenantKey,status:{$nin:["INACTIVE","DEACTIVATED"]}}).lean(),
     User.find({tenantKey,status:"ACTIVE"})
-      .select("name email mobile accountType tallyAccountTypeName tallyAccountTypeCode accountingRequired accountingMappings bankDetails loginEnabled")
+      .select("name email mobile accountType tallyAccountTypeName tallyAccountTypeCode accountingRequired accountingMappings bankDetails loginEnabled systemManaged systemKey")
       .lean(),
     CompanyLedger.find({tenantKey,ownerType:"USER",status:{$ne:"INACTIVE"}}).lean(),
     CompanyLedger.find({tenantKey,ownerType:"CUSTOMER",status:{$ne:"INACTIVE"}}).lean()
@@ -277,7 +278,10 @@ async function buildSmartPartyMatcher(tenantKey) {
     });
   }
 
+  const hasSystemCashCustomer=links.some(link=>String(link.systemKey||"").toUpperCase()==="CASH");
+
   for(const user of users){
+    if(hasSystemCashCustomer && String(user.systemKey||"").toUpperCase()==="CASH")continue;
     const ownerId=String(user._id||"");
     if(!ownerId)continue;
     const activeMapping=(user.accountingMappings||[]).find(x=>upper(x?.status)!=="INACTIVE")
@@ -471,9 +475,6 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     if(!req.file?.buffer)return fail(res,"Bank statement Excel/CSV file is required",400);
     const bank=await BankAccount.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});
     if(!bank)return fail(res,"Active bank account not found",404);
-    const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");
-    if(!financialYear)return fail(res,"Select Financial Year",400);
-    const bounds=financialYearBounds(financialYear); if(!bounds)return fail(res,"Invalid Financial Year",400);
     let rawRows; try{rawRows=readRows(req.file.buffer);}catch{return fail(res,"Unable to read bank statement file",400);}
     if(!rawRows.length)return fail(res,"Uploaded bank statement has no rows",400);
     const fields=[
@@ -490,6 +491,10 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     const normalized=normalizeStatementRows(rawRows,cols); if(normalized.errors.length)return fail(res,"Bank statement has invalid rows",400,{errors:normalized.errors.slice(0,50)});
     let rows=normalized.rows;
     if(!rows.length)return fail(res,"Uploaded bank statement has no transaction rows",400);
+    const rowYears=[...new Set(rows.map(r=>financialYearFromDate(r.date)).filter(Boolean))];
+    if(rowYears.length!==1)return fail(res,rowYears.length?`Statement contains transactions from multiple financial years (${rowYears.join(", ")}). Upload each financial year separately.`:"Could not determine Financial Year from statement dates",400);
+    const financialYear=rowYears[0];
+    const bounds=financialYearBounds(financialYear); if(!bounds)return fail(res,"Invalid Financial Year derived from statement dates",400);
     const outside=rows.filter(r=>r.date<bounds.start||r.date>bounds.end); if(outside.length)return fail(res,`Statement contains dates outside ${financialYear}`,400,{rows:outside.slice(0,20).map(x=>x.rowNo)});
     let running=validateRunningOrder(rows);
     if(!running.ok){const reversed=validateRunningOrder([...rows].reverse());if(reversed.ok){rows=[...rows].reverse();running=reversed;}else return fail(res,"Running Balance does not reconcile with Debit/Credit rows",400,{errors:running.errors.slice(0,20)});}

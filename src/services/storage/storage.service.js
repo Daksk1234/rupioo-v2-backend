@@ -3,7 +3,7 @@ import path from "path";
 import crypto from "crypto";
 import { Readable } from "stream";
 import { fileURLToPath } from "url";
-import { StorageObject } from "../../model/storageObject.model.js";
+import { StorageObject } from "../../models/storageObject.model.js";
 import {
   uploadBufferToGoogleDrive,
   getGoogleDriveFileBuffer,

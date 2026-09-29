@@ -1,6 +1,7 @@
 import { useDatabase, getFinancialYearDbName } from "../config/db.js";
 import { fyModels } from "../models/fyModels.js";
 import { isTenantMigrationActive } from "./tenantMigrationLock.js";
+import { resolveFinancialStorageTenantKeySync } from "./financialStorageTenantService.js";
 
 export function financialModels(tenantKey, financialYear) {
   if (isTenantMigrationActive(tenantKey)) {
@@ -9,7 +10,8 @@ export function financialModels(tenantKey, financialYear) {
     error.code = "TENANT_MIGRATION_RUNNING";
     throw error;
   }
-  const db = useDatabase(getFinancialYearDbName(tenantKey, financialYear));
+  const physicalTenantKey = resolveFinancialStorageTenantKeySync(tenantKey);
+  const db = useDatabase(getFinancialYearDbName(physicalTenantKey, financialYear));
   return fyModels(db);
 }
 

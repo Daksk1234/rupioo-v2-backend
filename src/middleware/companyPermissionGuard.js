@@ -11,12 +11,17 @@ import {
 const actionForRequest = (req) => {
   const method = String(req.method || "GET").toUpperCase();
   const path = String(req.path || req.originalUrl || "").toLowerCase();
+  if (path.startsWith("/transactions/sales-with-products/resolve-row")) return "view";
+  if (path.startsWith("/transactions/sales-with-products/import-preview")) return "view";
+  // Personal working-sheet persistence does not post accounting/stock, so autosave
+  // follows the same View ceiling as the Sales-with-Product page itself.
+  if (path.startsWith("/transactions/sales-with-products/draft")) return "view";
   if (method === "GET" || method === "HEAD") return "view";
   if (path.includes("bulk-upload")) return "create";
   if (path.includes("bulk-edit")) return "edit";
   if (path.includes("bulk-delete")) return "delete";
   if (/(cancel|reverse)/i.test(path)) return "delete";
-  if (/(approve|reject|hold|block|status|activity|convert|assign|verify|renew)/i.test(path)) return "edit";
+  if (/(approve|reject|hold|block|status|activity|convert|assign|verify|renew|issue|return)/i.test(path)) return "edit";
   if (method === "DELETE") return "delete";
   if (method === "PUT" || method === "PATCH") return "edit";
   if (method === "POST") return "create";
@@ -49,6 +54,10 @@ function mappedPageForApi(req) {
   if (path.startsWith("/purchase-ai/accounts")) return "/dms/purchase-invoices";
   if (path.startsWith("/purchase-ai")) return "/dms/purchase-orders";
 
+  if (path.startsWith("/transactions/sales-with-products")) return "/dms/sales-invoices";
+  if (path.startsWith("/transactions/credit-notes")) return "/dms/credit-notes";
+  if (path.startsWith("/transactions/debit-notes")) return "/dms/debit-notes";
+  if (path.startsWith("/transactions/delivery-notes")) return "/dms/delivery-notes";
   if (path.startsWith("/transactions/sales-invoices")) return "/dms/sales-invoices";
   if (path.startsWith("/transactions/purchase-invoices")) return "/dms/purchase-invoices";
   if (path.startsWith("/transactions/receipts")) return "/dms/receipts";

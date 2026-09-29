@@ -37,6 +37,11 @@ export function fyModels(db) {
     },
     branchId: { type:String, index:true }, warehouseId: { type:String, index:true }, warehouseNameSnapshot: String, assignedTo: { type:String, index:true },
     workflowStatus: { type:String, default:"POSTED", index:true }, releasedToWarehouseAt: Date, warehouseProcessedBy: String,
+    // Credit Note state is stored on the invoice for fast invoice-wise outstanding/UI.
+    // The CreditNote collection remains the accounting source of truth.
+    creditNoteAmount: { type:Number, default:0 }, netInvoiceAmount: Number,
+    creditNoteStatus: { type:String, enum:["NONE","PARTIAL","FULL"], default:"NONE", index:true },
+    lastCreditNoteNo: String, lastCreditNoteAt: Date,
     delivery: {
       deliveredAt: Date, deliveredTo: String, mobile: String, vehicleNo: String, biltyNo: String, remarks: String, deliveryMode: String,
       proofFiles: [{ kind:String, fileName:String, storedName:String, path:String, mimeType:String, size:Number }],
@@ -47,10 +52,14 @@ export function fyModels(db) {
   }, { timestamps: true });
   salesInvoiceSchema.index({ tenantKey: 1, invoiceNo: 1 }, { unique: true });
 
+  const purchaseAdjustmentSchema = new Schema({
+    id: String, masterId: String, type: String, title: String, method: String, value: Number, applied: Number
+  }, { _id: false });
+
   const purchaseInvoiceSchema = new Schema({
     tenantKey: { type: String, index: true }, financialYear: { type: String, index: true }, invoiceNo: { type:String, index:true }, date: { type: Date, index: true },
     supplierGlobalId: String, supplierNameSnapshot: String, supplierGstinSnapshot: String, purchaseType: String,
-    items: [invoiceItemSchema], subtotal: Number, billDiscount: Number, otherCharges: Number, taxableTotal: Number, taxTotal: Number, roundOff: Number, grandTotal: Number,
+    items: [invoiceItemSchema], adjustments: [purchaseAdjustmentSchema], subtotal: Number, billDiscount: Number, otherCharges: Number, taxableTotal: Number, taxTotal: Number, roundOff: Number, grandTotal: Number,
     landedCharges: Number, transportationCost: Number, labourCost: Number, localFreight: Number, miscellaneousCost: Number, landedTax: Number, landedExpensePercentage: Number, maxGstPercentage: Number,
     // DIRECT keeps urgent/cash purchase invoices independent. PO links the smart procurement workflow.
     procurementMode: { type:String, enum:["DIRECT","PO"], default:"DIRECT", index:true },
@@ -235,20 +244,46 @@ export function fyModels(db) {
   deliveryRunSchema.index({ tenantKey: 1, financialYear: 1, runNo: 1 }, { unique: true });
   deliveryRunSchema.index({ tenantKey: 1, financialYear: 1, deliveryBoyId: 1, date: -1 });
 
+  // Statutory adjustment / movement documents share the existing CreditNote
+  // collection. This is intentional: some Atlas Free/Flex deployments are at the
+  // 500-collection ceiling, so Debit Note and Delivery Note must not create new
+  // collections. Existing order-return credit notes remain fully compatible.
   const creditNoteItemSchema = new Schema({
-    productId: String, sku: String, nameSnapshot: String, qty: Number, unit: String,
-    rate: Number, taxable: Number, tax: Number, lineTotal: Number, condition: String,
+    productId: String, sku: String, nameSnapshot: String, description: String,
+    hsnSnapshot: String, qty: Number, unit: String, packingUnit: String,
+    rate: Number, discountPct: Number, effectiveRate: Number,
+    taxable: Number, gstRateSnapshot: Number, cgst: Number, sgst: Number, igst: Number,
+    tax: Number, lineTotal: Number, condition: String,
   }, { _id: false });
   const creditNoteSchema = new Schema({
     tenantKey: { type: String, index: true }, financialYear: { type: String, index: true },
-    creditNoteNo: { type: String, index: true }, date: { type: Date, default: Date.now, index: true },
+    documentType: { type: String, enum: ["CREDIT_NOTE", "DEBIT_NOTE", "DELIVERY_NOTE"], default: "CREDIT_NOTE", index: true },
+    // creditNoteNo is retained as the physical unique document-number field so
+    // the existing unique index and old order-return code continue to work.
+    creditNoteNo: { type: String, index: true }, documentNo: { type: String, index: true },
+    date: { type: Date, default: Date.now, index: true },
     orderId: String, orderNo: String, invoiceId: String, invoiceNo: String,
-    customerGlobalId: String, customerNameSnapshot: String, items: [creditNoteItemSchema],
-    taxableTotal: Number, taxTotal: Number, grandTotal: Number, reason: String,
-    status: { type: String, enum: ["DRAFT", "ISSUED", "CANCELLED"], default: "DRAFT", index: true },
+    referenceDocumentId: String, referenceDocumentNo: String, referenceDocumentDate: Date,
+    customerGlobalId: String, customerNameSnapshot: String,
+    partyGlobalId: { type: String, index: true }, partyNameSnapshot: String,
+    partyGstinSnapshot: String, addressSnapshot: String,
+    reasonType: String, reason: String, gstType: String,
+    items: [creditNoteItemSchema],
+    subtotal: Number, billDiscount: Number, otherCharges: Number,
+    taxableTotal: Number, taxTotal: Number, roundOff: Number, grandTotal: Number,
+    warehouseId: { type: String, index: true }, warehouseNameSnapshot: String,
+    stockEffectApplied: { type: Boolean, default: false },
+    origin: { type: String, default: "MANUAL" },
+    // Delivery Note / job-work movement fields. These do not post accounting.
+    jobWorkPurpose: String, expectedReturnDate: Date, transporterName: String,
+    placeOfSupply: String, vehicleNo: String, distanceKm: Number, eWayBillRequired: { type: Boolean, default: false },
+    eWayBillReason: String, eWayBillNo: String, eWayBillDate: Date, returnedAt: Date,
+    remarks: String,
+    status: { type: String, enum: ["DRAFT", "ISSUED", "RETURNED", "CANCELLED"], default: "DRAFT", index: true },
     issuedAt: Date, createdBy: String, createdByNameSnapshot: String, issuedBy: String,
   }, { timestamps: true });
   creditNoteSchema.index({ tenantKey: 1, financialYear: 1, creditNoteNo: 1 }, { unique: true });
+  creditNoteSchema.index({ tenantKey: 1, financialYear: 1, documentType: 1, date: -1 });
   creditNoteSchema.index({ tenantKey: 1, financialYear: 1, invoiceId: 1, status: 1 });
 
   const promiseToPaySchema = new Schema({

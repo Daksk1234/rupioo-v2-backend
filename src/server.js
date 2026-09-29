@@ -4,6 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { env } from "./config/env.js";
 import { connectDb } from "./config/db.js";
+import { warmFinancialStorageTenantKeyCache } from "./services/financialStorageTenantService.js";
 import { errorHandler } from "./middleware/error.js";
 import { optionalAuth } from "./middleware/auth.js";
 import { companyPermissionGuard } from "./middleware/companyPermissionGuard.js";
@@ -19,6 +20,8 @@ import otpRoutes from "./routes/otp.js";
 import fileRoutes from "./routes/files.js";
 import genericRoutes from "./routes/generic.js";
 import transactionRoutes from "./routes/transactions.js";
+import salesWithProductRoutes from "./routes/salesWithProduct.js";
+import documentNoteRoutes from "./routes/documentNotes.js";
 import salesInvoiceBulkRoutes from "./routes/salesInvoiceBulk.js";
 import referenceRoutes from "./routes/reference.js";
 import accessRoutes from "./routes/access.js";
@@ -39,13 +42,43 @@ import orderFlowRoutes from "./routes/orderFlow.js";
 import purchaseAiRoutes, { vendorRouter as purchaseAiVendorRoutes, startPurchaseAiAutomation } from "./routes/purchaseAi.js";
 
 await connectDb();
+await warmFinancialStorageTenantKeyCache();
 const app = express();
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: env.corsOrigin.split(","), credentials: true }));
+const configuredCorsOrigins = new Set(
+  String(env.corsOrigin || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+
+function isPrivateLanHost(hostname = "") {
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  const match = hostname.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  return Boolean(match && Number(match[1]) >= 16 && Number(match[1]) <= 31);
+}
+
+function allowCorsOrigin(origin, callback) {
+  if (!origin || configuredCorsOrigins.has(origin)) return callback(null, true);
+  try {
+    const parsed = new URL(origin);
+    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isPrivateLanHost(parsed.hostname)) {
+      return callback(null, true);
+    }
+  } catch {}
+  return callback(new Error(`CORS origin not allowed: ${origin}`));
+}
+
+app.use(cors({ origin: allowCorsOrigin, credentials: true }));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
 app.get("/health", (_req, res) =>
+  res.json({ ok: true, service: "rupioo-global-v2", time: new Date() }),
+);
+app.get("/api/health", (_req, res) =>
   res.json({ ok: true, service: "rupioo-global-v2", time: new Date() }),
 );
 app.use("/api/auth", authRoutes);
@@ -87,6 +120,14 @@ app.get("/api/transactions/sales-invoices/bulk-health-live", (_req, res) =>
 );
 app.use("/api/transactions/sales-invoices", salesInvoiceBulkRoutes);
 
+// Sales-with-Product bulk import + GST/product resolution. Priority mount avoids
+// generic /api middleware/router changes from hiding import-preview. The same
+// router is also compatibility-mounted inside transactions.js.
+app.get("/api/transactions/sales-with-products/health-live", (_req, res) =>
+  res.json({ ok: true, module: "sales-with-products", build: "2026-09-25-deep-gst-product-v4", time: new Date().toISOString() }),
+);
+app.use("/api/transactions", salesWithProductRoutes);
+
 // Resolve the signed company session once, then enforce the Plan Group's page/action ceiling across business APIs.
 app.use("/api", optionalAuth, companyPermissionGuard);
 app.use("/api/master", masterRoutes);
@@ -109,6 +150,8 @@ app.use("/api/otp", otpRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/document-ai", documentAiRoutes);
 app.use("/api/migration", migrationRoutes);
+app.use("/api/transactions", documentNoteRoutes);
+app.use("/api/transactions", salesWithProductRoutes);
 app.use("/api/transactions", transactionRoutes);
 app.use("/api/purchase-ai", purchaseAiRoutes);
 app.use("/api/sales-app", salesAppRoutes);

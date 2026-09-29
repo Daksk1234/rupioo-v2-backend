@@ -6,6 +6,8 @@ import { createOtp, verifyOtp } from "../services/otpService.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import { resolveFinancialYear, financialYearFromDate } from "../utils/financialYear.js";
+import { allocateDocumentNoteNumber } from "../services/documentNumberService.js";
+import { syncSalesInvoiceCreditState, validateCreditNoteAgainstInvoice } from "../services/creditNoteRulesService.js";
 
 const router = express.Router();
 
@@ -773,11 +775,12 @@ router.post("/delivery-runs/:id/stops/:stopId/return-to-warehouse", async (req, 
       }
     }
     if (!creditItems.length) return fail(res, "Enter at least one returned product quantity", 400);
-    let creditNoteNo = makeId("CN"); while (await models.CreditNote.exists({ tenantKey: req.auth.tenantKey, financialYear, creditNoteNo })) creditNoteNo = makeId("CN");
+    const creditNoteNo = await allocateDocumentNoteNumber({ tenantKey: req.auth.tenantKey, financialYear, type: "CREDIT_NOTE" });
     const taxableTotal = money(creditItems.reduce((s, x) => s + num(x.taxable), 0));
     const taxTotal = money(creditItems.reduce((s, x) => s + num(x.tax), 0));
     const grandTotal = money(creditItems.reduce((s, x) => s + num(x.lineTotal), 0));
-    const creditNote = await models.CreditNote.create({ tenantKey: req.auth.tenantKey, financialYear, creditNoteNo, date: new Date(), orderId: String(order._id), orderNo: order.orderNo, invoiceId: String(invoice._id), invoiceNo: invoice.invoiceNo, customerGlobalId: invoice.customerGlobalId, customerNameSnapshot: invoice.customerNameSnapshot, items: creditItems, taxableTotal, taxTotal, grandTotal, reason: stop.failure?.reason || "Undelivered goods returned", status: "DRAFT", createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "" });
+    await validateCreditNoteAgainstInvoice({ models, tenantKey: req.auth.tenantKey, financialYear, invoice, note: { grandTotal, items: creditItems, reasonType: "GOODS_RETURN" } });
+    const creditNote = await models.CreditNote.create({ tenantKey: req.auth.tenantKey, financialYear, documentType: "CREDIT_NOTE", creditNoteNo, documentNo: creditNoteNo, date: new Date(), orderId: String(order._id), orderNo: order.orderNo, invoiceId: String(invoice._id), invoiceNo: invoice.invoiceNo, referenceDocumentId: String(invoice._id), referenceDocumentNo: invoice.invoiceNo, customerGlobalId: invoice.customerGlobalId, customerNameSnapshot: invoice.customerNameSnapshot, partyGlobalId: invoice.customerGlobalId, partyNameSnapshot: invoice.customerNameSnapshot, items: creditItems, taxableTotal, taxTotal, grandTotal, reasonType: "GOODS_RETURN", reason: stop.failure?.reason || "Undelivered goods returned", stockEffectApplied: true, origin: "ORDER_RETURN", status: "DRAFT", createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "" });
     stop.status = "RETURNED_TO_WAREHOUSE"; stop.warehouseReturn = { otpId: challenge.otpId, verifiedAt: new Date(), receivedBy: req.auth.sub, receivedByNameSnapshot: req.auth.name || "", receivedAt: new Date(), remarks: clean(req.body.remarks) }; await run.save();
     await models.SalesInvoice.updateOne({ _id: invoice._id, tenantKey: req.auth.tenantKey, financialYear }, { $set: { workflowStatus: "RETURNED_TO_WAREHOUSE" } });
     await transitionOrder({ req, models, order, toStatus: "RETURNED_TO_WAREHOUSE", note: `Returned goods received at warehouse. Draft credit note ${creditNoteNo} created.`, type: "RETURN_RECEIVED", meta: { creditNoteId: String(creditNote._id), creditNoteNo } });
@@ -791,7 +794,7 @@ router.post("/delivery-runs/:id/stops/:stopId/return-to-warehouse", async (req, 
 router.get("/credit-notes", async (req, res) => {
   try {
     const financialYear = await getFy(req), { CreditNote } = financialModels(req.auth.tenantKey, financialYear);
-    const filter = { tenantKey: req.auth.tenantKey, financialYear }; if (req.query.status) filter.status = upper(req.query.status);
+    const filter = { tenantKey: req.auth.tenantKey, financialYear, $or: [{ documentType: "CREDIT_NOTE" }, { documentType: { $exists: false } }] }; if (req.query.status) filter.status = upper(req.query.status);
     const items = await CreditNote.find(filter).sort({ createdAt: -1 }).limit(200).lean(); return ok(res, { financialYear, items });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
@@ -799,14 +802,17 @@ router.get("/credit-notes", async (req, res) => {
 router.post("/credit-notes/:id/issue", async (req, res) => {
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
-    const note = await models.CreditNote.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear }); if (!note) return fail(res, "Credit note not found", 404);
+    const note = await models.CreditNote.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear, $or: [{ documentType: "CREDIT_NOTE" }, { documentType: { $exists: false } }] }); if (!note) return fail(res, "Credit note not found", 404);
     if (note.status === "ISSUED") return ok(res, note, "Credit note already issued");
+    const invoice = await models.SalesInvoice.findOne({ _id: note.invoiceId || note.referenceDocumentId, tenantKey: req.auth.tenantKey, financialYear }).lean();
+    await validateCreditNoteAgainstInvoice({ models, tenantKey: req.auth.tenantKey, financialYear, invoice, note, excludeNoteId: note._id });
     await postBalancedEntries({ tenantKey: req.auth.tenantKey, financialYear, transactionId: note.creditNoteNo, transactionType: "SALES_CREDIT_NOTE", date: note.date, partyGlobalId: note.customerGlobalId, narration: `Credit Note ${note.creditNoteNo} against ${note.invoiceNo}`, entries: [
       { accountCode: "SYS_SALES", debit: note.taxableTotal },
       { accountCode: "SYS_DUTIES_TAXES", debit: note.taxTotal },
       { accountCode: "SYS_SUNDRY_DEBTORS", credit: note.grandTotal },
     ].filter((x) => num(x.debit) || num(x.credit)) });
     note.status = "ISSUED"; note.issuedAt = new Date(); note.issuedBy = req.auth.sub; await note.save();
+    if (note.invoiceId || note.referenceDocumentId) await syncSalesInvoiceCreditState({ models, tenantKey: req.auth.tenantKey, financialYear, invoiceId: note.invoiceId || note.referenceDocumentId });
     const order = await models.SalesOrder.findOne({ _id: note.orderId, tenantKey: req.auth.tenantKey, financialYear });
     if (order && upper(order.workflowStatus) === "CREDIT_NOTE_PENDING") await transitionOrder({ req, models, order, toStatus: "CLOSED", note: `Credit note ${note.creditNoteNo} issued against invoice ${note.invoiceNo}`, type: "CREDIT_NOTE_ISSUED", meta: { creditNoteNo: note.creditNoteNo, amount: note.grandTotal } });
     return ok(res, note, "Credit note issued and accounting posted");

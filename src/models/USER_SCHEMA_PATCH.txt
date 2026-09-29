@@ -1,0 +1,6 @@
+
+// Add this field inside the existing User schema definition:
+salesWithProductDraft: {
+  rows: { type: [Object], default: [] },
+  updatedAt: { type: Date, default: null },
+},

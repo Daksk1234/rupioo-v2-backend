@@ -43,6 +43,7 @@ export const PAGE_PERMISSION_MAP = {
   "/dms/sales-invoices": p("dms.sales.sales_invoice", "dms.sales.select_invoice"),
   "/dms/sales-returns": p("dms.sales.sales_return"),
   "/dms/credit-notes": p("dms.sales.creditnote"),
+  "/dms/delivery-notes": p("dms.sales.sales_invoice", "dms.sales.dispatch_details"),
 
   "/dms/purchase-request": p("dms.purchase.purchase_order", "dms.purchase.purchase_pending"),
   "/dms/rfq": p("dms.purchase.purchase_order", "dms.purchase.purchase_pending"),
@@ -54,6 +55,7 @@ export const PAGE_PERMISSION_MAP = {
   "/dms/grn": p("dms.purchase.purchase_pending", "dms.purchase.purchase_complete", "dms.purchase.purchase_invoice"),
   "/dms/purchase-invoices": p("dms.purchase.purchase_invoice"),
   "/dms/purchase-returns": p("dms.purchase.purchase_return"),
+  "/dms/debit-notes": p("dms.purchase.debit_notes"),
 
   "/dms/products": p("dms.product.product_creation", "dms.others.product"),
   "/dms/product-categories": p("dms.product.category_list", "dms.product.subcategory_list"),

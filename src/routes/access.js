@@ -2195,20 +2195,28 @@ router.get("/assignment-options", async (req,res) => {
 router.get("/superadmins", async (req,res) => {
   if(req.auth.role!=="MASTER") return fail(res,"MASTER access required",403);
   const users=await User.find({role:"SUPERADMIN"}).select("-passwordHash").sort({createdAt:-1}).lean();
-  const tenantKeys=users.map(x=>x.tenantKey).filter(Boolean);
-  const profiles=await CompanyProfile.find({tenantKey:{$in:tenantKeys}})
+  const tenantKeys=users.map(x=>String(x.tenantKey||"").trim()).filter(Boolean);
+  const tenantIds=users.map(x=>String(x.tenantId||"").trim()).filter(x=>/^[a-f0-9]{24}$/i.test(x));
+  const profileFilter=[];
+  if(tenantKeys.length)profileFilter.push({tenantKey:{$in:tenantKeys}});
+  if(tenantIds.length)profileFilter.push({_id:{$in:tenantIds}});
+  const profiles=profileFilter.length?await CompanyProfile.find({$or:profileFilter})
     .select("-aadhaarHash -stakeholders.aadhaarHash")
-    .lean();
+    .lean():[];
   const planCodes=Array.from(new Set(profiles.map(x=>x.planCode).filter(Boolean)));
   const plans=await Plan.find({code:{$in:planCodes}}).select("name code groupCode monthlyAmount yearlyAmount status").lean();
-  const profileMap=new Map(profiles.map(x=>[x.tenantKey,x]));
+  const profileByTenant=new Map(profiles.map(x=>[String(x.tenantKey||""),x]));
+  const profileById=new Map(profiles.map(x=>[String(x._id),x]));
   const planMap=new Map(plans.map(x=>[x.code,x]));
   return ok(res,users.map(user=>{
-    const companyProfile=profileMap.get(user.tenantKey)||null;
+    // tenantId is stable across GST/tenantKey migrations and repairs older
+    // split states where User.tenantKey and CompanyProfile.tenantKey differ.
+    const companyProfile=profileById.get(String(user.tenantId||""))||profileByTenant.get(String(user.tenantKey||""))||null;
     const subscription=companyProfile?subscriptionSnapshot(companyProfile):null;
     return {
       ...user,
       companyProfile,
+      tenantIdentityMismatch:Boolean(companyProfile&&String(companyProfile.tenantKey||"")!==String(user.tenantKey||"")),
       subscription,
       plan:companyProfile?planMap.get(companyProfile.planCode)||null:null
     };
@@ -2342,24 +2350,31 @@ router.get("/superadmins/:id", async (req,res) => {
   if(req.auth.role!=="MASTER") return fail(res,"MASTER access required",403);
   const user=await User.findOne({_id:req.params.id,role:"SUPERADMIN"}).select("-passwordHash").lean();
   if(!user) return fail(res,"Superadmin not found",404);
-  const companyProfile=await CompanyProfile.findOne({tenantKey:user.tenantKey})
-    .select("-aadhaarHash -stakeholders.aadhaarHash")
-    .lean();
+  let companyProfile=null;
+  const tenantId=String(user.tenantId||"").trim();
+  if(/^[a-f0-9]{24}$/i.test(tenantId)){
+    companyProfile=await CompanyProfile.findById(tenantId).select("-aadhaarHash -stakeholders.aadhaarHash").lean();
+  }
+  if(!companyProfile){
+    companyProfile=await CompanyProfile.findOne({tenantKey:user.tenantKey}).select("-aadhaarHash -stakeholders.aadhaarHash").lean();
+  }
   if(!companyProfile) return fail(res,"Company profile not found",404);
+  const companyTenantKey=String(companyProfile.tenantKey||user.tenantKey||"").trim();
 
   const [plan,payments,activeUsers,totalUsers,roles,branchRows]=await Promise.all([
     Plan.findOne({code:companyProfile.planCode}).lean(),
-    PlatformPayment.find({$or:[{tenantKey:user.tenantKey},{linkedUserId:String(user._id)},{linkedCompanyProfileId:String(companyProfile._id)}]})
+    PlatformPayment.find({$or:[{tenantKey:companyTenantKey},{tenantKey:user.tenantKey},{linkedUserId:String(user._id)},{linkedCompanyProfileId:String(companyProfile._id)}]})
       .sort({createdAt:-1}).limit(50).lean(),
-    User.countDocuments({tenantKey:user.tenantKey,status:"ACTIVE"}),
-    User.countDocuments({tenantKey:user.tenantKey}),
-    Role.countDocuments({tenantKey:user.tenantKey,status:"ACTIVE"}),
-    BranchOffice.countDocuments({tenantKey:user.tenantKey,status:"ACTIVE"})
+    User.countDocuments({tenantKey:companyTenantKey,status:"ACTIVE"}),
+    User.countDocuments({tenantKey:companyTenantKey}),
+    Role.countDocuments({tenantKey:companyTenantKey,status:"ACTIVE"}),
+    BranchOffice.countDocuments({tenantKey:companyTenantKey,status:"ACTIVE"})
   ]);
 
   return ok(res,{
     user,
     companyProfile,
+    tenantIdentityMismatch:String(companyProfile.tenantKey||"")!==String(user.tenantKey||""),
     plan,
     subscription:subscriptionSnapshot(companyProfile),
     payments,
@@ -2377,9 +2392,22 @@ router.put("/superadmins/:id", async (req,res) => {
   if(req.auth.role!=="MASTER") return fail(res,"MASTER access required",403);
   const user=await User.findOne({_id:req.params.id,role:"SUPERADMIN"});
   if(!user) return fail(res,"Superadmin not found",404);
-  const profile=await CompanyProfile.findOne({tenantKey:user.tenantKey});
+  let profile=null;
+  const stableTenantId=String(user.tenantId||"").trim();
+  if(/^[a-f0-9]{24}$/i.test(stableTenantId)) profile=await CompanyProfile.findById(stableTenantId);
+  if(!profile) profile=await CompanyProfile.findOne({tenantKey:user.tenantKey});
   if(!profile) return fail(res,"Company profile not found",404);
+  if(!user.tenantId) user.tenantId=String(profile._id);
   if(String(profile.status).toUpperCase()==="DELETED") return fail(res,"Restore this company before editing it",409);
+  const tenantIdentityWasSplit=String(user.tenantKey||"").trim()!==String(profile.tenantKey||"").trim();
+  if(tenantIdentityWasSplit){
+    // tenantId ties this SUPERADMIN to this exact CompanyProfile. Reconcile the
+    // login identity to the profile before migration preflight so a stale user
+    // record cannot falsely occupy the new tenantKey and block its own repair.
+    user.tenantKey=String(profile.tenantKey||"").trim();
+    user.tenantId=String(profile._id);
+    await user.save();
+  }
 
   const requestedGstin=normalizeGstin(req.body.gstin ?? profile.gstin ?? profile.tenantKey);
   let tenantMigration=null;
@@ -2449,21 +2477,66 @@ router.put("/superadmins/:id", async (req,res) => {
     profile.tenantKey=requestedGstin;
     user.tenantKey=requestedGstin;
   }
+  // Make the edited GSTIN an explicit persisted field. This is deliberately
+  // done even when migrateTenantData=false: in that case only the legal GSTIN
+  // changes while tenantKey remains unchanged.
+  if(gstChanged || tenantMoveRequested){
+    profile.gstin=requestedGstin;
+    profile.markModified("gstin");
+  }
   await profile.save();
 
+  // CompanyProfile is the authoritative tenant identity because tenantId is a
+  // stable link to it. Repair an older split state automatically, including
+  // the case where the company already moved but the SUPERADMIN user did not.
+  user.tenantKey=String(profile.tenantKey||user.tenantKey||"").trim();
+  user.tenantId=String(profile._id);
   user.name=profile.companyName;
   user.email=email;
   user.mobile=profile.mobile;
   await user.save();
 
-  const safeUser=user.toObject();delete safeUser.passwordHash;
-  const safeProfile=profile.toObject();delete safeProfile.aadhaarHash;
+  // Re-read from MongoDB before returning success. This prevents the MASTER UI
+  // from being told that the edit succeeded while the database still contains
+  // the previous GSTIN.
+  const [persistedProfile,persistedUser]=await Promise.all([
+    CompanyProfile.findById(profile._id),
+    User.findById(user._id),
+  ]);
+  if(!persistedProfile) return fail(res,"Company profile disappeared while saving",500,{code:"COMPANY_PROFILE_SAVE_FAILED"});
+  if(!persistedUser) return fail(res,"Superadmin user disappeared while saving",500,{code:"SUPERADMIN_SAVE_FAILED"});
+  if((gstChanged || tenantMoveRequested) && normalizeGstin(persistedProfile.gstin)!==requestedGstin){
+    return fail(res,"GSTIN could not be persisted. The company still has the previous GST number.",500,{
+      code:"GSTIN_PERSISTENCE_FAILED",
+      requestedGstin,
+      persistedGstin:normalizeGstin(persistedProfile.gstin),
+    });
+  }
+  if(tenantMoveRequested && (String(persistedProfile.tenantKey||"")!==requestedGstin || String(persistedUser.tenantKey||"")!==requestedGstin)){
+    return fail(res,"Tenant migration did not persist the new tenantKey on both the company and Superadmin.",500,{
+      code:"TENANT_KEY_PERSISTENCE_FAILED",
+      requestedTenantKey:requestedGstin,
+      companyTenantKey:String(persistedProfile.tenantKey||""),
+      superadminTenantKey:String(persistedUser.tenantKey||""),
+    });
+  }
+  if(String(persistedUser.tenantKey||"")!==String(persistedProfile.tenantKey||"")){
+    return fail(res,"Superadmin and company tenantKey are still inconsistent after saving.",500,{
+      code:"TENANT_IDENTITY_SPLIT",
+      companyTenantKey:String(persistedProfile.tenantKey||""),
+      superadminTenantKey:String(persistedUser.tenantKey||""),
+    });
+  }
+
+  const safeUser=persistedUser.toObject();delete safeUser.passwordHash;
+  const safeProfile=persistedProfile.toObject();delete safeProfile.aadhaarHash;
   if(Array.isArray(safeProfile.stakeholders)) safeProfile.stakeholders=safeProfile.stakeholders.map(({aadhaarHash,...rest})=>rest);
   return ok(res,{
     user:safeUser,
     companyProfile:safeProfile,
     subscription:subscriptionSnapshot(safeProfile),
     gstChanged,
+    tenantIdentityRepaired:tenantIdentityWasSplit,
     tenantMigration,
     tenantKeyChanged:Boolean(tenantMigration?.changed),
     newTenantKey:tenantMigration?.newTenantKey||safeProfile.tenantKey

@@ -13,6 +13,7 @@ import { extractDocument, enrichExtractedValues } from "../services/documentAiSe
 import { saveUploadedFile } from "../services/storageService.js";
 import { configuredFinancialYear, financialYearFromDate } from "../utils/financialYear.js";
 import orderFlowRoutes from "./orderFlow.js";
+import { enrichSalesInvoicesWithCreditState } from "../services/creditNoteRulesService.js";
 
 const router = express.Router();
 
@@ -176,7 +177,9 @@ function allocateReceiptsToInvoices(invoices = [], totalReceipts = 0, creditDays
   const today = startOfDay(new Date());
   const oldestFirst = [...invoices].sort((a, b) => new Date(a.date) - new Date(b.date));
   return oldestFirst.map((inv) => {
-    const total = Math.max(0, num(inv.grandTotal));
+    const grossTotal = Math.max(0, num(inv.grandTotal));
+    const credited = Math.max(0, num(inv.creditNoteAmount));
+    const total = Math.max(0, num(inv.netInvoiceAmount ?? (grossTotal - credited)));
     const applied = Math.min(total, available);
     available = money(available - applied);
     const outstanding = money(total - applied);
@@ -201,17 +204,19 @@ function allocateReceiptsToInvoices(invoices = [], totalReceipts = 0, creditDays
 }
 
 async function invoiceOutstandingForCustomer({ tenantKey, financialYear, customer, onlyOpen = false }) {
-  const { SalesInvoice, Receipt } = financialModels(tenantKey, financialYear);
+  const models = financialModels(tenantKey, financialYear);
+  const { SalesInvoice, Receipt } = models;
   const [invoices, receiptAgg] = await Promise.all([
     SalesInvoice.find({ tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" })
-      .select("invoiceNo date grandTotal workflowStatus status")
+      .select("invoiceNo date grandTotal creditNoteAmount netInvoiceAmount workflowStatus status")
       .sort({ date: 1, createdAt: 1 }).lean(),
     Receipt.aggregate([
       { $match: { tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" } },
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]),
   ]);
-  const bills = allocateReceiptsToInvoices(invoices, receiptAgg[0]?.total || 0, customer.creditDays || customer.approvedTerms?.creditDays || 0);
+  const netInvoices = await enrichSalesInvoicesWithCreditState({ models, tenantKey, financialYear, invoices });
+  const bills = allocateReceiptsToInvoices(netInvoices, receiptAgg[0]?.total || 0, customer.creditDays || customer.approvedTerms?.creditDays || 0);
   return onlyOpen ? bills.filter((x) => x.outstanding > 0) : bills;
 }
 
@@ -525,16 +530,18 @@ async function fulfillPromisesFromReceipt({ tenantKey, financialYear, customerGl
 async function collectionPriorityItems({ tenantKey, financialYear, customers }) {
   const ids = customers.map((x) => x.globalCustomerId);
   if (!ids.length) return [];
-  const { SalesInvoice, Receipt, PromiseToPay } = financialModels(tenantKey, financialYear);
+  const models = financialModels(tenantKey, financialYear);
+  const { SalesInvoice, Receipt, PromiseToPay } = models;
   await markBrokenPromises(PromiseToPay, tenantKey, financialYear, ids);
   const [invoices, receiptAgg, balanceMap, promises] = await Promise.all([
-    SalesInvoice.find({ tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" }).select("customerGlobalId invoiceNo date grandTotal").sort({ date: 1 }).lean(),
+    SalesInvoice.find({ tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" }).select("customerGlobalId invoiceNo date grandTotal creditNoteAmount netInvoiceAmount").sort({ date: 1 }).lean(),
     Receipt.aggregate([{ $match: { tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" } }, { $group: { _id: "$customerGlobalId", total: { $sum: "$amount" }, lastReceiptAt: { $max: "$date" } } }]),
     receivableMap({ tenantKey, financialYear, customerIds: ids }),
     PromiseToPay.find({ tenantKey, financialYear, customerGlobalId: { $in: ids }, status: { $in: ["OPEN", "PARTIAL", "BROKEN"] } }).lean(),
   ]);
+  const netInvoices = await enrichSalesInvoicesWithCreditState({ models, tenantKey, financialYear, invoices });
   const im = new Map();
-  for (const inv of invoices) { if (!im.has(inv.customerGlobalId)) im.set(inv.customerGlobalId, []); im.get(inv.customerGlobalId).push(inv); }
+  for (const inv of netInvoices) { if (!im.has(inv.customerGlobalId)) im.set(inv.customerGlobalId, []); im.get(inv.customerGlobalId).push(inv); }
   const rm = new Map(receiptAgg.map((x) => [String(x._id), x]));
   const pm = new Map();
   for (const p of promises) { if (!pm.has(p.customerGlobalId)) pm.set(p.customerGlobalId, []); pm.get(p.customerGlobalId).push(p); }
@@ -1105,15 +1112,16 @@ router.get("/collection-priority", async (req, res) => {
     const { filter } = await visibleCustomerFilter(req, { status: "ACTIVE" });
     if (q) { const rx = new RegExp(escapeRx(q), "i"); filter.$or = [{ localName: rx }, { displayIdentifier: rx }, { companyContactNumber: rx }, { ownerMobile: rx }, { "addresses.pincode": rx }]; }
     const customers = await CustomerLink.find(filter).select("globalCustomerId localName displayIdentifier companyContactNumber ownerMobile contacts addresses creditDays creditLimit accountingProfile salespersonId").lean();
-    const ids = customers.map((x) => x.globalCustomerId); const { SalesInvoice, Receipt, PromiseToPay } = financialModels(req.auth.tenantKey, financialYear);
+    const ids = customers.map((x) => x.globalCustomerId); const models = financialModels(req.auth.tenantKey, financialYear); const { SalesInvoice, Receipt, PromiseToPay } = models;
     await markBrokenPromises(PromiseToPay, req.auth.tenantKey, financialYear, ids);
     const [invoices, receiptAgg, balanceMap, promises] = await Promise.all([
-      SalesInvoice.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" }).select("customerGlobalId invoiceNo date grandTotal").sort({ date: 1 }).lean(),
+      SalesInvoice.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" }).select("customerGlobalId invoiceNo date grandTotal creditNoteAmount netInvoiceAmount").sort({ date: 1 }).lean(),
       Receipt.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" } }, { $group: { _id: "$customerGlobalId", total: { $sum: "$amount" }, lastReceiptAt: { $max: "$date" } } }]),
       receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: ids }),
       PromiseToPay.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: { $in: ["OPEN", "PARTIAL", "BROKEN"] } }).lean(),
     ]);
-    const im = new Map(); for (const inv of invoices) { if (!im.has(inv.customerGlobalId)) im.set(inv.customerGlobalId, []); im.get(inv.customerGlobalId).push(inv); }
+    const netInvoices = await enrichSalesInvoicesWithCreditState({ models, tenantKey: req.auth.tenantKey, financialYear, invoices });
+    const im = new Map(); for (const inv of netInvoices) { if (!im.has(inv.customerGlobalId)) im.set(inv.customerGlobalId, []); im.get(inv.customerGlobalId).push(inv); }
     const rm = new Map(receiptAgg.map((x) => [String(x._id), x])); const pm = new Map(); for (const p of promises) { if (!pm.has(p.customerGlobalId)) pm.set(p.customerGlobalId, []); pm.get(p.customerGlobalId).push(p); }
     const today = startOfDay(new Date());
     const items = customers.map((c) => {
@@ -2077,7 +2085,7 @@ router.get("/analytics/sales-collection", async (req, res) => {
         { $group: { _id: "$customerGlobalId", amount: { $sum: "$amount" }, receipts: { $sum: 1 }, lastCollectionAt: { $max: "$date" } } },
       ]),
       SalesInvoice.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $lt: end } })
-        .select("customerGlobalId invoiceNo date grandTotal workflowStatus status").sort({ date: 1, createdAt: 1 }).lean(),
+        .select("customerGlobalId invoiceNo date grandTotal creditNoteAmount netInvoiceAmount workflowStatus status").sort({ date: 1, createdAt: 1 }).lean(),
       Receipt.aggregate([
         { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED", date: { $lt: end } } },
         { $group: { _id: "$customerGlobalId", total: { $sum: "$amount" } } },
@@ -2108,8 +2116,9 @@ router.get("/analytics/sales-collection", async (req, res) => {
     const salesMap = new Map(partySales.map((x) => [String(x._id), x]));
     const receiptMap = new Map(partyCollections.map((x) => [String(x._id), x]));
     const receiptTotalMap = new Map(receiptTotals.map((x) => [String(x._id), num(x.total)]));
+    const netInvoiceRows = await enrichSalesInvoicesWithCreditState({ models: financialModels(req.auth.tenantKey, financialYear), tenantKey: req.auth.tenantKey, financialYear, invoices: invoiceRows });
     const invoiceMap = new Map();
-    for (const inv of invoiceRows) {
+    for (const inv of netInvoiceRows) {
       const id = clean(inv.customerGlobalId);
       if (!invoiceMap.has(id)) invoiceMap.set(id, []);
       invoiceMap.get(id).push(inv);

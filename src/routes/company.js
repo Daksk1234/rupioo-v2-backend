@@ -117,8 +117,12 @@ router.put("/profile", async (req,res) => {
   for(const key of ["companyName","tradeName","registeredAddress","financialYear","status"]) {
     if(req.body[key] !== undefined) current[key] = typeof req.body[key] === "string" ? clean(req.body[key]) : req.body[key];
   }
+  if(gstChanged||tenantMoveRequested){current.gstin=requestedGstin;current.markModified("gstin");}
   await current.save();
-  const result={...current.toObject(),gstChanged,tenantMigration,tenantKeyChanged:Boolean(tenantMigration?.changed),newTenantKey:tenantMigration?.newTenantKey||current.tenantKey};
+  const persisted=await CompanyProfile.findById(current._id).lean();
+  if(!persisted)return fail(res,"Company profile disappeared while saving",500,{code:"COMPANY_PROFILE_SAVE_FAILED"});
+  if((gstChanged||tenantMoveRequested)&&normalizeCompanyGstin(persisted.gstin)!==requestedGstin)return fail(res,"GSTIN could not be persisted. The company still has the previous GST number.",500,{code:"GSTIN_PERSISTENCE_FAILED",requestedGstin,persistedGstin:normalizeCompanyGstin(persisted.gstin)});
+  const result={...persisted,gstChanged,tenantMigration,tenantKeyChanged:Boolean(tenantMigration?.changed),newTenantKey:tenantMigration?.newTenantKey||persisted.tenantKey};
   return ok(res,result,tenantMigration?.changed?"GSTIN updated and company data moved to the new tenantKey":"Company profile updated");
 });
 

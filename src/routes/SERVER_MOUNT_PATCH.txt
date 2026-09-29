@@ -1,0 +1,6 @@
+
+// Ensure this exists in src/server.js:
+import salesWithProductRoutes from "./routes/salesWithProduct.js";
+
+// Ensure this exists after auth middleware / API setup:
+app.use("/api/transactions", salesWithProductRoutes);

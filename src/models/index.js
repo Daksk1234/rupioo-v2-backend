@@ -122,6 +122,13 @@ const userSchema = new Schema({
   fieldAccess: { type: Schema.Types.Mixed, default: {} },
   workflowTransitions: { type: Schema.Types.Mixed, default: {} },
   accountingRequired: { type: Boolean, default: false },
+  // Auto-saved working sheet for “List of Sales with Product”. Stored on the
+  // existing User document so no new MongoDB collection is required. Rows stay
+  // here until the related Sales Invoice is actually created.
+  salesWithProductDraft: {
+    rows: { type: [Schema.Types.Mixed], default: [] },
+    updatedAt: Date
+  },
   systemManaged: { type: Boolean, default: false, index: true },
   systemKey: { type: String, uppercase: true, trim: true, index: true, sparse: true },
   systemNote: String,
@@ -619,6 +626,13 @@ const stakeholderSchema = new Schema({
 
 const companyProfileSchema = new Schema({
   tenantKey: { type:String, required:true, unique:true, index:true },
+  // Physical FY database prefix. This can intentionally remain on the original
+  // tenant key after a legal GST/tenantKey change so Atlas Free/Flex migrations
+  // do not need to duplicate collections (500-collection hard limit).
+  financialStorageTenantKey: { type:String, default:"" },
+  // Historical logical tenant identities. Used as an alias fallback without
+  // requiring a separate alias collection to be created on a full Atlas cluster.
+  previousTenantKeys: { type:[String], default:[] },
   companyName: { type:String, required:true, index:true },
   tradeName:String,
   companyType: { type:String, enum:["PROPRIETORSHIP","PARTNERSHIP","LLP","PRIVATE_LIMITED","PUBLIC_LIMITED","OPC","TRUST","SOCIETY","OTHER"], required:true, index:true },
@@ -723,7 +737,8 @@ const tenantMigrationSchema = new Schema({
   masterCollections: [{ name: String, matched: Number, modified: Number, _id: false }],
   financialDatabases: [{
     source: String, target: String, sourceDocuments: Number, copiedDocuments: Number,
-    collections: Number, sourceDropped: Boolean, backupRetained: Boolean, error: String, _id: false
+    collections: Number, sourceDropped: Boolean, backupRetained: Boolean, error: String,
+    strategy: String, _id: false
   }],
   sourceDatabasesRetained: { type: Boolean, default: false },
   startedAt: { type: Date, default: Date.now },

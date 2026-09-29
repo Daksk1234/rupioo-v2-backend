@@ -1,13 +1,18 @@
 import mongoose from "mongoose";
-import { CompanyProfile, GlobalCustomer, TenantKeyAlias, TenantMigration } from "../models/index.js";
+import { CompanyProfile, GlobalCustomer, TenantMigration } from "../models/index.js";
 import { getTenantDbName } from "../config/db.js";
 import { makeId } from "../utils/ids.js";
 import { isTenantKeyReserved, recordTenantKeyAlias } from "./tenantKeyService.js";
 import { beginTenantMigrationLock, endTenantMigrationLock } from "./tenantMigrationLock.js";
+import {
+  clearFinancialStorageTenantKey,
+  setFinancialStorageTenantKey,
+} from "./financialStorageTenantService.js";
 
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
 const EXCLUDED_MASTER_COLLECTIONS = new Set(["tenantkeyaliases", "tenantmigrations"]);
 const BATCH_SIZE = 500;
+const FY_SUFFIX_RE = /^20\d{2}-\d{2}$/;
 
 const clean = (value) => String(value ?? "").trim();
 export const normalizeCompanyGstin = (value) => clean(value).toUpperCase();
@@ -20,6 +25,31 @@ const httpError = (message, status = 400, code = "") => {
   return error;
 };
 
+async function collectionExists(name) {
+  try {
+    return await mongoose.connection.db.listCollections({ name }, { nameOnly: true }).hasNext();
+  } catch {
+    return false;
+  }
+}
+
+async function migrationAuditAvailable() {
+  return collectionExists(TenantMigration.collection.name);
+}
+
+function memoryMigration(data) {
+  return {
+    ...data,
+    _auditPersisted: false,
+    async save() { return this; },
+  };
+}
+
+async function createMigrationAudit(data) {
+  if (!(await migrationAuditAvailable())) return memoryMigration(data);
+  return TenantMigration.create(data);
+}
+
 export function gstChangeConfirmation(profile, nextGstin) {
   const oldGstin = normalizeCompanyGstin(profile?.gstin || profile?.tenantKey);
   const newGstin = normalizeCompanyGstin(nextGstin);
@@ -29,9 +59,9 @@ export function gstChangeConfirmation(profile, nextGstin) {
     newGstin,
     oldTenantKey: clean(profile?.tenantKey),
     newTenantKey: newGstin,
-    question: "GST Number changed. Do you want to move all company data from the old tenantKey to the new GST tenantKey?",
+    question: "GST Number changed. Do you want to move all company data to the new GST tenantKey?",
     choices: {
-      yes: "Set migrateTenantData=true to move master data and every financial-year database to the new tenantKey.",
+      yes: "Set migrateTenantData=true. Tenant identity and all tenantKey values move to the new GSTIN without creating duplicate FY collections.",
       no: "Set migrateTenantData=false to change only the company GSTIN and keep the existing tenantKey/data location.",
     },
   };
@@ -40,7 +70,6 @@ export function gstChangeConfirmation(profile, nextGstin) {
 function replaceTenantKeys(value, oldKey, newKey) {
   if (Array.isArray(value)) return value.map((item) => replaceTenantKeys(item, oldKey, newKey));
   if (!value || typeof value !== "object" || value instanceof Date || Buffer.isBuffer(value)) return value;
-  // Preserve BSON values such as ObjectId, Decimal128, Binary and Timestamp.
   if (value._bsontype) return value;
   const proto = Object.getPrototypeOf(value);
   if (proto && proto !== Object.prototype) return value;
@@ -53,110 +82,68 @@ function replaceTenantKeys(value, oldKey, newKey) {
   return output;
 }
 
-function indexKeyForCreate(index = {}) {
-  const key = index?.key || {};
-  // MongoDB listIndexes represents text indexes internally as _fts/_ftsx.
-  // Recreate them from the public weights map instead of using internal keys.
-  if (key._fts === "text" && index.weights && typeof index.weights === "object") {
-    return Object.fromEntries(Object.keys(index.weights).map((field) => [field, "text"]));
-  }
-  return key;
-}
-
-function safeIndexOptions(index = {}, oldKey = "", newKey = "") {
-  const options = {};
-  for (const key of [
-    "name", "unique", "sparse", "expireAfterSeconds", "partialFilterExpression", "collation",
-    "weights", "default_language", "language_override", "textIndexVersion", "2dsphereIndexVersion",
-    "bits", "min", "max", "wildcardProjection", "hidden",
-  ]) {
-    if (index[key] !== undefined) options[key] = index[key];
-  }
-  return oldKey && newKey ? replaceTenantKeys(options, oldKey, newKey) : options;
-}
-
-async function copyCollection({ sourceDb, targetDb, name, oldKey, newKey }) {
-  const source = sourceDb.collection(name);
-  const target = targetDb.collection(name);
-  let copied = 0;
-  let batch = [];
-
-  const cursor = source.find({}, { batchSize: BATCH_SIZE });
-  for await (const doc of cursor) {
-    batch.push(replaceTenantKeys(doc, oldKey, newKey));
-    if (batch.length >= BATCH_SIZE) {
-      await target.insertMany(batch, { ordered: true });
-      copied += batch.length;
-      batch = [];
-    }
-  }
-  if (batch.length) {
-    await target.insertMany(batch, { ordered: true });
-    copied += batch.length;
-  }
-
-  // Preserve all non-_id indexes after the documents are copied.
-  // This avoids index-maintenance overhead while copying large FY databases.
-  const indexes = await source.indexes().catch(() => []);
-  for (const index of indexes) {
-    if (index.name === "_id_" || !index.key) continue;
-    await target.createIndex(indexKeyForCreate(index), safeIndexOptions(index, oldKey, newKey));
-  }
-
-  const targetCount = await target.countDocuments({});
-  if (targetCount !== copied) {
-    throw httpError(`Verification failed while copying ${sourceDb.databaseName}.${name}: expected ${copied}, found ${targetCount}`, 500, "TENANT_MIGRATION_COPY_VERIFY_FAILED");
-  }
-  if (await target.countDocuments({ tenantKey: oldKey }, { limit: 1 })) {
-    throw httpError(`Old tenantKey remained in copied collection ${targetDb.databaseName}.${name}`, 500, "TENANT_MIGRATION_TENANT_VERIFY_FAILED");
-  }
-  return copied;
-}
-
-async function databaseHasDocuments(db) {
-  const collections = await db.listCollections({}, { nameOnly: true }).toArray();
-  for (const { name } of collections) {
-    if (name.startsWith("system.")) continue;
-    if (await db.collection(name).countDocuments({}, { limit: 1 })) return true;
-  }
-  return false;
-}
-
-async function discoverFinancialDatabases(oldKey, financialYears = []) {
+async function discoverFinancialDatabases(storageTenantKey, financialYears = []) {
   const client = mongoose.connection.getClient();
-  const oldBase = getTenantDbName(oldKey);
+  const base = getTenantDbName(storageTenantKey);
   const discovered = new Set();
+  let listed = false;
 
   try {
     const result = await client.db().admin().listDatabases({ nameOnly: true });
+    listed = true;
     for (const row of result?.databases || []) {
       const name = clean(row?.name);
-      if (name.startsWith(`${oldBase}_`)) discovered.add(name);
+      if (!name.startsWith(`${base}_`)) continue;
+      const suffix = name.slice(base.length + 1);
+      if (FY_SUFFIX_RE.test(suffix)) discovered.add(name);
     }
   } catch (error) {
-    // Some managed MongoDB users cannot list every database. Fall back to the
-    // company's enabled FY list, which is the normal source of truth.
     console.warn("[tenant migration] listDatabases unavailable; using financialYears fallback:", error?.message || error);
   }
 
-  for (const fy of Array.isArray(financialYears) ? financialYears : []) {
-    const normalized = clean(fy).replace(/[^0-9-]/g, "");
-    if (normalized) discovered.add(`${oldBase}_${normalized}`);
+  if (!listed) {
+    for (const fy of Array.isArray(financialYears) ? financialYears : []) {
+      const normalized = clean(fy).replace(/[^0-9-]/g, "");
+      if (FY_SUFFIX_RE.test(normalized)) discovered.add(`${base}_${normalized}`);
+    }
   }
   return [...discovered].sort();
+}
+
+async function rollbackFailedMasterResidue(mainDb, oldKey, newKey, companyProfileId) {
+  if (!(await migrationAuditAvailable())) return [];
+  const failed = await TenantMigration.exists({
+    companyProfileId: String(companyProfileId),
+    oldTenantKey: oldKey,
+    newTenantKey: newKey,
+    status: "FAILED",
+  });
+  if (!failed) return [];
+
+  const collectionInfos = await mainDb.listCollections({}, { nameOnly: true }).toArray();
+  const repaired = [];
+  for (const { name } of collectionInfos) {
+    if (name.startsWith("system.") || EXCLUDED_MASTER_COLLECTIONS.has(name)) continue;
+    const collection = mainDb.collection(name);
+    const matched = await collection.countDocuments({ tenantKey: newKey });
+    if (!matched) continue;
+    const outcome = await collection.updateMany({ tenantKey: newKey }, { $set: { tenantKey: oldKey } });
+    repaired.push({ name, matched, modified: Number(outcome.modifiedCount || 0) });
+  }
+  return repaired;
 }
 
 async function preflightMasterTarget(mainDb, newKey, companyProfileId) {
   const duplicateProfile = await CompanyProfile.findOne({
     _id: { $ne: companyProfileId },
-    $or: [{ tenantKey: newKey }, { gstin: newKey }],
+    $or: [{ tenantKey: newKey }, { gstin: newKey }, { previousTenantKeys: newKey }],
   }).select("_id tenantKey gstin companyName").lean();
   if (duplicateProfile) {
-    throw httpError("The new GSTIN/tenantKey is already used by another company", 409, "TENANT_KEY_ALREADY_EXISTS");
+    throw httpError("The new GSTIN/tenantKey is already used or reserved by another company", 409, "TENANT_KEY_ALREADY_EXISTS");
   }
 
   if (await isTenantKeyReserved(newKey, { companyProfileId })) {
-    throw httpError("The new GSTIN is reserved by an existing tenant migration history", 409, "TENANT_KEY_RESERVED");
+    throw httpError("The new GSTIN is reserved by an existing tenant identity/history", 409, "TENANT_KEY_RESERVED");
   }
 
   const collectionInfos = await mainDb.listCollections({}, { nameOnly: true }).toArray();
@@ -217,8 +204,6 @@ async function migrateMasterCollections(mainDb, oldKey, newKey) {
       if (remaining) throw httpError(`Old tenantKey remained in master collection ${name}`, 500, "TENANT_MIGRATION_MASTER_VERIFY_FAILED");
     }
   } catch (error) {
-    // The target was verified empty before migration, so reversing only the
-    // collections changed in this attempt is safe and prevents a split tenant.
     for (const name of changedCollections.reverse()) {
       await mainDb.collection(name).updateMany({ tenantKey: newKey }, { $set: { tenantKey: oldKey } }).catch(() => {});
     }
@@ -228,70 +213,124 @@ async function migrateMasterCollections(mainDb, oldKey, newKey) {
   return results;
 }
 
-async function copyFinancialDatabases({ sourceNames, oldKey, newKey, allowTargetCleanup = false }) {
-  const client = mongoose.connection.getClient();
-  const oldBase = getTenantDbName(oldKey);
-  const newBase = getTenantDbName(newKey);
-  const results = [];
+async function remapCollectionInPlace(collection, oldKey, newKey) {
+  const total = await collection.countDocuments({});
+  const matched = await collection.countDocuments({ tenantKey: oldKey });
+  if (!matched) return { total, matched: 0, modified: 0 };
 
-  for (const sourceName of sourceNames) {
-    if (!sourceName.startsWith(`${oldBase}_`)) continue;
-    const suffix = sourceName.slice(oldBase.length);
-    const targetName = `${newBase}${suffix}`;
-    const sourceDb = client.db(sourceName);
-    const targetDb = client.db(targetName);
-
-    if (await databaseHasDocuments(targetDb)) {
-      if (!allowTargetCleanup) {
-        throw httpError(`Target financial-year database already contains data: ${targetName}`, 409, "TENANT_TARGET_FY_DATA_EXISTS");
-      }
-      // A previous failed/stale migration for the same old->new tenant pair may
-      // leave a partial target copy. Preflight already proved the new tenant is
-      // not active in MASTER data, so this orphan target is safe to rebuild.
-      await targetDb.dropDatabase();
-    } else {
-      // Remove empty/stale target collections/indexes from an earlier aborted attempt.
-      await targetDb.dropDatabase().catch(() => {});
+  let modified = 0;
+  let batch = [];
+  const cursor = collection.find({ tenantKey: oldKey }, { batchSize: BATCH_SIZE });
+  for await (const doc of cursor) {
+    batch.push({
+      replaceOne: {
+        filter: { _id: doc._id },
+        replacement: replaceTenantKeys(doc, oldKey, newKey),
+      },
+    });
+    if (batch.length >= BATCH_SIZE) {
+      const result = await collection.bulkWrite(batch, { ordered: true });
+      modified += Number(result.modifiedCount || result.matchedCount || batch.length);
+      batch = [];
     }
-
-    const collections = (await sourceDb.listCollections({}, { nameOnly: true }).toArray())
-      .map((row) => row.name)
-      .filter((name) => !name.startsWith("system."));
-
-    let sourceDocuments = 0;
-    let copiedDocuments = 0;
-    for (const name of collections) {
-      const count = await sourceDb.collection(name).countDocuments({});
-      sourceDocuments += count;
-      copiedDocuments += await copyCollection({ sourceDb, targetDb, name, oldKey, newKey });
-    }
-
-    if (sourceDocuments !== copiedDocuments) {
-      throw httpError(`Financial-year database verification failed for ${sourceName}`, 500, "TENANT_MIGRATION_FY_VERIFY_FAILED");
-    }
-    results.push({ source: sourceName, target: targetName, sourceDocuments, copiedDocuments, collections: collections.length, sourceDropped: false, backupRetained: true, error: "" });
   }
-  return results;
+  if (batch.length) {
+    const result = await collection.bulkWrite(batch, { ordered: true });
+    modified += Number(result.modifiedCount || result.matchedCount || batch.length);
+  }
+
+  const remaining = await collection.countDocuments({ tenantKey: oldKey }, { limit: 1 });
+  if (remaining) {
+    throw httpError(`Old tenantKey remained in FY collection ${collection.namespace}`, 500, "TENANT_MIGRATION_FY_VERIFY_FAILED");
+  }
+  return { total, matched, modified };
 }
 
-async function dropSourceFinancialDatabases(rows) {
+async function remapFinancialDatabasesInPlace({ sourceNames, oldKey, newKey }) {
   const client = mongoose.connection.getClient();
-  let retained = false;
-  for (const row of rows) {
-    try {
-      await client.db(row.source).dropDatabase();
-      row.sourceDropped = true;
-      row.backupRetained = false;
-    } catch (error) {
-      // The new tenant is already active and verified. A failure to remove an
-      // old source DB is non-fatal; keep it as a rollback backup and report it.
-      row.sourceDropped = false;
-      row.backupRetained = true;
-      row.error = error?.message || "Unable to remove old FY database";
-      retained = true;
+  const rows = [];
+
+  try {
+    for (const sourceName of sourceNames) {
+      const db = client.db(sourceName);
+      const collectionNames = (await db.listCollections({}, { nameOnly: true }).toArray())
+        .map((row) => row.name)
+        .filter((name) => !name.startsWith("system."));
+      if (!collectionNames.length) continue;
+
+      let sourceDocuments = 0;
+      let changedDocuments = 0;
+      for (const name of collectionNames) {
+        const result = await remapCollectionInPlace(db.collection(name), oldKey, newKey);
+        sourceDocuments += result.total;
+        changedDocuments += result.modified;
+      }
+
+      rows.push({
+        source: sourceName,
+        target: sourceName,
+        sourceDocuments,
+        copiedDocuments: changedDocuments,
+        collections: collectionNames.length,
+        sourceDropped: false,
+        backupRetained: true,
+        error: "",
+        collectionNames,
+        strategy: "IN_PLACE_ZERO_COLLECTION_GROWTH",
+      });
+    }
+    return rows;
+  } catch (error) {
+    error.financialRows = rows;
+    throw error;
+  }
+}
+
+async function rollbackFinancialDatabasesInPlace(sourceNames, fromKey, toKey) {
+  const client = mongoose.connection.getClient();
+  for (const sourceName of sourceNames) {
+    const db = client.db(sourceName);
+    const collectionNames = (await db.listCollections({}, { nameOnly: true }).toArray())
+      .map((row) => row.name)
+      .filter((name) => !name.startsWith("system."));
+    for (const name of collectionNames) {
+      await remapCollectionInPlace(db.collection(name), fromKey, toKey).catch(() => {});
     }
   }
-  return retained;
+}
+
+async function cleanupKnownFailedTargetDatabases({ companyProfileId, oldKey, newKey, sourceNames }) {
+  // Previous copy-based builds may have left partial rupioo_<NEWGST>_<FY>
+  // databases. Drop only those exact FY targets when a FAILED migration record
+  // proves they came from this same company/GST change. No arbitrary DB is touched.
+  if (!(await migrationAuditAvailable())) return [];
+  const failed = await TenantMigration.exists({
+    companyProfileId: String(companyProfileId),
+    oldTenantKey: oldKey,
+    newTenantKey: newKey,
+    status: "FAILED",
+  });
+  if (!failed) return [];
+
+  const client = mongoose.connection.getClient();
+  const newBase = getTenantDbName(newKey);
+  const dropped = [];
+  for (const sourceName of sourceNames) {
+    const suffix = sourceName.split("_").pop();
+    if (!FY_SUFFIX_RE.test(suffix)) continue;
+    const target = `${newBase}_${suffix}`;
+    if (target === sourceName) continue;
+    try {
+      const exists = await client.db().admin().listDatabases({ nameOnly: true });
+      if ((exists?.databases || []).some((row) => row.name === target)) {
+        await client.db(target).dropDatabase();
+        dropped.push(target);
+      }
+    } catch (error) {
+      console.warn(`[tenant migration] unable to clean failed target ${target}:`, error?.message || error);
+    }
+  }
+  return dropped;
 }
 
 export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, newGstin, actorId = "", actorRole = "" }) {
@@ -307,24 +346,22 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
     throw httpError("Company tenantKey changed before this migration started. Reload and try again.", 409, "TENANT_CHANGED_CONCURRENTLY");
   }
 
-  const running = await TenantMigration.findOne({ oldTenantKey: oldKey, status: "RUNNING" }).sort({ createdAt: -1 });
-  if (running) {
-    const ageMs = Date.now() - new Date(running.startedAt || running.createdAt || 0).getTime();
-    if (ageMs < 30 * 60 * 1000) {
-      throw httpError("A tenant migration is already running for this company", 423, "TENANT_MIGRATION_RUNNING");
+  if (await migrationAuditAvailable()) {
+    const running = await TenantMigration.findOne({ oldTenantKey: oldKey, status: "RUNNING" }).sort({ createdAt: -1 });
+    if (running) {
+      const ageMs = Date.now() - new Date(running.startedAt || running.createdAt || 0).getTime();
+      if (ageMs < 30 * 60 * 1000) {
+        throw httpError("A tenant migration is already running for this company", 423, "TENANT_MIGRATION_RUNNING");
+      }
+      running.status = "FAILED";
+      running.phase = "STALE_PROCESS_INTERRUPTED";
+      running.error = "Previous migration was marked stale after 30 minutes without completion";
+      running.completedAt = new Date();
+      await running.save();
     }
-    running.status = "FAILED";
-    running.phase = "STALE_PROCESS_INTERRUPTED";
-    running.error = "Previous migration was marked stale after 30 minutes without completion";
-    running.completedAt = new Date();
-    await running.save();
   }
 
-  const priorFailedMigration = await TenantMigration.exists({
-    oldTenantKey: oldKey, newTenantKey: newKey, status: "FAILED",
-  });
-
-  const migration = await TenantMigration.create({
+  const migration = await createMigrationAudit({
     migrationId: makeId("TNM"),
     companyProfileId: String(profile._id),
     oldTenantKey: oldKey,
@@ -340,18 +377,38 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
 
   beginTenantMigrationLock(oldKey);
   const mainDb = mongoose.connection.db;
+  const physicalStorageKey = clean(profile.financialStorageTenantKey) || oldKey;
   let financialRows = [];
   let masterRows = [];
+  let sourceNames = [];
+
   try {
+    migration.phase = "REPAIR_FAILED_MASTER_RESIDUE";
+    await migration.save();
+    const repairedMasterResidue = await rollbackFailedMasterResidue(mainDb, oldKey, newKey, String(profile._id));
+    if (repairedMasterResidue.length) migration.repairedMasterResidue = repairedMasterResidue;
+
+    migration.phase = "PREFLIGHT";
+    await migration.save();
     await preflightMasterTarget(mainDb, newKey, String(profile._id));
 
     migration.phase = "DISCOVER_FINANCIAL_DATABASES";
     await migration.save();
-    const sourceNames = await discoverFinancialDatabases(oldKey, profile.financialYears?.length ? profile.financialYears : [profile.financialYear].filter(Boolean));
+    sourceNames = await discoverFinancialDatabases(
+      physicalStorageKey,
+      profile.financialYears?.length ? profile.financialYears : [profile.financialYear].filter(Boolean),
+    );
 
-    migration.phase = "COPY_FINANCIAL_DATABASES";
+    // Reclaim namespaces left by the older copy-based migration before doing
+    // anything else. The new strategy never creates replacement FY databases.
+    const removedFailedTargets = await cleanupKnownFailedTargetDatabases({
+      companyProfileId: String(profile._id), oldKey, newKey, sourceNames,
+    });
+    if (removedFailedTargets.length) migration.removedFailedTargets = removedFailedTargets;
+
+    migration.phase = "REMAP_FINANCIAL_DATA_IN_PLACE";
     await migration.save();
-    financialRows = await copyFinancialDatabases({ sourceNames, oldKey, newKey, allowTargetCleanup: Boolean(priorFailedMigration) });
+    financialRows = await remapFinancialDatabasesInPlace({ sourceNames, oldKey, newKey });
     migration.financialDatabases = financialRows;
     await migration.save();
 
@@ -361,9 +418,26 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
     migration.masterCollections = masterRows;
     await migration.save();
 
-    // Create the compatibility alias immediately after the master switch.
-    // This keeps already-issued JWTs and signed vendor links working even if
-    // a later non-critical cleanup step encounters an error.
+    // Persist the physical FY storage mapping immediately after the logical
+    // tenant switch. This is what prevents financialModels(newGST, FY) from
+    // creating a new GST-named database/collection on a full Atlas cluster.
+    migration.phase = "SET_FINANCIAL_STORAGE_MAPPING";
+    await migration.save();
+    await CompanyProfile.updateOne(
+      { _id: profile._id, tenantKey: newKey },
+      {
+        $set: {
+          gstin: newKey,
+          tenantKey: newKey,
+          financialStorageTenantKey: physicalStorageKey,
+        },
+        $addToSet: { previousTenantKeys: oldKey },
+      },
+    );
+    clearFinancialStorageTenantKey(oldKey, newKey);
+    setFinancialStorageTenantKey(newKey, physicalStorageKey);
+    setFinancialStorageTenantKey(oldKey, physicalStorageKey);
+
     migration.phase = "CREATE_ALIAS";
     await migration.save();
     await recordTenantKeyAlias({
@@ -375,29 +449,31 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
       changedBy: actorId,
     });
 
-    // Make the legal GST identity explicit even though tenantKey has already
-    // been moved by the generic master-collection migration.
-    await CompanyProfile.updateOne(
-      { _id: profile._id, tenantKey: newKey },
-      { $set: { gstin: newKey, tenantKey: newKey } },
-    );
+    const persistedProfile = await CompanyProfile.findById(profile._id)
+      .select("tenantKey gstin financialStorageTenantKey previousTenantKeys")
+      .lean();
+    if (
+      !persistedProfile ||
+      clean(persistedProfile.tenantKey) !== newKey ||
+      normalizeCompanyGstin(persistedProfile.gstin) !== newKey ||
+      clean(persistedProfile.financialStorageTenantKey) !== physicalStorageKey
+    ) {
+      throw httpError("Company tenant/storage identity was not persisted after migration", 500, "TENANT_IDENTITY_VERIFY_FAILED");
+    }
 
     migration.phase = "UPDATE_GLOBAL_LINKS";
     await migration.save();
     await migrateGlobalCustomerLinks(oldKey, newKey);
 
-    migration.phase = "REMOVE_OLD_FINANCIAL_DATABASES";
-    await migration.save();
-    const sourceDatabasesRetained = await dropSourceFinancialDatabases(financialRows);
-
     migration.status = "COMPLETED";
     migration.phase = "COMPLETED";
     migration.financialDatabases = financialRows;
     migration.masterCollections = masterRows;
-    migration.sourceDatabasesRetained = sourceDatabasesRetained;
+    migration.sourceDatabasesRetained = true;
     migration.completedAt = new Date();
     migration.error = "";
     await migration.save();
+
     return {
       changed: true,
       migrationId: migration.migrationId,
@@ -407,7 +483,9 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
       newGstin: newKey,
       masterCollections: masterRows,
       financialDatabases: financialRows,
-      sourceDatabasesRetained,
+      sourceDatabasesRetained: true,
+      financialStorageTenantKey: physicalStorageKey,
+      storageStrategy: "IN_PLACE_ZERO_COLLECTION_GROWTH",
       sessionAliasCreated: true,
     };
   } catch (error) {
@@ -419,34 +497,42 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
     migration.completedAt = new Date();
     await migration.save().catch(() => {});
 
-    // If the master tenant switch never completed, target FY databases are only
-    // copies and can be removed safely to leave the old tenant fully intact.
     const switched = await CompanyProfile.exists({ _id: profile._id, tenantKey: newKey });
     if (!switched) {
-      const client = mongoose.connection.getClient();
-      for (const row of financialRows) await client.db(row.target).dropDatabase().catch(() => {});
+      // No master switch: restore any FY documents already changed in place.
+      if (sourceNames.length) await rollbackFinancialDatabasesInPlace(sourceNames, newKey, oldKey);
+      clearFinancialStorageTenantKey(oldKey, newKey);
+      setFinancialStorageTenantKey(oldKey, physicalStorageKey);
       throw error;
     }
 
-    // If the MASTER switch already happened, the active tenant is the new key.
-    // Do not report a hard failure that could tempt the caller to retry the move
-    // against an already-migrated company. Repair critical identity pieces and
-    // return a completed-with-warning result instead.
+    // Master switch already happened. Keep the new logical identity, repair the
+    // storage mapping/alias, and return with warnings rather than risking a
+    // second migration against an already-switched tenant.
     const warnings = [error?.message || "A post-migration cleanup step failed"];
-    let sessionAliasCreated = true;
+    await CompanyProfile.updateOne(
+      { _id: profile._id },
+      {
+        $set: { tenantKey: newKey, gstin: newKey, financialStorageTenantKey: physicalStorageKey },
+        $addToSet: { previousTenantKeys: oldKey },
+      },
+    ).catch((repairError) => warnings.push(`Company/storage repair: ${repairError?.message || repairError}`));
+    clearFinancialStorageTenantKey(oldKey, newKey);
+    setFinancialStorageTenantKey(newKey, physicalStorageKey);
+    setFinancialStorageTenantKey(oldKey, physicalStorageKey);
     await recordTenantKeyAlias({
-      oldTenantKey: oldKey, newTenantKey: newKey, companyProfileId: String(profile._id),
-      oldGstin: profile.gstin || oldKey, newGstin: newKey, changedBy: actorId,
-    }).catch((repairError) => { sessionAliasCreated = false; warnings.push(`Alias repair: ${repairError?.message || repairError}`); });
-    await CompanyProfile.updateOne({ _id: profile._id }, { $set: { tenantKey: newKey, gstin: newKey } })
-      .catch((repairError) => warnings.push(`Company identity repair: ${repairError?.message || repairError}`));
+      oldTenantKey: oldKey,
+      newTenantKey: newKey,
+      companyProfileId: String(profile._id),
+      oldGstin: profile.gstin || oldKey,
+      newGstin: newKey,
+      changedBy: actorId,
+    }).catch((repairError) => warnings.push(`Alias repair: ${repairError?.message || repairError}`));
 
     migration.status = "COMPLETED";
     migration.phase = "COMPLETED_WITH_WARNINGS";
     migration.error = warnings.join(" | ");
     migration.completedAt = new Date();
-    migration.financialDatabases = financialRows;
-    migration.masterCollections = masterRows;
     migration.sourceDatabasesRetained = true;
     await migration.save().catch(() => {});
     return {
@@ -454,12 +540,13 @@ export async function migrateCompanyTenantKey({ companyProfileId, oldTenantKey, 
       migrationId: migration.migrationId,
       oldTenantKey: oldKey,
       newTenantKey: newKey,
-      oldGstin: normalizeCompanyGstin(profile.gstin || oldKey),
       newGstin: newKey,
       masterCollections: masterRows,
       financialDatabases: financialRows,
       sourceDatabasesRetained: true,
-      sessionAliasCreated,
+      financialStorageTenantKey: physicalStorageKey,
+      storageStrategy: "IN_PLACE_ZERO_COLLECTION_GROWTH",
+      sessionAliasCreated: true,
       warnings,
     };
   } finally {
@@ -471,15 +558,21 @@ export async function validateGstinChangeTarget({ profile, nextGstin }) {
   const newGstin = normalizeCompanyGstin(nextGstin);
   if (!validCompanyGstin(newGstin)) throw httpError("Enter a valid 15-character GSTIN", 400, "INVALID_GSTIN");
   if (!profile) throw httpError("Company profile not found", 404, "COMPANY_NOT_FOUND");
-  if (newGstin === normalizeCompanyGstin(profile.gstin)) return { changed: false, newGstin };
+
+  // A profile can already have the new GSTIN while still carrying the old
+  // tenantKey after an older failed save. Do not treat that split state as
+  // 'nothing changed'; the caller may still need a tenant migration.
+  const sameGstin = newGstin === normalizeCompanyGstin(profile.gstin);
+  const sameTenant = newGstin === clean(profile.tenantKey);
+  if (sameGstin && sameTenant) return { changed: false, newGstin };
 
   const duplicate = await CompanyProfile.findOne({
     _id: { $ne: profile._id },
-    $or: [{ gstin: newGstin }, { tenantKey: newGstin }],
+    $or: [{ gstin: newGstin }, { tenantKey: newGstin }, { previousTenantKeys: newGstin }],
   }).select("_id companyName gstin tenantKey").lean();
-  if (duplicate) throw httpError("This GSTIN is already assigned to another company", 409, "GSTIN_ALREADY_EXISTS");
+  if (duplicate) throw httpError("This GSTIN is already assigned/reserved by another company", 409, "GSTIN_ALREADY_EXISTS");
 
-  if (await TenantKeyAlias.exists({ oldTenantKey: newGstin, status: "ACTIVE" })) {
+  if (await isTenantKeyReserved(newGstin, { companyProfileId: String(profile._id) })) {
     throw httpError("This GSTIN is an old tenant identity reserved by migration history", 409, "GSTIN_RESERVED_BY_MIGRATION");
   }
   return { changed: true, newGstin };

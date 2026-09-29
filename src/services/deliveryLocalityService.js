@@ -38,6 +38,34 @@ export async function resolveFirmDeliveryLocation(tenantKey) {
 export async function resolveCustomerDeliveryMode({ tenantKey, customer }) {
   const firm = await resolveFirmDeliveryLocation(tenantKey);
   const destination = customerDeliveryAddress(customer);
+
+  // The system CASH party is always treated as a local/counter sale.
+  // It intentionally has no delivery address, city or transporter and must never
+  // be blocked by Local-vs-Transport delivery validation.  The extra identity
+  // fallbacks also cover CASH records created by older deployments before the
+  // systemManaged/systemKey fields were back-filled on login.
+  const cashIdentity = [
+    customer?.systemKey,
+    customer?.customerCode,
+    customer?.displayIdentifier,
+    customer?.localName,
+  ].some((value) => clean(value).toUpperCase() === "CASH");
+
+  if (cashIdentity) {
+    return {
+      mode: "LOCAL",
+      requiresTransport: false,
+      firmCity: firm.city,
+      firmState: firm.state,
+      firmPincode: firm.pincode,
+      customerCity: firm.city || "CASH",
+      customerState: clean(destination.state || customer?.state || firm.state),
+      customerPincode: digits(destination.pincode || customer?.pincode).slice(0, 6),
+      destination,
+      systemCash: true,
+    };
+  }
+
   let customerCity = clean(destination.city || customer?.city);
   if (!customerCity) customerCity = await cityFromPincode(destination.pincode || customer?.pincode);
   if (!firm.normalizedCity) {

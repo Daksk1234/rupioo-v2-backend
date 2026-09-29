@@ -187,8 +187,24 @@ router.put("/", async (req, res) => {
     company.tenantKey = requestedGstin;
     user.tenantKey = requestedGstin;
     req.auth.tenantKey = requestedGstin;
+    // The user was saved earlier for normal profile fields. Save again after a
+    // tenant move so the login identity stored in MongoDB also carries the new
+    // tenantKey.
+    await user.save();
+  }
+  if (gstChanged || tenantMoveRequested) {
+    company.gstin = requestedGstin;
+    company.markModified("gstin");
   }
   await company.save();
+
+  const persistedCompany = await CompanyProfile.findById(company._id).lean();
+  if (!persistedCompany) return fail(res, "Company profile disappeared while saving", 500, { code: "COMPANY_PROFILE_SAVE_FAILED" });
+  if ((gstChanged || tenantMoveRequested) && normalizeCompanyGstin(persistedCompany.gstin) !== requestedGstin) {
+    return fail(res, "GSTIN could not be persisted. The company still has the previous GST number.", 500, {
+      code: "GSTIN_PERSISTENCE_FAILED", requestedGstin, persistedGstin: normalizeCompanyGstin(persistedCompany.gstin),
+    });
+  }
 
   const data = await loadProfile(req);
   return ok(res, {

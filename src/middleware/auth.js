@@ -4,6 +4,7 @@ import { fail } from "../utils/http.js";
 import { decodePermissions } from "../utils/authToken.js";
 import { resolveTenantKeyAlias } from "../services/tenantKeyService.js";
 import { isTenantMigrationActive } from "../services/tenantMigrationLock.js";
+import { ensureFinancialStorageTenantKey } from "../services/financialStorageTenantService.js";
 
 async function authFromClaims(claims) {
   const originalTenantKey = String(claims?.tenantKey || "").trim();
@@ -15,6 +16,13 @@ async function authFromClaims(claims) {
       // Alias lookup must never make an otherwise-valid login unusable.
       // A fresh login will carry the new tenantKey after migration.
       console.warn("Tenant alias lookup warning:", error?.message || error);
+    }
+  }
+  if (tenantKey && String(claims?.role || "").toUpperCase() !== "MASTER") {
+    try {
+      await ensureFinancialStorageTenantKey(tenantKey);
+    } catch (error) {
+      console.warn("Financial storage mapping warning:", error?.message || error);
     }
   }
   return {

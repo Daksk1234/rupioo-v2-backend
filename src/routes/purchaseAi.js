@@ -22,6 +22,7 @@ import { saveUploadedFile, readFile } from "../services/storageService.js";
 import { extractDocument } from "../services/documentAiService.js";
 import { getDocumentTemplate } from "../config/documentForms.js";
 import { resolveTenantKeyAlias } from "../services/tenantKeyService.js";
+import { ensureFinancialStorageTenantKey } from "../services/financialStorageTenantService.js";
 import { isTenantMigrationActive } from "../services/tenantMigrationLock.js";
 
 const router = express.Router();
@@ -334,6 +335,7 @@ export function startPurchaseAiAutomation({ intervalMs = 15 * 60 * 1000, initial
       const tenants = (await Product.distinct("tenantKey", { status: "ACTIVE" })).filter(Boolean);
       for (const tenantKey of tenants) {
         try {
+          await ensureFinancialStorageTenantKey(tenantKey);
           const financialYear = await currentFy(tenantKey);
           await scanAndUpsert(tenantKey, financialYear, "SYSTEM");
         } catch (error) {

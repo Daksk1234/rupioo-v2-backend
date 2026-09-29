@@ -845,6 +845,12 @@ router.put("/:id", async (req, res) => {
     if (!existing) return fail(res, "Product not found", 404);
 
     const changes = { ...req.body };
+    // Never let edit-form metadata overwrite ownership/identity fields.
+    delete changes._id;
+    delete changes.__v;
+    delete changes.tenantKey;
+    delete changes.createdAt;
+    delete changes.updatedAt;
     if (!isAdminAuth(req.auth)) {
       delete changes.minimumProfitPct;
       delete changes.pricingScheme;
@@ -903,11 +909,17 @@ router.put("/:id", async (req, res) => {
     if (changes.packingUnit !== undefined) changes.packingUnit = upper(changes.packingUnit);
     normalizeNumericFields(changes);
 
-    if (changes.openingStock !== undefined && changes.currentStock === undefined) {
-      if (Number(existing.currentStock || 0) === Number(existing.openingStock || 0)) {
-        changes.currentStock = Number(changes.openingStock || 0);
-      }
-    }
+    // Current Stock is transaction-driven and must never be overwritten by the
+    // stale read-only value sent back by the Product edit form. When Opening
+    // Stock changes, only apply the difference to Current Stock so every sale,
+    // purchase and other stock movement already posted remains intact.
+    const openingStockWasProvided = changes.openingStock !== undefined;
+    const previousOpeningStock = Number(existing.openingStock || 0);
+    const nextOpeningStock = openingStockWasProvided
+      ? Number(changes.openingStock || 0)
+      : previousOpeningStock;
+    const openingStockDelta = nextOpeningStock - previousOpeningStock;
+    delete changes.currentStock;
 
     const nextName = changes.name !== undefined ? changes.name : existing.name;
     const nextCategory = changes.category !== undefined ? changes.category : existing.category;
@@ -915,26 +927,28 @@ router.put("/:id", async (req, res) => {
       changes.subCategory !== undefined ? changes.subCategory : existing.subCategory;
     const nextHsn = changes.hsnCode !== undefined ? changes.hsnCode : existing.hsnCode;
     const nextBarcode = changes.barcode !== undefined ? changes.barcode : existing.barcode;
+    const existingBarcodeCode = cleanText(existing.barcode);
+    const nextBarcodeCode = cleanText(nextBarcode);
 
-    const barcode = await syncBarcodeMetadata({
-      tenantKey: req.auth.tenantKey,
-      oldBarcode: existing.barcode,
-      newBarcode: nextBarcode,
-      oldSku: existing.sku,
-      sku: nextSku,
-      productName: nextName,
-      category: nextCategory,
-      subCategory: nextSubCategory,
-      hsnCode: nextHsn,
-      productId: String(existing._id),
-      userId: userIdFromAuth(req.auth),
-    });
-    changes.barcode = barcode.barcode;
-    changes.barcodeSource = barcode.barcodeSource;
+    // Product EDIT must never re-allocate or validate the barcode against the
+    // MASTER Barcode Center. The product may retain its current barcode or the
+    // user may type a different one. Database-level duplicate protection is
+    // still kept by the Product model/update error handling below.
+    changes.barcode = nextBarcodeCode;
+    if (nextBarcodeCode === existingBarcodeCode) {
+      if (existing.barcodeSource) changes.barcodeSource = existing.barcodeSource;
+    } else {
+      changes.barcodeSource = nextBarcodeCode ? "MANUAL_EDIT" : "";
+    }
+
+    const productUpdate = { $set: changes };
+    if (openingStockWasProvided && openingStockDelta !== 0) {
+      productUpdate.$inc = { currentStock: openingStockDelta };
+    }
 
     const product = await Product.findOneAndUpdate(
       { _id: req.params.id, tenantKey: req.auth.tenantKey },
-      changes,
+      productUpdate,
       { new: true, runValidators: true },
     );
     const responseProduct = product.toObject();

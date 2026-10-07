@@ -1210,10 +1210,29 @@ router.post("/orders", async (req, res) => {
     const creditHold = creditLimit > 0 && exceededBy > 0;
     let orderNo = clean(req.body.orderNo) || makeId("SO");
     while (await SalesOrder.exists({ tenantKey: req.auth.tenantKey, financialYear, orderNo })) orderNo = makeId("SO");
-    const orderChannel = ["DMS", "CUSTOMER", "SALESPERSON_ON_BEHALF"].includes(upper(req.body.orderChannel))
-      ? upper(req.body.orderChannel)
+    const requestedChannel = upper(req.body.orderChannel);
+    const orderChannel = ["DMS", "DMS_WEB", "CUSTOMER", "SALESPERSON_ON_BEHALF"].includes(requestedChannel)
+      ? requestedChannel
       : "SALESPERSON_ON_BEHALF";
     const customerOtpRequired = orderChannel === "SALESPERSON_ON_BEHALF";
+
+    // Website-created DMS orders must carry a valid active warehouse. Existing mobile/app
+    // orders remain backward compatible and are not forced to send a warehouse.
+    const warehouseId = clean(req.body.warehouseId);
+    let warehouse = null;
+    if (warehouseId) {
+      if (!objectIdText(warehouseId)) return fail(res, "Invalid warehouse selected", 400);
+      warehouse = await GenericRecord.findOne({
+        _id: warehouseId,
+        tenantKey: req.auth.tenantKey,
+        app: "dms",
+        resource: "warehouses",
+        status: "ACTIVE",
+      }).select("title reference name value").lean();
+      if (!warehouse) return fail(res, "Selected warehouse is not active or does not exist", 400);
+    }
+    if (orderChannel === "DMS_WEB" && !warehouse) return fail(res, "Warehouse is required for a website-created order", 400);
+
     const workflowStatus = creditHold ? "CREDIT_HOLD" : customerOtpRequired ? "OTP_PENDING" : "ORDER_PLACED";
     const order = await SalesOrder.create({
       tenantKey: req.auth.tenantKey,
@@ -1224,11 +1243,13 @@ router.post("/orders", async (req, res) => {
       customerNameSnapshot: customerName(customer),
       salespersonId: clean(customer.salespersonId || req.auth.sub),
       orderChannel,
+      warehouseId: warehouse ? String(warehouse._id) : "",
+      warehouseNameSnapshot: warehouse ? clean(warehouse.title || warehouse.name || warehouse.reference || warehouse.value) : clean(req.body.warehouseName),
       customerOtpRequired,
       workflowStatus,
       nextAction: creditHold ? "Credit approval required" : customerOtpRequired ? "Customer OTP verification required" : "Verify order",
       lastWorkflowAt: new Date(),
-      source: ["MANUAL", "REPEAT", "SUGGESTED"].includes(upper(req.body.source)) ? upper(req.body.source) : "MANUAL",
+      source: ["MANUAL", "REPEAT", "SUGGESTED", "WEB"].includes(upper(req.body.source)) ? upper(req.body.source) : "MANUAL",
       repeatFromOrderNo: clean(req.body.repeatFromOrderNo),
       repeatFromInvoiceNo: clean(req.body.repeatFromInvoiceNo),
       items,
@@ -1253,8 +1274,14 @@ router.post("/orders", async (req, res) => {
     await OrderEvent.create({
       tenantKey: req.auth.tenantKey, financialYear, eventNo, orderId: String(order._id), orderNo: order.orderNo,
       type: "ORDER_CREATED", fromStatus: "", toStatus: workflowStatus,
-      note: orderChannel === "CUSTOMER" ? "Order placed directly by customer" : orderChannel === "SALESPERSON_ON_BEHALF" ? "Order placed by salesperson on behalf of customer" : "Order created from DMS",
-      meta: { orderChannel, grandTotal: money(grandTotal), creditHold }, audience: ["DMS", "CUSTOMER", "SALESPERSON"],
+      note: orderChannel === "CUSTOMER"
+        ? "Order placed directly by customer"
+        : orderChannel === "SALESPERSON_ON_BEHALF"
+          ? "Order placed by salesperson on behalf of customer"
+          : orderChannel === "DMS_WEB"
+            ? "Order created directly from DMS website"
+            : "Order created from DMS",
+      meta: { orderChannel, warehouseId: order.warehouseId || "", warehouseName: order.warehouseNameSnapshot || "", grandTotal: money(grandTotal), creditHold }, audience: ["DMS", "CUSTOMER", "SALESPERSON"],
       actorId: req.auth.sub, actorNameSnapshot: req.auth.name || "", actorRole: req.auth.role || "", occurredAt: new Date(),
     });
     await OrderNotification.insertMany([

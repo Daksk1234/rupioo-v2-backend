@@ -5,7 +5,7 @@ import { ok, fail, pageMeta } from "../utils/http.js";
 import { financialModels, postBalancedEntries, reversePostedTransaction } from "../services/accountingService.js";
 import { financialYearFromDate, resolveFinancialYear, transactionDate } from "../utils/financialYear.js";
 import { buildDocumentNotePdf } from "../services/documentNotePdfService.js";
-import { allocateDocumentNoteNumber, nextDocumentNoteNumber } from "../services/documentNumberService.js";
+import { allocateDocumentNoteNumber, nextDocumentNoteNumber, isRegisteredParty } from "../services/documentNumberService.js";
 import { isCreditNoteStockReason, syncSalesInvoiceCreditState, validateCreditNoteAgainstInvoice } from "../services/creditNoteRulesService.js";
 
 const router = express.Router();
@@ -293,7 +293,14 @@ async function createDocument(req, res, type) {
   try {
     const calc = await normalizeDocument({ auth: req.auth, body: req.body, type });
     const models = financialModels(calc.tenantKey, calc.financialYear);
-    const documentNo = clean(req.body.documentNo) || await allocateDocumentNoteNumber({ tenantKey: calc.tenantKey, financialYear: calc.financialYear, type });
+    // Number previews are advisory: always allocate against the selected party/FY
+    // on the server. Never trust a stale number supplied by the browser.
+    const documentNo = type === "DELIVERY_NOTE" && clean(req.body.documentNo)
+      ? clean(req.body.documentNo)
+      : await allocateDocumentNoteNumber({
+          tenantKey: calc.tenantKey, financialYear: calc.financialYear,
+          type, registered: isRegisteredParty(calc.party),
+        });
     if (await models.CreditNote.exists({ tenantKey: calc.tenantKey, financialYear: calc.financialYear, creditNoteNo: documentNo })) return fail(res, `${CONFIG[type].label} number already exists`, 409);
     if (type === "CREDIT_NOTE") {
       await validateCreditNoteAgainstInvoice({
@@ -494,7 +501,17 @@ function register(type) {
   router.get(`/${path}/next-number`, async (req, res) => {
     try {
       const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
-      return ok(res, { documentNo: await nextDocumentNoteNumber({ tenantKey: req.auth.tenantKey, financialYear, type }), financialYear });
+      const partyGlobalId = clean(req.query.partyGlobalId);
+      const party = partyGlobalId ? await CustomerLink.findOne({
+        tenantKey: req.auth.tenantKey, globalCustomerId: partyGlobalId, status: "ACTIVE",
+      }).lean() : null;
+      if (partyGlobalId && !party) return fail(res, "Selected party not found", 404);
+      return ok(res, {
+        documentNo: await nextDocumentNoteNumber({
+          tenantKey: req.auth.tenantKey, financialYear, type,
+          registered: party ? isRegisteredParty(party) : true,
+        }), financialYear,
+      });
     } catch (error) { return fail(res, error.message, error.statusCode || error.status || 400); }
   });
   router.get(`/${path}`, (req, res) => listDocuments(req, res, type));

@@ -16,11 +16,23 @@ export function safeKey(value) {
   return words[0] + words.slice(1).map((x) => x.charAt(0).toUpperCase() + x.slice(1)).join("");
 }
 
-export function readRows(buffer) {
-  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: false });
+export function readRows(buffer, options = {}) {
+  const preserveText = Boolean(options?.preserveText);
+  // CSV parsers can otherwise auto-convert ambiguous values such as
+  // 03-04-2025 to March 4, 2025 before the module-specific date parser
+  // gets a chance to apply DD-MM-YYYY rules.  preserveText keeps CSV
+  // cell values exactly as supplied by the user.
+  const workbook = XLSX.read(buffer, {
+    type: "buffer",
+    cellDates: false,
+    ...(preserveText ? { raw: true } : {}),
+  });
   const first = workbook.Sheets[workbook.SheetNames[0]];
   if (!first) return [];
-  return XLSX.utils.sheet_to_json(first, { defval: "", raw: false });
+  return XLSX.utils.sheet_to_json(first, {
+    defval: "",
+    raw: preserveText ? true : false,
+  });
 }
 
 export function resolveColumns(firstRow = {}, fields = []) {

@@ -511,6 +511,60 @@ router.get("/purchase-orders", async (req, res) => {
   return ok(res, await PurchaseOrderAi.find(filter).sort({ createdAt: -1 }).limit(500).lean());
 });
 
+router.delete("/purchase-orders/:id", async (req, res) => {
+  try {
+    const po = await PurchaseOrderAi.findOne({
+      _id: req.params.id,
+      tenantKey: req.auth.tenantKey,
+    });
+    if (!po) return fail(res, "Purchase Order not found", 404);
+
+    const payload = {
+      _id: String(po._id),
+      poNo: po.poNo,
+      deleted: true,
+      hardDeleted: true,
+    };
+
+    await PurchaseOrderAi.deleteOne({
+      _id: po._id,
+      tenantKey: req.auth.tenantKey,
+    });
+
+    // If this PO had not progressed to GRN, reopen its RFQ/requirements so the
+    // buyer can award/create another PO after the permanent deletion.
+    const hasGrn = await PurchaseGoodsReceipt.exists({
+      tenantKey: req.auth.tenantKey,
+      purchaseOrderId: String(po._id),
+    });
+    if (!hasGrn && po.rfqId) {
+      const anotherPo = await PurchaseOrderAi.exists({
+        tenantKey: req.auth.tenantKey,
+        rfqId: String(po.rfqId),
+      });
+      if (!anotherPo) {
+        await PurchaseRfq.updateOne(
+          { _id: po.rfqId, tenantKey: req.auth.tenantKey },
+          {
+            $set: { status: "OPEN", selectedVendorGlobalId: "", selectedVendorReason: "" },
+            $unset: { awardedBy: "", awardedAt: "" },
+          },
+        );
+        if (po.requirementIds?.length) {
+          await PurchaseRequirement.updateMany(
+            { _id: { $in: po.requirementIds }, tenantKey: req.auth.tenantKey },
+            { $set: { status: "RFQ_SENT", updatedBy: req.auth.sub } },
+          );
+        }
+      }
+    }
+
+    return ok(res, payload, "Purchase Order permanently deleted from database");
+  } catch (e) {
+    return fail(res, e.message, e.statusCode || 400);
+  }
+});
+
 router.get("/incoming", async (req, res) => {
   const rows = await PurchaseOrderAi.find({ tenantKey: req.auth.tenantKey, status: { $in: ["SUPPLIER_CONFIRMED", "PART_DISPATCHED", "DISPATCHED", "IN_TRANSIT", "PART_RECEIVED", "QC_PENDING", "QC_IN_PROGRESS"] } }).sort({ "shipments.expectedArrival": 1, updatedAt: -1 }).lean();
   return ok(res, rows);

@@ -37,6 +37,7 @@ import profileRoutes from "./routes/profile.js";
 import documentAiRoutes from "./routes/documentAi.js";
 import migrationRoutes from "./routes/migration.js";
 import storageRoutes from "./routes/storage.js";
+import mailRoutes from "./routes/mail.route.js";
 import salesAppRoutes from "./routes/salesApp.js";
 import orderFlowRoutes from "./routes/orderFlow.js";
 import purchaseAiRoutes, { vendorRouter as purchaseAiVendorRoutes, startPurchaseAiAutomation } from "./routes/purchaseAi.js";
@@ -84,6 +85,11 @@ app.get("/api/health", (_req, res) =>
 app.use("/api/auth", authRoutes);
 app.use("/api/registration", registrationRoutes);
 app.use("/api/profile", optionalAuth, profileRoutes);
+// Smart Mail owns its own signed-session/database guard. Mount both aliases so
+// existing builds using either VITE_API_URL=/api or the historical /mail path
+// reach the same secure connection/send endpoints.
+app.use("/api/mail", mailRoutes);
+app.use("/mail", mailRoutes);
 // Storage OAuth callbacks and Superadmin/Master storage setup use their own auth guard.
 app.use("/api/storage", storageRoutes);
 

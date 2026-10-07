@@ -61,6 +61,23 @@ router.get("/:module/:resource", async (req, res) => {
   const f = baseFilter(req);
   if (req.query.status) f.status = req.query.status;
   if (q) f.$or = [{ title: new RegExp(q, "i") }, { reference: new RegExp(q, "i") }, { notes: new RegExp(q, "i") }, { "data.name": new RegExp(q, "i") }];
+  // Date-bearing generic-resource lists are filtered in MongoDB before pagination.
+  // Do not apply a period to global master data or to pages without a Date field.
+  if (req.query.fromDate || req.query.toDate) {
+    const from = String(req.query.fromDate || "");
+    const to = String(req.query.toDate || "");
+    const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value)
+      && !Number.isNaN(Date.parse(`${value}T00:00:00.000Z`))
+      && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+    if (!validDate(from) || !validDate(to) || from > to) return fail(res, "Invalid date range", 400);
+    const end = new Date(`${to}T00:00:00.000Z`);
+    end.setUTCDate(end.getUTCDate() + 1);
+    const period = { $gte: new Date(`${from}T00:00:00.000Z`), $lt: end };
+    f.$and = [{ $or: [
+      { date: period },
+      { date: null, createdAt: period }
+    ] }];
+  }
   const [items, total] = await Promise.all([
     GenericRecord.find(f).sort({ updatedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     GenericRecord.countDocuments(f)

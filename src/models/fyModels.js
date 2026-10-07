@@ -8,18 +8,37 @@ export function fyModels(db) {
     tenantKey: { type: String, index: true }, financialYear: { type: String, index: true }, transactionId: { type: String, index: true },
     transactionType: { type: String, index: true }, date: { type: Date, index: true }, accountCode: { type: String, index: true },
     partyGlobalId: { type: String, index: true }, ledgerId: { type: String, index: true }, bankAccountId: { type: String, index: true },
-    debit: Number, credit: Number, narration: String, status: { type: String, default: "POSTED" }
+    debit: Number, credit: Number, narration: String, status: { type: String, default: "POSTED" },
+    // Immutable, deterministic identifier for ONE journal line. Old rows do not
+    // have this key; the partial unique index therefore does not break migrations.
+    postingKey: { type: String },
+    // When a posted journal is reversed for an edit/cancellation, preserve its
+    // former deterministic key here and release postingKey so the corrected
+    // transaction can safely reuse the active posting key.
+    archivedPostingKey: { type: String, default: "" },
   }, { timestamps: true });
+  ledgerEntrySchema.index(
+    { tenantKey: 1, financialYear: 1, postingKey: 1 },
+    { unique: true, partialFilterExpression: { postingKey: { $type: "string" } } },
+  );
+  // Fast customer-ledger reports (Lock Party / receivable ageing).
+  ledgerEntrySchema.index({ tenantKey: 1, financialYear: 1, accountCode: 1, status: 1, partyGlobalId: 1, date: 1 });
 
   const invoiceItemSchema = new Schema({
     productId: String, sku: String, nameSnapshot: String, hsnSnapshot: String, qty: Number, unit: String,
     packingUnit: String, qtyInBag: Number, grossQty: Number, mrpSnapshot: Number, gradeDiscountPct: Number,
     landedCostSnapshot: Number, averagePurchasePriceSnapshot: Number, rate: Number, discountPct: Number, effectiveRate: Number, taxable: Number,
+    // Purchase invoices keep the entered/basic taxable separately from the net value
+    // after bill-level Discount + Charges.  This prevents edit/list/stock costing
+    // from confusing the raw Basic Total with the actual taxable purchase value.
+    netRate: Number, netTaxable: Number, billDiscountShare: Number, billChargeShare: Number,
     gstRateSnapshot: Number, cgst: Number, sgst: Number, igst: Number, tax: Number, lineTotal: Number, profitPct: Number, marginColor: String
   }, { _id: false });
 
   const salesInvoiceSchema = new Schema({
-    tenantKey: { type: String, index: true }, financialYear: { type: String, index: true }, invoiceNo: { type: String, index: true }, date: { type: Date, index: true },
+    tenantKey: { type: String, index: true }, financialYear: { type: String, index: true }, invoiceNo: { type: String, index: true },
+    voidedInvoiceNo: { type: String, default: "" }, voidedAt: Date, // preserve the original number of safely recycled test invoices
+    date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true }, customerNameSnapshot: String, gstinSnapshot: String, addressSnapshot: String,
     items: [invoiceItemSchema], subtotal: Number, billDiscount: Number, otherCharges: Number, taxableTotal: Number, taxTotal: Number, roundOff: Number, grandTotal: Number, grossProfit: Number, grossMarginPct: Number,
     // DIRECT invoices stay independent from the order workflow. ORDER invoices are linked back to SalesOrder.
@@ -42,8 +61,20 @@ export function fyModels(db) {
     creditNoteAmount: { type:Number, default:0 }, netInvoiceAmount: Number,
     creditNoteStatus: { type:String, enum:["NONE","PARTIAL","FULL"], default:"NONE", index:true },
     lastCreditNoteNo: String, lastCreditNoteAt: Date,
+    // Transporter / consignment-note details captured against the sales invoice.
+    // Keep this separate from accounting Credit Notes above.
+    consignmentNote: {
+      cnDate: Date, cnQty: Number, cnNumber: String,
+      imageFileId: String, imageName: String, imageMimeType: String,
+      savedAt: Date, savedBy: String, savedByNameSnapshot: String
+    },
     delivery: {
-      deliveredAt: Date, deliveredTo: String, mobile: String, vehicleNo: String, biltyNo: String, remarks: String, deliveryMode: String,
+      deliveredAt: Date,
+      // Dispatch information captured at delivery time. Keep old receiver/proof
+      // fields for backward compatibility with historical invoices, but new
+      // deliveries use transporter/package/CN/LR details instead.
+      transporterName: String, noOfPackages: Number, cnNumber: String,
+      deliveredTo: String, mobile: String, vehicleNo: String, biltyNo: String, remarks: String, deliveryMode: String,
       proofFiles: [{ kind:String, fileName:String, storedName:String, path:String, mimeType:String, size:Number }],
       proofFileIds: [String],
       emailedAt: Date, emailTo: String, emailStatus: String, emailError: String
@@ -51,6 +82,10 @@ export function fyModels(db) {
     status: { type: String, default: "POSTED", index: true }, createdBy: String, createdByNameSnapshot: String
   }, { timestamps: true });
   salesInvoiceSchema.index({ tenantKey: 1, invoiceNo: 1 }, { unique: true });
+  salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, status: 1, date: 1 });
+  salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, status: 1, "items.productId": 1, date: -1 });
+  // Fast customer activity reports (Dead Party / last purchase / 3-month activity).
+  salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, status: 1, customerGlobalId: 1, date: -1 });
 
   const purchaseAdjustmentSchema = new Schema({
     id: String, masterId: String, type: String, title: String, method: String, value: Number, applied: Number
@@ -69,11 +104,14 @@ export function fyModels(db) {
     remarks:String, createdBy:String, createdByNameSnapshot:String, status: { type: String, default: "POSTED" }
   }, { timestamps: true });
   purchaseInvoiceSchema.index({ tenantKey:1, financialYear:1, invoiceNo:1 }, { unique:true });
+  purchaseInvoiceSchema.index({ tenantKey:1, financialYear:1, status:1, date:1 });
+  purchaseInvoiceSchema.index({ tenantKey:1, financialYear:1, status:1, "items.productId":1, date:-1 });
 
   const receiptSchema = new Schema({
     tenantKey: String,
     financialYear: String,
     receiptNo: { type: String, index: true },
+    sourceKey: String,
     date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true },
     partyNameSnapshot:String,
@@ -87,6 +125,14 @@ export function fyModels(db) {
     statementRowNo:Number,
     runningBalance:Number,
     bounceStatus: String,
+    // Cheque lifecycle. Older receipts may not have these fields; reports use
+    // receipt date / bank-statement linkage as safe fallbacks where possible.
+    chequeNumber: { type:String, index:true },
+    chequeIssueDate: Date,
+    chequeDepositDate: Date,
+    chequeClearanceDate: Date,
+    chequeBounceDate: Date,
+    chequeStatus: { type:String, index:true },
     // Sales Person app ownership. Legacy receipts remain valid because these
     // fields are optional and attribution falls back to createdBy where needed.
     collectedBySalespersonId: { type: String, index: true },
@@ -97,8 +143,14 @@ export function fyModels(db) {
     status: { type: String, default: "POSTED" }
   }, { timestamps: true });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, collectedBySalespersonId: 1, date: -1 });
+  receiptSchema.index({ tenantKey: 1, financialYear: 1, status: 1, bounceStatus: 1, date: -1 });
+  receiptSchema.index({ tenantKey: 1, financialYear: 1, chequeStatus: 1, chequeIssueDate: -1 });
+  receiptSchema.index({tenantKey:1,financialYear:1,sourceKey:1},{unique:true,partialFilterExpression:{sourceKey:{$type:"string"}}});
 
-  const paymentSchema = new Schema({ tenantKey: String, financialYear: String, paymentNo: String, date: { type: Date, index: true }, partyGlobalId: { type: String, index: true }, partyNameSnapshot:String, amount: Number, mode: String, reference: String, remarks:String, bankAccountId:{type:String,index:true}, bankNameSnapshot:String, statementImportId:String, statementRowNo:Number, runningBalance:Number, createdBy:String, createdByNameSnapshot:String, status: { type: String, default: "POSTED" } }, { timestamps: true });
+  const paymentSchema = new Schema({ tenantKey: String, financialYear: String, paymentNo: String, sourceKey:String, date: { type: Date, index: true }, partyGlobalId: { type: String, index: true }, partyNameSnapshot:String, amount: Number, mode: String, reference: String, remarks:String, bankAccountId:{type:String,index:true}, bankNameSnapshot:String, statementImportId:String, statementRowNo:Number, runningBalance:Number, createdBy:String, createdByNameSnapshot:String, status: { type: String, default: "POSTED" } }, { timestamps: true });
+
+  paymentSchema.index({tenantKey:1,financialYear:1,sourceKey:1},{unique:true,partialFilterExpression:{sourceKey:{$type:"string"}}});
+  paymentSchema.index({ tenantKey: 1, financialYear: 1, status: 1, date: -1 });
 
   const bankStatementImportSchema = new Schema({
     tenantKey:String, financialYear:{type:String,index:true}, importId:{type:String,index:true}, bankAccountId:{type:String,index:true}, bankNameSnapshot:String, accountNumberSnapshot:String,
@@ -110,10 +162,14 @@ export function fyModels(db) {
   const bankStatementRowSchema = new Schema({
     tenantKey:String, financialYear:{type:String,index:true}, importId:{type:String,index:true}, bankAccountId:{type:String,index:true}, rowNo:Number, date:{type:Date,index:true}, partyName:String, remarks:String, mode:String,
     debit:Number, credit:Number, runningBalance:Number, fingerprint:{type:String,index:true}, sourceFingerprint:{type:String,index:true}, matchedPartyGlobalId:String, matchedPartyName:String, partyAccountCode:String,
-    transactionType:String, transactionId:String, detectionSource:String, matchConfidence:Number, candidateCount:Number, submittedAt:Date,
+    transactionType:String, transactionId:String, postingFingerprint:String, detectionSource:String, matchConfidence:Number, candidateCount:Number, submittedAt:Date,
     classification:{type:String,default:"DRAFT",index:true}, createdBy:String, createdByNameSnapshot:String, submittedBy:String, submittedByNameSnapshot:String, error:String
   },{timestamps:true});
   bankStatementRowSchema.index({tenantKey:1,financialYear:1,bankAccountId:1,fingerprint:1},{unique:true});
+  bankStatementRowSchema.index(
+    { tenantKey:1, financialYear:1, bankAccountId:1, postingFingerprint:1 },
+    { unique:true, partialFilterExpression:{ postingFingerprint:{ $type:"string" } } },
+  );
 
   const stockMovementSchema = new Schema({ tenantKey: String, financialYear: String, date: { type: Date, index: true }, productId: { type: String, index: true }, warehouseId: String, type: { type: String, index: true }, qtyIn: Number, qtyOut: Number, landedCost: Number, referenceId: String }, { timestamps: true });
   const expenseSchema = new Schema({ tenantKey: String, financialYear: String, expenseNo: { type: String, index: true }, date: { type: Date, index: true }, accountCode: { type: String, index: true }, amount: Number, nature: String, allocationMethod: String, branchId: String, productId: String, customerGlobalId: String, status: { type: String, default: "POSTED" } }, { timestamps: true });
@@ -183,6 +239,7 @@ export function fyModels(db) {
   salesOrderSchema.index({ tenantKey: 1, financialYear: 1, customerGlobalId: 1, date: -1 });
   salesOrderSchema.index({ tenantKey: 1, financialYear: 1, salespersonId: 1, date: -1 });
   salesOrderSchema.index({ tenantKey: 1, financialYear: 1, workflowStatus: 1, updatedAt: -1 });
+  salesOrderSchema.index({ tenantKey: 1, financialYear: 1, status: 1, workflowStatus: 1, date: 1 });
 
   const orderEventSchema = new Schema({
     tenantKey: { type: String, index: true }, financialYear: { type: String, index: true },

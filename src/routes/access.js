@@ -17,12 +17,13 @@ import { eligibleUsersForDepartment, getAssignmentOptions, reconcilePincodeAssig
 import { DEFAULT_TALLY_ACCOUNT_TYPES, ensureDefaultTallyAccountTypes } from "../config/defaultTallyAccountTypes.js";
 import { DEFAULT_LEDGER_LIBRARY, flattenLedgerLibrary, normalizeLedgerLibraryName } from "../config/defaultLedgerLibrary.js";
 import { defaultRoleTemplates, MASTER_TEMPLATE_TENANT } from "../config/defaultRoleTemplates.js";
-import { userReferenceDetails } from "../services/referenceIntegrityService.js";
+import { tenantFinancialYears, userReferenceDetails } from "../services/referenceIntegrityService.js";
 import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { reassignOpenLeadsForPincodes } from "../services/leadAssignmentService.js";
 import { ensureSystemCashAccount, isSystemCashRecord } from "../services/systemCashAccountService.js";
 import { gstChangeConfirmation, migrateCompanyTenantKey, validateGstinChangeTarget } from "../services/tenantMigrationService.js";
 import { isTenantKeyReserved, resolveTenantKeyAlias } from "../services/tenantKeyService.js";
+import { financialModels } from "../services/accountingService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -1600,6 +1601,41 @@ router.put("/users/:id", async (req,res) => {
   if(user.departmentId && String(user.departmentId)!==oldDepartmentId) await reconcilePincodeAssignmentsForDepartment(user.tenantKey,user.departmentId,CustomerLink);
   if(!ledgerOnlyMode&&req.body.pincodes!==undefined){const effectiveRole=await Role.findOne({_id:user.roleId,tenantKey:user.tenantKey,status:"ACTIVE"});if(effectiveRole){try{await replaceSalesRolePincodes({tenantKey:user.tenantKey,user,roleDoc:effectiveRole,pincodes:req.body.pincodes,actorId:req.auth.sub});}catch(e){return fail(res,e.message,e.statusCode||409);}}}
   return ok(res,publicUser(user),"Person / User updated");
+});
+
+router.delete("/users/:id", async (req,res) => {
+  if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
+  const filter={_id:req.params.id};
+  if(req.auth.role!=="MASTER")filter.tenantKey=req.auth.tenantKey;
+  const user=await User.findOne(filter);if(!user)return fail(res,"User not found",404);
+  if(isSystemCashRecord(user))return fail(res,"CASH is a protected system account and cannot be deleted",409);
+  if(String(user._id)===String(req.auth.sub))return fail(res,"You cannot delete the user account you are currently signed in with",409);
+  if(String(user.role||"").toUpperCase()==="SUPERADMIN")return fail(res,"SUPERADMIN accounts must be managed from Superadmin administration, not User Master",409);
+  const userId=String(user._id),userPartyRef=`USER:${userId}`;
+  const references=await userReferenceDetails(user.tenantKey,userId);
+  const removableSetupRefs=new Set(["user hierarchy","pincode assignments","customer assignments"]);
+  const blockers=references.filter(x=>!removableSetupRefs.has(String(x)));
+  const userLedgers=await CompanyLedger.find({tenantKey:user.tenantKey,ownerType:"USER",ownerId:userId}).select("ledgerId").lean();
+  const ledgerIds=userLedgers.map(x=>String(x.ledgerId||"")).filter(Boolean);
+  for(const financialYear of await tenantFinancialYears(user.tenantKey)){
+    const {Receipt,Payment,LedgerEntry}=financialModels(user.tenantKey,financialYear);
+    const [receiptUsed,paymentUsed,ledgerUsed]=await Promise.all([
+      Receipt.exists({tenantKey:user.tenantKey,$or:[{customerGlobalId:userPartyRef},{createdBy:userId}]}),
+      Payment.exists({tenantKey:user.tenantKey,$or:[{partyGlobalId:userPartyRef},{createdBy:userId}]}),
+      LedgerEntry.exists({tenantKey:user.tenantKey,$or:[{partyGlobalId:userPartyRef},...(ledgerIds.length?[{ledgerId:{$in:ledgerIds}}]:[])]})
+    ]);
+    if(receiptUsed||paymentUsed||ledgerUsed)blockers.push(`accounting transactions (${financialYear})`);
+  }
+  const uniqueBlockers=[...new Set(blockers)];
+  if(uniqueBlockers.length)return fail(res,`${user.name||"User"} cannot be deleted because it is already used in ${uniqueBlockers.slice(0,8).join(", ")}. Historical transactions must keep their user/account reference.`,409,{references:uniqueBlockers});
+  const departmentId=user.departmentId?String(user.departmentId):"";
+  await User.updateMany({tenantKey:user.tenantKey,assignedToUserId:user._id},{$unset:{assignedToUserId:1}});
+  await CustomerLink.updateMany({tenantKey:user.tenantKey,salespersonId:userId},{$set:{salespersonId:""}});
+  await PincodeAssignment.updateMany({tenantKey:user.tenantKey,userIds:user._id},{$pull:{userIds:user._id}});
+  await CompanyLedger.deleteMany({tenantKey:user.tenantKey,ownerType:"USER",ownerId:userId});
+  await User.deleteOne({_id:user._id});
+  if(departmentId)await reconcilePincodeAssignmentsForDepartment(user.tenantKey,departmentId,CustomerLink);
+  return ok(res,{id:String(user._id),deleted:true},"User permanently deleted");
 });
 
 router.post("/users/:id/reset-password", async (req,res) => {

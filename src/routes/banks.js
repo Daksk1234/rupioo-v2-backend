@@ -6,11 +6,14 @@ import { requireAuth } from "../middleware/auth.js";
 import { ok, fail } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import { syncBankAccountLedger } from "../services/companyAccountingService.js";
+import { isAdminAuth } from "../utils/adminAccess.js";
+import { bankStatementIdentity, inspectBankLedgerRows } from "../services/bankLedgerIntegrityService.js";
 import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { financialModels, postBalancedEntries } from "../services/accountingService.js";
 import { readRows, resolveColumns, valueFor } from "../utils/bulkSpreadsheet.js";
 import { resolvePartyDisplayMap, resolveUserDisplayMap } from "../services/transactionDisplayService.js";
 import { financialYearFromDate } from "../utils/financialYear.js";
+import { env } from "../config/env.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -20,6 +23,20 @@ const clean = (value) => String(value ?? "").trim();
 const upper = (value) => clean(value).toUpperCase();
 const normalizeAccount = (value) => clean(value).replace(/\s+/g, "");
 const normalizeName = (value) => clean(value).toUpperCase().replace(/[^A-Z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+const nameSimilarity = (a,b) => {
+  const x=normalizeName(a),y=normalizeName(b);
+  if(!x||!y)return 0;if(x===y)return 1;
+  const prev=Array.from({length:y.length+1},(_,i)=>i);
+  for(let i=1;i<=x.length;i++){
+    let left=i,diag=i-1;
+    for(let j=1;j<=y.length;j++){
+      const up=prev[j],cost=x[i-1]===y[j-1]?0:1;
+      const next=Math.min(up+1,left+1,diag+cost);diag=up;prev[j]=next;left=next;
+    }
+    prev[0]=i;
+  }
+  return Math.max(0,1-prev[y.length]/Math.max(x.length,y.length));
+};
 const allowedTypes = new Set(["CURRENT", "SAVINGS", "OD", "CC", "OTHER"]);
 const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 const objectIdText = (v) => /^[a-fA-F0-9]{24}$/.test(clean(v));
@@ -213,14 +230,15 @@ function normalizeStatementRows(rawRows, cols) {
 
 const normalizeBankAccountKey = (value) => clean(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
 
-async function buildSmartPartyMatcher(tenantKey) {
-  const [links,users,userLedgers,customerLedgers] = await Promise.all([
+async function buildSmartPartyMatcher(tenantKey,{excludeBankAccountId=""}={}) {
+  const [links,users,userLedgers,customerLedgers,bankAccounts] = await Promise.all([
     CustomerLink.find({tenantKey,status:{$nin:["INACTIVE","DEACTIVATED"]}}).lean(),
     User.find({tenantKey,status:"ACTIVE"})
       .select("name email mobile accountType tallyAccountTypeName tallyAccountTypeCode accountingRequired accountingMappings bankDetails loginEnabled systemManaged systemKey")
       .lean(),
     CompanyLedger.find({tenantKey,ownerType:"USER",status:{$ne:"INACTIVE"}}).lean(),
-    CompanyLedger.find({tenantKey,ownerType:"CUSTOMER",status:{$ne:"INACTIVE"}}).lean()
+    CompanyLedger.find({tenantKey,ownerType:"CUSTOMER",status:{$ne:"INACTIVE"}}).lean(),
+    BankAccount.find({tenantKey,status:"ACTIVE"}).select("bankAccountId bankName accountHolderName accountNumber accountNumberNormalized accountType ledgerId ifsc").lean()
   ]);
 
   const ids=[...new Set(links.map(x=>x.globalCustomerId).filter(Boolean))];
@@ -243,11 +261,16 @@ async function buildSmartPartyMatcher(tenantKey) {
   const entries=[];
   const byId=new Map();
   const accountMap=new Map();
+  const ignoredWords=new Set(["NEFT","RTGS","IMPS","UPI","CR","DR","NET","TPT","TRANSFER","TRF","FROM","TO","BY","BANK","A","AN","THE","OF","AC","ACCOUNT","NO","REF","UTR","INWARD","OUTWARD","PAY","PAYMENT","TXN","TRANSACTION","YES"]);
+  const tokenise=(value)=>normalizeName(value).split(" ").filter(x=>x.length>=2&&!ignoredWords.has(x));
+  const uniqueStrings=(values)=>[...new Set(values.map(normalizeName).filter(Boolean))];
 
   const registerEntry=(entry)=>{
+    entry.aliases=uniqueStrings(entry.aliases||[]);
+    entry.accountNumbers=[...new Set((entry.accountNumbers||[]).map(normalizeBankAccountKey).filter(x=>x.length>=6))];
     entries.push(entry);
     byId.set(String(entry.ref),entry);
-    for(const acc of entry.accountNumbers||[]){
+    for(const acc of entry.accountNumbers){
       if(!accountMap.has(acc))accountMap.set(acc,[]);
       accountMap.get(acc).push(entry);
     }
@@ -256,10 +279,12 @@ async function buildSmartPartyMatcher(tenantKey) {
   for(const link of links){
     const global=gm.get(String(link.globalCustomerId));
     const preferred=clean(link.localName||global?.tradeName||global?.legalName||link.displayIdentifier||link.globalCustomerId);
-    const aliases=[link.localName,link.displayIdentifier,global?.tradeName,global?.legalName]
-      .map(normalizeName).filter(Boolean);
-    const accountNumbers=(Array.isArray(link.bankDetails)?link.bankDetails:[])
-      .map(x=>normalizeBankAccountKey(x?.accountNumber)).filter(x=>x.length>=6);
+    const bankDetails=Array.isArray(link.bankDetails)?link.bankDetails:[];
+    const aliases=[
+      link.localName,link.displayIdentifier,global?.tradeName,global?.legalName,
+      ...bankDetails.map(x=>x?.accountName)
+    ];
+    const accountNumbers=bankDetails.map(x=>x?.accountNumber);
     const partyAccountCode=clean(link.accountingProfile?.systemAccountCode) || (["CREDITOR","SUPPLIER"].includes(upper(link.partyType))?"SYS_SUNDRY_CREDITORS":"SYS_SUNDRY_DEBTORS");
     const ledger=(customerLedgerByOwner.get(String(link.globalCustomerId))||[]).find(x=>String(x.systemAccountCode||"")===partyAccountCode)
       ||(customerLedgerByOwner.get(String(link.globalCustomerId))||[])[0]
@@ -294,13 +319,8 @@ async function buildSmartPartyMatcher(tenantKey) {
       ||null;
     const partyAccountCode=clean(ledger?.systemAccountCode||activeMapping?.systemAccountCode||user.tallyAccountTypeCode)||"SYS_SUSPENSE";
     const preferred=clean(user.name||activeMapping?.ledgerName||ledger?.name||ownerId);
-    const aliases=[
-      user.name,
-      activeMapping?.ledgerName,
-      ledger?.name
-    ].map(normalizeName).filter(Boolean);
-    const accountNumbers=[normalizeBankAccountKey(user.bankDetails?.accountNumber)]
-      .filter(x=>x.length>=6);
+    const aliases=[user.name,activeMapping?.ledgerName,ledger?.name,user.bankDetails?.accountName];
+    const accountNumbers=[user.bankDetails?.accountNumber];
     registerEntry({
       ref:`USER:${ownerId}`,
       ownerType:"USER",
@@ -315,47 +335,200 @@ async function buildSmartPartyMatcher(tenantKey) {
     });
   }
 
+  for(const bank of bankAccounts){
+    if(clean(bank.bankAccountId)===clean(excludeBankAccountId))continue;
+    const ownerId=clean(bank.bankAccountId);
+    if(!ownerId)continue;
+    const accountType=upper(bank.accountType);
+    registerEntry({
+      ref:`BANK:${ownerId}`,
+      ownerType:"BANK_ACCOUNT",
+      ownerId,
+      bank,
+      preferred:clean(bank.accountHolderName||bank.bankName||ownerId),
+      aliases:[bank.accountHolderName,`${clean(bank.accountHolderName)} ${clean(bank.bankName)}`],
+      accountNumbers:[bank.accountNumberNormalized||bank.accountNumber],
+      partyAccountCode:["OD","CC"].includes(accountType)?"SYS_BANK_OD":"SYS_BANK_ACCOUNT",
+      ledgerId:clean(bank.ledgerId),
+      bankAccountId:ownerId,
+      accountTypeLabel:`BANK ACCOUNT • ${clean(bank.bankName)}`
+    });
+  }
+
   const uniqueEntry=(arr=[])=>{
     const m=new Map(); for(const x of arr)m.set(String(x.ref),x);
     return [...m.values()];
   };
 
-  const detect=(row={})=>{
-    const remarks=clean(row.remarks); const partyName=clean(row.partyHint||row.partyName);
-    const accountTokens=[...new Set((remarks.toUpperCase().match(/[A-Z0-9]{6,34}/g)||[]).map(normalizeBankAccountKey).filter(x=>x.length>=6))];
+  const scoreAlias=(alias,remarkKey,remarkTokens,partyKey)=>{
+    const aliasKey=normalizeName(alias); if(!aliasKey)return 0;
+    const aliasTokens=tokenise(aliasKey); if(!aliasTokens.length)return 0;
+    let score=0;
+    const paddedRemark=` ${remarkKey} `;
+    if(paddedRemark.includes(` ${aliasKey} `)){
+      score=Math.max(score,90+Math.min(9,aliasTokens.length*3+Math.floor(aliasKey.length/12)));
+    }
+    const matched=aliasTokens.filter(t=>remarkTokens.has(t)).length;
+    const coverage=aliasTokens.length?matched/aliasTokens.length:0;
+    if(coverage===1){
+      const base=aliasTokens.length>=2?87:aliasKey.length>=6?84:78;
+      score=Math.max(score,base+Math.min(9,aliasTokens.length*3));
+    }else if(coverage>=0.75&&aliasTokens.length>=2){
+      score=Math.max(score,80+Math.round(coverage*10));
+    }
+    if(partyKey){
+      if(partyKey===aliasKey)score=Math.max(score,99);
+      else if(partyKey.includes(aliasKey)||aliasKey.includes(partyKey))score=Math.max(score,90);
+      else {
+        const similarity=nameSimilarity(partyKey,aliasKey);
+        if(similarity>=0.92)score=Math.max(score,96);
+        else if(similarity>=0.84&&aliasTokens.length>=2)score=Math.max(score,89);
+      }
+    }
+    return Math.min(99,score);
+  };
+
+  const rank=(row={})=>{
+    const remarks=clean(row.remarks);
+    const remarkKey=normalizeName(remarks);
+    const remarkTokens=new Set(tokenise(remarkKey));
+    const partyKey=normalizeName(clean(row.partyHint||row.partyName));
+    const narrationSegments=remarks.split(/\s*-\s*/).map(normalizeName).filter(Boolean);
+    const ifscSegmentIndex=narrationSegments.findIndex(seg=>/[A-Z]{4}0[A-Z0-9]{6}/.test(seg.replace(/\s+/g,"")));
+    const prioritySegment=ifscSegmentIndex>=0?clean(narrationSegments[ifscSegmentIndex+1]):"";
+    const priorityTokens=new Set(tokenise(prioritySegment));
     const compactRemarks=normalizeBankAccountKey(remarks);
-    const accountMatches=uniqueEntry([
+    const accountTokens=[...new Set((remarks.toUpperCase().match(/[A-Z0-9]{6,34}/g)||[]).map(normalizeBankAccountKey).filter(x=>x.length>=6))];
+    const exactAccountEntries=uniqueEntry([
       ...accountTokens.flatMap(x=>accountMap.get(x)||[]),
       ...entries.filter(e=>e.accountNumbers.some(acc=>compactRemarks.includes(acc)))
     ]);
-    if(accountMatches.length===1)return {entry:accountMatches[0],confidence:100,source:"ACCOUNT_NO_IN_REMARKS",candidateCount:1};
-    if(accountMatches.length>1)return {entry:null,confidence:0,source:"AMBIGUOUS_ACCOUNT_NO",candidateCount:accountMatches.length};
-
-    const remarkKey=normalizeName(remarks);
-    if(remarkKey){
-      const nameMatches=uniqueEntry(entries.filter(e=>e.aliases.some(a=>a.length>=4&&remarkKey.includes(a))));
-      if(nameMatches.length===1)return {entry:nameMatches[0],confidence:94,source:nameMatches[0].ownerType==="USER"?"USER_NAME_IN_REMARKS":"NAME_IN_REMARKS",candidateCount:1};
-      if(nameMatches.length>1)return {entry:null,confidence:0,source:"AMBIGUOUS_NAME_IN_REMARKS",candidateCount:nameMatches.length};
+    if(exactAccountEntries.length){
+      return exactAccountEntries.map(entry=>({entry,score:100,source:"ACCOUNT_NO_IN_REMARKS",alias:entry.accountNumbers.find(acc=>compactRemarks.includes(acc))||""}));
     }
-
-    const partyKey=normalizeName(partyName);
-    if(partyKey){
-      const exact=uniqueEntry(entries.filter(e=>e.aliases.includes(partyKey)));
-      if(exact.length===1)return {entry:exact[0],confidence:90,source:exact[0].ownerType==="USER"?"USER_COLUMN_EXACT":"PARTY_COLUMN_EXACT",candidateCount:1};
-      if(exact.length>1)return {entry:null,confidence:0,source:"AMBIGUOUS_PARTY_COLUMN",candidateCount:exact.length};
-      const fuzzy=uniqueEntry(entries.filter(e=>e.aliases.some(a=>a.length>=5&&(partyKey.includes(a)||a.includes(partyKey)))));
-      if(fuzzy.length===1)return {entry:fuzzy[0],confidence:76,source:fuzzy[0].ownerType==="USER"?"USER_COLUMN_FUZZY":"PARTY_COLUMN_FUZZY",candidateCount:1};
-      if(fuzzy.length>1)return {entry:null,confidence:0,source:"AMBIGUOUS_PARTY_COLUMN",candidateCount:fuzzy.length};
-    }
-    return {entry:null,confidence:0,source:"NO_MATCH",candidateCount:0};
+    return entries.map(entry=>{
+      let bestScore=0,bestAlias="",priority=false;
+      let hintExact=false,hintFuzzy=false;
+      for(const alias of entry.aliases){
+        let score=scoreAlias(alias,remarkKey,remarkTokens,partyKey);
+        const aliasKey=normalizeName(alias); const aliasTokens=tokenise(aliasKey);
+        const similarity=partyKey?nameSimilarity(partyKey,aliasKey):0;
+        const exactHint=Boolean(partyKey&&partyKey===aliasKey);
+        const fuzzyHint=Boolean(partyKey&&similarity>=0.92);
+        const priorityMatch=Boolean(prioritySegment&&aliasTokens.length&&(
+          ` ${prioritySegment} `.includes(` ${aliasKey} `)||aliasTokens.every(t=>priorityTokens.has(t))
+        ));
+        if(exactHint)score=Math.max(score,99);
+        else if(fuzzyHint)score=Math.max(score,96);
+        if(priorityMatch)score=Math.max(score,99);
+        if(score>bestScore||(score===bestScore&&alias.length>bestAlias.length)){bestScore=score;bestAlias=alias;priority=priorityMatch;hintExact=exactHint;hintFuzzy=fuzzyHint;}
+      }
+      const ordinarySource=entry.ownerType==="USER"?"USER_NAME_IN_REMARKS":entry.ownerType==="BANK_ACCOUNT"?"BANK_NAME_IN_REMARKS":"NAME_IN_REMARKS";
+      const source=hintExact?"PARTY_NAME_PREFIX_EXACT":hintFuzzy?"PARTY_NAME_PREFIX_FUZZY":priority?"STRUCTURED_NARRATION_NAME":ordinarySource;
+      return {entry,score:bestScore,source,alias:bestAlias,priority:priority||hintExact};
+    }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score||String(b.alias||"").length-String(a.alias||"").length);
   };
-  return {detect,byId,entries};
+
+  const detect=(row={})=>{
+    const ranked=rank(row);
+    if(!ranked.length)return {entry:null,confidence:0,source:"NO_MATCH",candidateCount:0,candidates:[]};
+    const top=ranked[0];
+    const second=ranked[1];
+    const sameTop=ranked.filter(x=>x.score===top.score);
+    if(top.score===100){
+      const exact=uniqueEntry(sameTop.map(x=>x.entry));
+      if(exact.length===1)return {entry:exact[0],confidence:100,source:"ACCOUNT_NO_IN_REMARKS",candidateCount:1,candidates:ranked.slice(0,6)};
+      return {entry:null,confidence:0,source:"AMBIGUOUS_ACCOUNT_NO",candidateCount:exact.length,candidates:ranked.slice(0,6)};
+    }
+    const gap=top.score-Number(second?.score||0);
+    const priorityTies=ranked.filter(x=>x.priority&&x.score===top.score);
+    if(top.priority&&top.score>=98&&priorityTies.length===1){
+      return {entry:top.entry,confidence:top.score,source:top.source,candidateCount:1,candidates:ranked.slice(0,6)};
+    }
+    const topAlias=String(top.alias||"");
+    const secondAlias=String(second?.alias||"");
+    const clearlyMoreSpecific=top.score>=94&&topAlias.length>=secondAlias.length+4;
+    if(top.score>=88&&(gap>=3||!second||clearlyMoreSpecific)){
+      return {entry:top.entry,confidence:top.score,source:top.source,candidateCount:1,candidates:ranked.slice(0,6)};
+    }
+    if(top.score>=76&&(!second||gap>=8)){
+      return {entry:top.entry,confidence:top.score,source:`${top.source}_FUZZY`,candidateCount:1,candidates:ranked.slice(0,6)};
+    }
+    return {entry:null,confidence:0,source:ranked.length>1?"AMBIGUOUS_NARRATION":"NO_MATCH",candidateCount:ranked.length,candidates:ranked.slice(0,6)};
+  };
+  return {detect,rank,byId,entries};
 }
+
+async function resolveNarrationsWithAi(rows=[],matcher){
+  if(!env.openai?.apiKey||!rows.length)return new Map();
+  const selected=new Map();
+  for(let offset=0;offset<rows.length;offset+=40){
+    const chunk=rows.slice(offset,offset+40).map(row=>({
+      rowNo:Number(row.rowNo),
+      remarks:clean(row.remarks),
+      partyHint:clean(row.partyHint||row.partyName),
+      candidates:matcher.rank(row).slice(0,6).map(x=>({ref:x.entry.ref,name:x.entry.preferred,type:x.entry.ownerType,score:x.score}))
+    })).filter(x=>x.candidates.length);
+    if(!chunk.length)continue;
+    try{
+      const response=await fetch("https://api.openai.com/v1/responses",{
+        method:"POST",
+        headers:{Authorization:`Bearer ${env.openai.apiKey}`,"Content-Type":"application/json"},
+        body:JSON.stringify({
+          model:env.openai.model,
+          input:[{role:"user",content:[{type:"input_text",text:[
+            "Match each bank narration to exactly one supplied candidate only when the narration clearly identifies that party.",
+            "Use the entire narration, including fragmented names and account-number context. Never invent a party. If uncertain, return an empty partyRef.",
+            JSON.stringify(chunk)
+          ].join("\n")}]}],
+          max_output_tokens:4000,
+          text:{format:{type:"json_schema",name:"bank_narration_party_match",strict:true,schema:{type:"object",properties:{matches:{type:"array",items:{type:"object",properties:{rowNo:{type:"integer"},partyRef:{type:"string"},confidence:{type:"integer",minimum:0,maximum:100},reason:{type:"string"}},required:["rowNo","partyRef","confidence","reason"],additionalProperties:false}}},required:["matches"],additionalProperties:false}}}
+        })
+      });
+      const payload=await response.json();
+      if(!response.ok)continue;
+      const text=payload.output_text||(payload.output||[]).flatMap(x=>x.content||[]).find(x=>x.type==="output_text")?.text||"";
+      const parsed=JSON.parse(text||"{}");
+      for(const match of parsed.matches||[]){
+        const ref=clean(match.partyRef); const confidence=Number(match.confidence||0);
+        if(ref&&confidence>=88&&matcher.byId.has(ref))selected.set(Number(match.rowNo),{entry:matcher.byId.get(ref),confidence,source:"AI_NARRATION_MATCH",candidateCount:1});
+      }
+    }catch{}
+  }
+  return selected;
+}
+
 function statementFingerprint(financialYear,bankAccountId,row){
   return crypto.createHash("sha256").update([
     financialYear,bankAccountId,row.date.toISOString().slice(0,10),normalizeName(row.sourcePartyName ?? row.partyName),normalizeName(row.remarks),row.mode,
     Number(row.debit||0).toFixed(2),Number(row.credit||0).toFixed(2),Number(row.runningBalance||0).toFixed(2)
   ].join("|")).digest("hex");
+}
+
+function postedBankFingerprint(financialYear, bankAccountId, row) {
+  return crypto.createHash("sha256").update(
+    JSON.stringify([financialYear, bankStatementIdentity(bankAccountId, row)]),
+  ).digest("hex");
+}
+
+async function existingPostedBankRow({ BankStatementRow, tenantKey, financialYear, bankAccountId, row, excludeId }) {
+  const identity = postedBankFingerprint(financialYear, bankAccountId, row);
+  const filter = {
+    tenantKey, financialYear, bankAccountId,
+    transactionId: { $nin: [null, ""] },
+    ...(excludeId ? { _id: { $ne: excludeId } } : {}),
+  };
+  const direct = await BankStatementRow.findOne({ ...filter, postingFingerprint: identity }).select("_id").lean();
+  if (direct) return direct;
+  // Legacy imports predate postingFingerprint; compare the actual bank line
+  // without importId or the matched party name, neither identifies a bank line.
+  const candidates = await BankStatementRow.find({
+    ...filter, date: row.date,
+    debit: Number(row.debit || 0), credit: Number(row.credit || 0),
+    runningBalance: Number(row.runningBalance || 0),
+  }).select("_id date remarks debit credit runningBalance").lean();
+  const same = bankStatementIdentity(bankAccountId, row);
+  return candidates.find((old) => bankStatementIdentity(bankAccountId, old) === same) || null;
 }
 
 async function buildPartyMatcher(tenantKey) {
@@ -381,6 +554,91 @@ async function buildPartyMatcher(tenantKey) {
     if(unique.length===1)return candidates.sort((a,b)=>Math.max(...b.aliases.map(x=>x.length))-Math.max(...a.aliases.map(x=>x.length)))[0];
     return null;
   };
+}
+
+async function refreshStatementImportAfterDelete({tenantKey,financialYear,importId}){
+  if(!importId)return;
+  const {BankStatementImport,BankStatementRow}=financialModels(tenantKey,financialYear);
+  const rows=await BankStatementRow.find({tenantKey,financialYear,importId}).sort({rowNo:1}).lean();
+  if(!rows.length){await BankStatementImport.deleteOne({tenantKey,financialYear,importId});return;}
+  const posted=rows.filter(x=>clean(x.transactionId));
+  await BankStatementImport.updateOne({tenantKey,financialYear,importId},{$set:{
+    totalRows:rows.length,postedRows:posted.length,
+    unmatchedRows:rows.filter(x=>!clean(x.matchedPartyGlobalId)).length,
+    totalDebit:round2(rows.reduce((sum,x)=>sum+Number(x.debit||0),0)),
+    totalCredit:round2(rows.reduce((sum,x)=>sum+Number(x.credit||0),0)),
+    closingBalance:Number(rows[rows.length-1]?.runningBalance||0)
+  }});
+}
+
+async function deleteBankTransactionIds({tenantKey,financialYear,ids=[]}){
+  const unique=[...new Set((ids||[]).map(clean).filter(Boolean))];
+  if(!unique.length)return {deleted:0,statement:0,receipts:0,payments:0};
+  const {BankStatementRow,Receipt,Payment,LedgerEntry}=financialModels(tenantKey,financialYear);
+  let deleted=0,statement=0,receipts=0,payments=0;const importIds=new Set();
+  for(const token of unique){
+    const [kind,rawId]=token.includes(":")?token.split(/:(.+)/):["",token];
+    const id=clean(rawId);if(!id)continue;
+    if(kind==="BST"){
+      const row=await BankStatementRow.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      const tx=clean(row.transactionId);if(tx){
+        if(row.transactionType==="RECEIPT")receipts+=(await Receipt.deleteMany({tenantKey,financialYear,receiptNo:tx})).deletedCount||0;
+        else payments+=(await Payment.deleteMany({tenantKey,financialYear,paymentNo:tx})).deletedCount||0;
+        await LedgerEntry.deleteMany({tenantKey,financialYear,transactionId:tx});
+      }
+      if(row.importId)importIds.add(String(row.importId));
+      await row.deleteOne();deleted++;statement++;continue;
+    }
+    if(kind==="RCT"){
+      const row=await Receipt.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      const tx=clean(row.receiptNo);if(tx)await LedgerEntry.deleteMany({tenantKey,financialYear,transactionId:tx});
+      if(clean(row.statementImportId)){
+        const linked=await BankStatementRow.find({tenantKey,financialYear,transactionId:tx}).select("importId").lean();
+        for(const linkedRow of linked)if(linkedRow.importId)importIds.add(String(linkedRow.importId));
+        await BankStatementRow.deleteMany({tenantKey,financialYear,transactionId:tx});
+      }
+      await row.deleteOne();deleted++;receipts++;continue;
+    }
+    if(kind==="PAY"){
+      const row=await Payment.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      const tx=clean(row.paymentNo);if(tx)await LedgerEntry.deleteMany({tenantKey,financialYear,transactionId:tx});
+      if(clean(row.statementImportId)){
+        const linked=await BankStatementRow.find({tenantKey,financialYear,transactionId:tx}).select("importId").lean();
+        for(const linkedRow of linked)if(linkedRow.importId)importIds.add(String(linkedRow.importId));
+        await BankStatementRow.deleteMany({tenantKey,financialYear,transactionId:tx});
+      }
+      await row.deleteOne();deleted++;payments++;continue;
+    }
+  }
+  for(const importId of importIds)await refreshStatementImportAfterDelete({tenantKey,financialYear,importId});
+  return {deleted,statement,receipts,payments};
+}
+
+function transactionDateFilter(fromDateValue="",toDateValue=""){
+  const fromDate=clean(fromDateValue),toDate=clean(toDateValue);const range={};
+  if(fromDate){const d=new Date(`${fromDate}T00:00:00.000Z`);if(!Number.isNaN(d.getTime()))range.$gte=d;}
+  if(toDate){const d=new Date(`${toDate}T23:59:59.999Z`);if(!Number.isNaN(d.getTime()))range.$lte=d;}
+  return Object.keys(range).length?range:null;
+}
+
+async function transactionIdsForDeleteAll({tenantKey,financialYear,fromDate="",toDate="",bankAccountId="",type="ALL",q=""}){
+  const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
+  const rx=q?new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"i"):null;
+  const statementFilter={tenantKey,financialYear,transactionId:{$nin:[null,""]},classification:{$in:["POSTED","SUSPENSE","UNMATCHED"]}};
+  const dateFilter=transactionDateFilter(fromDate,toDate);if(dateFilter)statementFilter.date=dateFilter;
+  if(bankAccountId)statementFilter.bankAccountId=bankAccountId;if(["RECEIPT","PAYMENT"].includes(type))statementFilter.transactionType=type;
+  if(rx)statementFilter.$or=[{matchedPartyName:rx},{partyName:rx},{remarks:rx},{mode:rx},{transactionId:rx}];
+  const manualBase={tenantKey,financialYear,$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
+  if(dateFilter)manualBase.date=dateFilter;
+  if(bankAccountId)manualBase.bankAccountId=bankAccountId;
+  const receiptFilter={...manualBase},paymentFilter={...manualBase};
+  if(rx){receiptFilter.$and=[{$or:manualBase.$or},{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{receiptNo:rx}]}];delete receiptFilter.$or;paymentFilter.$and=[{$or:manualBase.$or},{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{paymentNo:rx}]}];delete paymentFilter.$or;}
+  const [bst,rct,pay]=await Promise.all([
+    BankStatementRow.find(statementFilter).select("_id").lean(),
+    type==="PAYMENT"?[]:Receipt.find(receiptFilter).select("_id").lean(),
+    type==="RECEIPT"?[]:Payment.find(paymentFilter).select("_id").lean()
+  ]);
+  return [...bst.map(x=>`BST:${x._id}`),...rct.map(x=>`RCT:${x._id}`),...pay.map(x=>`PAY:${x._id}`)];
 }
 
 async function upsertOpeningBalance(bank, financialYear, amount, type, source, userId) {
@@ -437,12 +695,14 @@ router.get("/transactions", async (req,res)=>{
   const {BankStatementRow,BankStatementImport,Receipt,Payment}=financialModels(req.auth.tenantKey,financialYear);
   const page=Math.max(1,Number(req.query.page||1)),limit=Math.max(10,Math.min(200,Number(req.query.limit||50)));
   const q=clean(req.query.q),bankAccountId=clean(req.query.bankAccountId),type=upper(req.query.type||"ALL");
-  const rx=q?new RegExp(q,"i"):null;
+  const rx=q?new RegExp(q,"i"):null,dateFilter=transactionDateFilter(req.query.fromDate,req.query.toDate);
   const statementFilter={tenantKey:req.auth.tenantKey,financialYear,transactionId:{$nin:[null,""]},classification:{$in:["POSTED","SUSPENSE","UNMATCHED"]}};
+  if(dateFilter)statementFilter.date=dateFilter;
   if(bankAccountId)statementFilter.bankAccountId=bankAccountId;
   if(["RECEIPT","PAYMENT"].includes(type))statementFilter.transactionType=type;
   if(rx)statementFilter.$or=[{matchedPartyName:rx},{partyName:rx},{remarks:rx},{mode:rx},{transactionId:rx}];
   const manualBase={tenantKey:req.auth.tenantKey,financialYear,$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
+  if(dateFilter)manualBase.date=dateFilter;
   if(bankAccountId)manualBase.bankAccountId=bankAccountId;
   const receiptFilter={...manualBase},paymentFilter={...manualBase};
   if(rx){receiptFilter.$and=[{$or:manualBase.$or},{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{receiptNo:rx}]}];delete receiptFilter.$or;paymentFilter.$and=[{$or:manualBase.$or},{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{paymentNo:rx}]}];delete paymentFilter.$or;}
@@ -466,8 +726,87 @@ router.get("/transactions", async (req,res)=>{
   const partyRefs=[...new Set(items.map(x=>x.matchedPartyGlobalId).filter(x=>x&&x!=="SUSPENSE"))];
   const userIds=[...new Set(items.flatMap(x=>{const batch=im.get(String(x.importId||x.statementImportId||""));return [x.createdBy,x.submittedBy,batch?.submittedBy,batch?.importedBy].filter(Boolean)}))];
   const [partyMap,userMap]=await Promise.all([resolvePartyDisplayMap(req.auth.tenantKey,partyRefs),resolveUserDisplayMap(req.auth.tenantKey,userIds)]);
-  const enriched=items.map(x=>{const batch=im.get(String(x.importId||x.statementImportId||""));const partyRef=String(x.matchedPartyGlobalId||"");const partyName=partyMap.get(partyRef)?.name||x.matchedPartyName||x.partyName||"";const userId=String(x.submittedBy||batch?.submittedBy||x.createdBy||batch?.importedBy||"");const userName=x.submittedByNameSnapshot||batch?.submittedByNameSnapshot||x.createdByNameSnapshot||batch?.importedByNameSnapshot||userMap.get(userId)||userId;return {...x,matchedPartyName:partyName,partyNameDisplay:partyName,userNameDisplay:userName,bankNameSnapshot:x.bankNameSnapshot||bm.get(String(x.bankAccountId))?.bankName||"",bankAccountNumberSnapshot:bm.get(String(x.bankAccountId))?.accountNumber||""}});
+  const enriched=items.map(x=>{const batch=im.get(String(x.importId||x.statementImportId||""));const partyRef=String(x.matchedPartyGlobalId||"");const partyName=x.matchedPartyName||x.partyName||partyMap.get(partyRef)?.name||"";const userId=String(x.submittedBy||batch?.submittedBy||x.createdBy||batch?.importedBy||"");const userName=x.submittedByNameSnapshot||batch?.submittedByNameSnapshot||x.createdByNameSnapshot||batch?.importedByNameSnapshot||userMap.get(userId)||userId;return {...x,matchedPartyName:partyName,partyNameDisplay:partyName,userNameDisplay:userName,bankNameSnapshot:x.bankNameSnapshot||bm.get(String(x.bankAccountId))?.bankName||"",bankAccountNumberSnapshot:bm.get(String(x.bankAccountId))?.accountNumber||""}});
   return ok(res,{items:enriched,meta:{page,limit,total,pages:Math.max(1,Math.ceil(total/limit))}});
+});
+
+// Ledger is source-verified on every read. This admin-only reconciliation
+// physically removes ONLY verified extra lines / orphan lines, never invoices,
+// legitimate bank transactions, or disputed amount/party mismatches.
+async function bankLedgerAudit({tenantKey,financialYear}){
+  const {LedgerEntry,Receipt,Payment,BankStatementRow}=financialModels(tenantKey,financialYear);
+  const rows=await LedgerEntry.find({tenantKey,financialYear,status:"POSTED",transactionType:{$in:["RECEIPT","PAYMENT","BANK_STATEMENT_RECEIPT","BANK_STATEMENT_PAYMENT"]}})
+    .sort({createdAt:1,_id:1}).lean();
+  const checked=await inspectBankLedgerRows({tenantKey,financialYear,rows});
+  const [duplicateReceipts,duplicatePayments,postedStatements]=await Promise.all([
+    Receipt.aggregate([{$match:{tenantKey,financialYear}},{$group:{_id:"$receiptNo",count:{$sum:1}}},{$match:{count:{$gt:1}}}]),
+    Payment.aggregate([{$match:{tenantKey,financialYear}},{$group:{_id:"$paymentNo",count:{$sum:1}}},{$match:{count:{$gt:1}}}]),
+    BankStatementRow.find({tenantKey,financialYear,transactionId:{$nin:[null,""]}})
+      .select("_id bankAccountId transactionId date remarks debit credit runningBalance").sort({createdAt:1,_id:1}).lean(),
+  ]);
+  const seen=new Map(),duplicateStatements=[];
+  for(const row of postedStatements){
+    const id=postedBankFingerprint(financialYear,row.bankAccountId,row);
+    if(seen.has(id))duplicateStatements.push({rowId:String(row._id),transactionId:row.transactionId,originalTransactionId:seen.get(id)});
+    else seen.set(id,row.transactionId);
+  }
+  const byTransaction=new Map();
+  for(const row of checked.rows){
+    const id=clean(row.transactionId);
+    const current=byTransaction.get(id)||{transactionId:id,debit:0,credit:0,lines:0};
+    current.debit+=Number(row.debit||0);current.credit+=Number(row.credit||0);current.lines++;
+    byTransaction.set(id,current);
+  }
+  const unbalancedTransactions=[...byTransaction.values()].filter(x=>Math.abs(x.debit-x.credit)>0.01||x.lines!==2)
+    .map(x=>({...x,debit:round2(x.debit),credit:round2(x.credit)}));
+  return {
+    journalRows:rows.length,unbalancedTransactions,duplicateLedgerLines:checked.duplicateIds.map(String),
+    orphanLedgerLines:checked.orphanIds.map(String),inconsistentLedgerLines:checked.inconsistentIds.map(String),
+    duplicateStatementTransactions:duplicateStatements,
+    duplicateReceiptNumbers:duplicateReceipts.map(x=>({receiptNo:x._id,count:x.count})),
+    duplicatePaymentNumbers:duplicatePayments.map(x=>({paymentNo:x._id,count:x.count})),
+  };
+}
+
+router.get("/transactions/ledger-integrity",async(req,res,next)=>{
+  try{
+    if(!isAdminAuth(req.auth))return fail(res,"Admin permission required",403);
+    const financialYear=clean(req.query.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");
+    if(!financialYear)return fail(res,"Select Financial Year",400);
+    return ok(res,{financialYear,...await bankLedgerAudit({tenantKey:req.auth.tenantKey,financialYear})});
+  }catch(error){return next(error);}
+});
+router.post("/transactions/ledger-integrity/repair",async(req,res,next)=>{
+  try{
+    if(!isAdminAuth(req.auth))return fail(res,"Admin permission required",403);
+    const financialYear=clean(req.body.financialYear);
+    if(!financialYear)return fail(res,"Financial Year is required",400);
+    const audit=await bankLedgerAudit({tenantKey:req.auth.tenantKey,financialYear});
+    const remove=[...new Set([...audit.duplicateLedgerLines,...audit.orphanLedgerLines])];
+    if(req.body.confirm!=="REPAIR_BANK_LEDGER")return ok(res,{financialYear,dryRun:true,wouldRemove:remove.length,...audit},"Preview only. Explicit confirmation is required for repair.");
+    const {LedgerEntry}=financialModels(req.auth.tenantKey,financialYear);
+    const result=remove.length?await LedgerEntry.deleteMany({tenantKey:req.auth.tenantKey,financialYear,_id:{$in:remove},status:"POSTED"}):{deletedCount:0};
+    return ok(res,{financialYear,removedLedgerLines:result.deletedCount||0,remaining:await bankLedgerAudit({tenantKey:req.auth.tenantKey,financialYear})},"Verified duplicate/orphan ledger lines reconciled. Conflicting source documents require manual review.");
+  }catch(error){return next(error);}
+});
+
+router.post("/transactions/bulk-delete",async(req,res,next)=>{
+  try{
+    const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");if(!financialYear)return fail(res,"Select Financial Year",400);
+    const ids=Array.isArray(req.body.ids)?req.body.ids:[];if(!ids.length)return fail(res,"Select at least one bank transaction",400);
+    const result=await deleteBankTransactionIds({tenantKey:req.auth.tenantKey,financialYear,ids});
+    return ok(res,result,`${result.deleted} bank transaction(s) deleted`);
+  }catch(error){return next(error);}
+});
+
+router.post("/transactions/delete-all",async(req,res,next)=>{
+  try{
+    const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");if(!financialYear)return fail(res,"Select Financial Year",400);
+    const ids=await transactionIdsForDeleteAll({tenantKey:req.auth.tenantKey,financialYear,fromDate:clean(req.body.fromDate),toDate:clean(req.body.toDate),bankAccountId:clean(req.body.bankAccountId),type:upper(req.body.type||"ALL"),q:clean(req.body.q)});
+    if(!ids.length)return ok(res,{deleted:0},"No bank transactions matched the current filters");
+    const result=await deleteBankTransactionIds({tenantKey:req.auth.tenantKey,financialYear,ids});
+    return ok(res,result,`${result.deleted} bank transaction(s) deleted`);
+  }catch(error){return next(error);}
 });
 
 router.post("/:id/statement-preview", upload.single("file"), async (req,res,next)=>{
@@ -475,7 +814,11 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     if(!req.file?.buffer)return fail(res,"Bank statement Excel/CSV file is required",400);
     const bank=await BankAccount.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});
     if(!bank)return fail(res,"Active bank account not found",404);
-    let rawRows; try{rawRows=readRows(req.file.buffer);}catch{return fail(res,"Unable to read bank statement file",400);}
+    // CSV dates must stay as text here. SheetJS can otherwise auto-parse
+    // DD-MM-YYYY values as MM-DD-YYYY (for example 03-04-2025), which
+    // makes one FY 2025-26 statement falsely appear to span 2024-25/2026-27.
+    const isCsv = /\.csv$/i.test(clean(req.file.originalname)) || /csv/i.test(clean(req.file.mimetype));
+    let rawRows; try{rawRows=readRows(req.file.buffer,{preserveText:isCsv});}catch{return fail(res,"Unable to read bank statement file",400);}
     if(!rawRows.length)return fail(res,"Uploaded bank statement has no rows",400);
     const fields=[
       {key:"date",label:"Date",aliases:["txn date","transaction date","value date"],required:true},
@@ -514,13 +857,20 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     const oldDrafts=await BankStatementImport.find({tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW",importedBy:req.auth.sub}).select("importId").lean();
     if(oldDrafts.length){const ids=oldDrafts.map(x=>x.importId);await BankStatementRow.deleteMany({tenantKey:req.auth.tenantKey,financialYear,importId:{$in:ids},transactionId:{$in:[null,""]}});await BankStatementImport.deleteMany({tenantKey:req.auth.tenantKey,financialYear,importId:{$in:ids},status:"DRAFT_REVIEW"});}
 
-    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey); const importId=makeId("BST");
+    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId}); const importId=makeId("BST");
+    const localMatchByRow=new Map(rows.map(r=>[Number(r.rowNo),matcher.detect(r)]));
+    const aiMatchByRow=await resolveNarrationsWithAi(rows.filter(r=>!localMatchByRow.get(Number(r.rowNo))?.entry),matcher);
     const preview=[];let unmatchedRows=0,duplicateRows=0,autoMatchedRows=0;
+    const seenInFile=new Set();
     for(const r of rows){
       const sourceFingerprint=statementFingerprint(financialYear,bank.bankAccountId,r);
-      const duplicate=await BankStatementRow.exists({tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,transactionId:{$nin:[null,""]},$or:[{sourceFingerprint},{fingerprint:sourceFingerprint}]});
+      const postedIdentity=postedBankFingerprint(financialYear,bank.bankAccountId,r);
+      const duplicate=seenInFile.has(postedIdentity) || await existingPostedBankRow({
+        BankStatementRow,tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,row:r,
+      });
+      seenInFile.add(postedIdentity);
       if(duplicate){duplicateRows++;preview.push({...r,date:r.date.toISOString(),transactionType:r.credit>0?"RECEIPT":"PAYMENT",classification:"DUPLICATE",duplicate:true,sourceFingerprint,matchedPartyGlobalId:"",matchedPartyName:"Already imported",detectionSource:"DUPLICATE",matchConfidence:100,candidateCount:1});continue;}
-      const found=matcher.detect(r); const entry=found.entry;
+      const found=aiMatchByRow.get(Number(r.rowNo))||localMatchByRow.get(Number(r.rowNo))||matcher.detect(r); const entry=found.entry;
       const partyId=entry?.ref||""; const partyName=entry?.preferred||"Suspense Account"; const partyCode=entry?.partyAccountCode||"SYS_SUSPENSE";
       const classification=entry?"AUTO_MATCHED":"SUSPENSE"; if(entry)autoMatchedRows++;else unmatchedRows++;
       const fingerprint=crypto.createHash("sha256").update(`${importId}|${sourceFingerprint}`).digest("hex");
@@ -539,36 +889,155 @@ router.post("/:id/statement-upload", upload.single("file"), async (req,res,next)
   return next();
 });
 
+
+router.put("/:id/statement-review/:importId", async (req,res,next)=>{
+  try{
+    const bank=await BankAccount.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});
+    if(!bank)return fail(res,"Active bank account not found",404);
+    const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");
+    if(!financialYear)return fail(res,"Select Financial Year",400);
+    const edits=Array.isArray(req.body.rows)?req.body.rows:[];
+    if(!edits.length)return fail(res,"No statement review rows supplied",400);
+    const {BankStatementImport,BankStatementRow}=financialModels(req.auth.tenantKey,financialYear);
+    const batch=await BankStatementImport.findOne({tenantKey:req.auth.tenantKey,financialYear,importId:req.params.importId,bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW"});
+    if(!batch)return fail(res,"Statement review draft not found or already submitted",404);
+    const docs=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({rowNo:1});
+    const editMap=new Map(edits.map(x=>[Number(x.rowNo),x]));
+    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId});
+    const validation=[];
+    const prepared=[];
+    for(const doc of docs){
+      const edit=editMap.get(Number(doc.rowNo));
+      if(!edit){const requested=clean(doc.matchedPartyGlobalId);prepared.push({doc,date:doc.date,remarks:doc.remarks,mode:doc.mode,debit:Number(doc.debit||0),credit:Number(doc.credit||0),runningBalance:Number(doc.runningBalance||0),requested,originalPartyRef:requested,selected:requested?matcher.byId.get(requested)||null:null});continue;}
+      const has=(key)=>Object.prototype.hasOwnProperty.call(edit,key);
+      const date=has("date")&&clean(edit.date)?parseStatementDate(edit.date):doc.date;
+      const remarks=has("remarks")?clean(edit.remarks):clean(doc.remarks);
+      const mode=normalizeStatementMode(has("mode")?edit.mode:doc.mode,remarks);
+      const debitRaw=has("debit")&&edit.debit!==""&&edit.debit!==null?Number(edit.debit):Number(doc.debit||0);
+      const creditRaw=has("credit")&&edit.credit!==""&&edit.credit!==null?Number(edit.credit):Number(doc.credit||0);
+      const balanceRaw=has("runningBalance")&&edit.runningBalance!==""&&edit.runningBalance!==null?Number(edit.runningBalance):Number(doc.runningBalance);
+      const debit=Number.isFinite(debitRaw)?Math.max(0,debitRaw):NaN;
+      const credit=Number.isFinite(creditRaw)?Math.max(0,creditRaw):NaN;
+      const runningBalance=Number.isFinite(balanceRaw)?balanceRaw:NaN;
+      let requested=has("partyGlobalId")?clean(edit.partyGlobalId):clean(doc.matchedPartyGlobalId);
+      if(!date)validation.push({row:doc.rowNo,error:"Invalid date"});
+      else if(financialYearFromDate(date)!==financialYear)validation.push({row:doc.rowNo,error:`Date must remain inside ${financialYear}`});
+      if(!Number.isFinite(debit)||!Number.isFinite(credit)||(debit>0&&credit>0)||(debit<=0&&credit<=0))validation.push({row:doc.rowNo,error:"Enter either Debit or Credit, not both"});
+      if(!Number.isFinite(runningBalance))validation.push({row:doc.rowNo,error:"Running Balance is required"});
+      let selected=null;
+      if(requested&&requested!=="SUSPENSE")selected=matcher.byId.get(requested)||null;
+      if(requested&&requested!=="SUSPENSE"&&!selected){
+        const recovered=matcher.detect({remarks,partyHint:extractPartyHintFromRemarks(remarks)});
+        selected=recovered.entry||null;requested=selected?.ref||"SUSPENSE";
+      }
+      prepared.push({doc,date,remarks,mode,debit:round2(debit),credit:round2(credit),runningBalance:round2(runningBalance),requested,originalPartyRef:clean(doc.matchedPartyGlobalId),selected});
+    }
+    if(validation.length)return fail(res,"Some edited bank statement rows are invalid",400,{errors:validation.slice(0,50)});
+    const running=validateRunningOrder(prepared.map(x=>({rowNo:x.doc.rowNo,date:x.date,debit:x.debit,credit:x.credit,runningBalance:x.runningBalance})));
+    if(!running.ok)return fail(res,"Edited Running Balance does not reconcile with Debit/Credit rows",400,{errors:running.errors.slice(0,50)});
+
+    for(const item of prepared){
+      const {doc,date,remarks,mode,debit,credit,runningBalance}=item;
+      const selected=item.selected||null;
+      const requested=clean(item.requested);
+      const sourceRow={rowNo:doc.rowNo,date,sourcePartyName:"",partyName:"",remarks,mode,debit,credit,runningBalance};
+      const editedFingerprint=statementFingerprint(financialYear,bank.bankAccountId,sourceRow);
+      doc.date=date;
+      doc.remarks=remarks;
+      doc.mode=mode;
+      doc.debit=debit;
+      doc.credit=credit;
+      doc.runningBalance=runningBalance;
+      doc.transactionType=credit>0?"RECEIPT":"PAYMENT";
+      doc.fingerprint=crypto.createHash("sha256").update(`${batch.importId}|${editedFingerprint}`).digest("hex");
+      doc.matchedPartyGlobalId=selected?.ref||"";
+      doc.matchedPartyName=selected?.preferred||"Suspense Account";
+      doc.partyName=selected?.preferred||"Suspense Account";
+      doc.partyAccountCode=selected?.partyAccountCode||"SYS_SUSPENSE";
+      doc.classification=selected?"MANUAL_MATCHED":"SUSPENSE";
+      doc.detectionSource=selected?(requested===clean(item.originalPartyRef)?doc.detectionSource||"REVIEW_SAVED":"MANUAL_REVIEW_EDIT"):"MANUAL_SUSPENSE";
+      doc.matchConfidence=selected?100:0;
+      doc.candidateCount=selected?1:0;
+      doc.error="";
+      await doc.save();
+    }
+
+    const saved=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({rowNo:1}).lean();
+    batch.openingBalance=running.statementOpening;
+    batch.closingBalance=saved.length?Number(saved[saved.length-1].runningBalance||0):0;
+    batch.totalDebit=round2(saved.reduce((sum,x)=>sum+Number(x.debit||0),0));
+    batch.totalCredit=round2(saved.reduce((sum,x)=>sum+Number(x.credit||0),0));
+    batch.unmatchedRows=saved.filter(x=>!clean(x.matchedPartyGlobalId)).length;
+    await batch.save();
+    return ok(res,{reviewRows:saved.map(x=>({...x,date:x.date?.toISOString?.()||x.date})),openingBalance:batch.openingBalance,closingBalance:batch.closingBalance,totalDebit:batch.totalDebit,totalCredit:batch.totalCredit,unmatchedRows:batch.unmatchedRows},"Review changes saved");
+  }catch(error){return next(error);}
+});
+
 router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
   try{
     const bank=await BankAccount.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});if(!bank)return fail(res,"Active bank account not found",404);
     const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");if(!financialYear)return fail(res,"Select Financial Year",400);
     const {Receipt,Payment,BankStatementImport,BankStatementRow}=financialModels(req.auth.tenantKey,financialYear);
+    await Promise.all([Receipt.init(),Payment.init(),BankStatementRow.init()]);
     const batch=await BankStatementImport.findOne({tenantKey:req.auth.tenantKey,financialYear,importId:req.params.importId,bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW"});
     if(!batch)return fail(res,"Statement review draft not found or already submitted",404);
-    const rows=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({date:1,rowNo:1});
-    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey);
+    const rows=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({rowNo:1});
+    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId});
     const assignmentMap=new Map((Array.isArray(req.body.assignments)?req.body.assignments:[]).map(x=>[Number(x.rowNo),clean(x.partyGlobalId)]));
     const bankSystemCode=["OD","CC"].includes(upper(bank.accountType))?"SYS_BANK_OD":"SYS_BANK_ACCOUNT";
     let postedRows=0,unmatchedRows=0,errorRows=0;const errors=[];
     for(const r of rows){
+      let createdTransactionId="",createdType="",claimed=false;
       try{
         const requested=assignmentMap.has(Number(r.rowNo))?assignmentMap.get(Number(r.rowNo)):clean(r.matchedPartyGlobalId);
         const selected=requested&&requested!=="SUSPENSE"?matcher.byId.get(String(requested)):null;
         const partyId=selected?.ref||"";const partyName=selected?.preferred||"Suspense Account";const partyCode=selected?.partyAccountCode||"SYS_SUSPENSE";const partyLedgerId=selected?.ledgerId||"";
         if(selected?.ownerType==="USER"&&partyCode==="SYS_SUSPENSE")throw new Error(`Set Accounting Account Type for ${partyName} in User Master before posting this bank row`);
+        const duplicate=await existingPostedBankRow({
+          BankStatementRow,tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,row:r,excludeId:r._id,
+        });
+        if(duplicate)throw new Error(`Bank transaction already posted (row ${r.rowNo}); re-import rejected`);
+        // Unique partial DB index claims the statement line before creating
+        // the receipt/payment; concurrent submissions cannot post it twice.
+        const uniqueIdentity=postedBankFingerprint(financialYear,bank.bankAccountId,r);
+        const claim=await BankStatementRow.findOneAndUpdate({
+          _id:r._id,tenantKey:req.auth.tenantKey,financialYear,
+          transactionId:{$in:[null,""]},postingFingerprint:{$exists:false},
+        },{$set:{postingFingerprint:uniqueIdentity}},{new:true});
+        if(!claim)throw new Error(`Row ${r.rowNo} was already claimed or posted by another submission`);
+        claimed=true;
+        r.postingFingerprint=uniqueIdentity;
         const isReceipt=r.credit>0,amount=isReceipt?Number(r.credit||0):Number(r.debit||0),transactionId=makeId(isReceipt?"RCT":"PAY");
+        createdTransactionId=transactionId;
+        createdType=isReceipt?"RECEIPT":"PAYMENT";
         const bankEntry={accountCode:bankSystemCode,ledgerId:bank.ledgerId||"",bankAccountId:bank.bankAccountId};
         if(isReceipt){
-          await Receipt.create({tenantKey:req.auth.tenantKey,financialYear,receiptNo:transactionId,date:r.date,customerGlobalId:partyId,partyNameSnapshot:partyName,amount,mode:r.mode||"BANK",reference:"",remarks:r.remarks,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,statementImportId:batch.importId,statementRowNo:r.rowNo,runningBalance:r.runningBalance,bounceStatus:"CLEAR",status:selected?"POSTED":"PENDING_CLASSIFICATION",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+          await Receipt.create({tenantKey:req.auth.tenantKey,financialYear,receiptNo:transactionId,sourceKey:transactionId,date:r.date,customerGlobalId:partyId,partyNameSnapshot:partyName,amount,mode:r.mode||"BANK",reference:"",remarks:r.remarks,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,statementImportId:batch.importId,statementRowNo:r.rowNo,runningBalance:r.runningBalance,bounceStatus:"CLEAR",status:selected?"POSTED":"PENDING_CLASSIFICATION",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear,transactionId,transactionType:"BANK_STATEMENT_RECEIPT",date:r.date,partyGlobalId:partyId,narration:r.remarks||`Bank receipt - ${partyName}`,entries:[{...bankEntry,debit:amount},{accountCode:partyCode,ledgerId:partyLedgerId,credit:amount}]});
         }else{
-          await Payment.create({tenantKey:req.auth.tenantKey,financialYear,paymentNo:transactionId,date:r.date,partyGlobalId:partyId,partyNameSnapshot:partyName,amount,mode:r.mode||"BANK",reference:"",remarks:r.remarks,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,statementImportId:batch.importId,statementRowNo:r.rowNo,runningBalance:r.runningBalance,status:selected?"POSTED":"PENDING_CLASSIFICATION",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+          await Payment.create({tenantKey:req.auth.tenantKey,financialYear,paymentNo:transactionId,sourceKey:transactionId,date:r.date,partyGlobalId:partyId,partyNameSnapshot:partyName,amount,mode:r.mode||"BANK",reference:"",remarks:r.remarks,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,statementImportId:batch.importId,statementRowNo:r.rowNo,runningBalance:r.runningBalance,status:selected?"POSTED":"PENDING_CLASSIFICATION",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear,transactionId,transactionType:"BANK_STATEMENT_PAYMENT",date:r.date,partyGlobalId:partyId,narration:r.remarks||`Bank payment - ${partyName}`,entries:[{accountCode:partyCode,ledgerId:partyLedgerId,debit:amount},{...bankEntry,credit:amount}]});
         }
         r.matchedPartyGlobalId=partyId;r.matchedPartyName=partyName;r.partyAccountCode=partyCode;r.transactionId=transactionId;r.classification=selected?"POSTED":"SUSPENSE";r.submittedAt=new Date();r.submittedBy=req.auth.sub;r.submittedByNameSnapshot=req.auth.name||"";await r.save();
         postedRows++;if(!selected)unmatchedRows++;
-      }catch(error){errorRows++;r.error=error.message;await r.save();if(errors.length<50)errors.push({row:r.rowNo,error:error.message});}
+      }catch(error){
+        // If any step failed, remove this attempt's incomplete voucher + journal
+        // before clearing its uniqueness claim, so retry never multiplies entries.
+        if(createdTransactionId){
+          const {LedgerEntry}=financialModels(req.auth.tenantKey,financialYear);
+          await LedgerEntry.deleteMany({tenantKey:req.auth.tenantKey,financialYear,transactionId:createdTransactionId});
+          if(createdType==="RECEIPT")await Receipt.deleteMany({tenantKey:req.auth.tenantKey,financialYear,receiptNo:createdTransactionId});
+          else await Payment.deleteMany({tenantKey:req.auth.tenantKey,financialYear,paymentNo:createdTransactionId});
+        }
+        // Never clear another request's active claim: only its owner may
+        // roll back the postingFingerprint after cleaning its own voucher.
+        if(claimed){
+          r.transactionId="";r.postingFingerprint=undefined;r.error=error.message;
+          await r.save();
+        }
+        errorRows++;
+        if(errors.length<50)errors.push({row:r.rowNo,error:error.message});
+      }
     }
     batch.postedRows=postedRows;batch.unmatchedRows=unmatchedRows;batch.errorRows=errorRows;batch.status=errorRows?"SUBMITTED_WITH_ERRORS":"SUBMITTED";batch.submittedBy=req.auth.sub;batch.submittedByNameSnapshot=req.auth.name||"";batch.submittedAt=new Date();await batch.save();
     return ok(res,{importId:batch.importId,postedRows,unmatchedRows,errorRows,totalRows:batch.totalRows,duplicateRows:batch.duplicateRows,closingBalance:batch.closingBalance,errors},`Statement submitted: ${postedRows} transactions posted, ${unmatchedRows} to Suspense`);

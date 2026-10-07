@@ -12,24 +12,33 @@ const sum=(arr,key)=>arr.reduce((s,x)=>s+Number(x[key]||0),0);
 router.get("/",async(req,res)=>{
  const app=String(req.query.app||"dms"),tenantKey=req.auth.tenantKey,financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
  if(req.auth.role!=="MASTER" && !(req.auth.apps||[]).includes(app)) return res.status(403).json({success:false,message:`${app} is not enabled for this user`});
+ const fullFY=String(req.query.month || "").toUpperCase()==="ALL";
+ const requestedMonth=Number(req.query.month);
+ const month=(Number.isInteger(requestedMonth)&&requestedMonth>=1&&requestedMonth<=12)?requestedMonth:new Date().getMonth()+1;
+ const year=Number(financialYear.slice(0,4))+(month<4?1:0);
+ const monthStart=fullFY?new Date(Date.UTC(Number(financialYear.slice(0,4)),3,1)):new Date(Date.UTC(year,month-1,1));
+ const monthEnd=fullFY?new Date(Date.UTC(Number(financialYear.slice(0,4))+1,3,1)):new Date(Date.UTC(year,month,1));
+ const periodDate={$gte:monthStart,$lt:monthEnd};
+ const periodGeneric={$or:[{date:periodDate},{date:null,createdAt:periodDate}]};
  if(app==="hr"){
    const today=new Date();today.setHours(0,0,0,0);const tomorrow=new Date(today);tomorrow.setDate(today.getDate()+1);
    const [employees,attendance,payroll,leavePending,openJobs,candidates]=await Promise.all([
-    Employee.countDocuments({tenantKey,status:"ACTIVE"}),GenericRecord.find({tenantKey,app:"hr",resource:"attendance",date:{$gte:today,$lt:tomorrow}}).lean(),GenericRecord.find({tenantKey,app:"hr",resource:"payroll"}).sort({updatedAt:-1}).limit(300).lean(),GenericRecord.countDocuments({tenantKey,app:"hr",resource:"leave",status:"REQUESTED"}),JobOpening.countDocuments({tenantKey,status:{$in:["OPEN","APPROVED"]}}),Candidate.countDocuments({tenantKey,stage:{$nin:["JOINED","REJECTED","WITHDRAWN"]}})
+    Employee.countDocuments({tenantKey,status:"ACTIVE"}),GenericRecord.find({tenantKey,app:"hr",resource:"attendance",date:{$gte:today,$lt:tomorrow}}).lean(),GenericRecord.find({tenantKey,app:"hr",resource:"payroll",...periodGeneric}).sort({updatedAt:-1}).limit(300).lean(),GenericRecord.countDocuments({tenantKey,app:"hr",resource:"leave",status:"REQUESTED"}),JobOpening.countDocuments({tenantKey,status:{$in:["OPEN","APPROVED"]}}),Candidate.countDocuments({tenantKey,stage:{$nin:["JOINED","REJECTED","WITHDRAWN"]}})
    ]);
    const present=attendance.filter(x=>["PRESENT","HALF_DAY"].includes(x.status)).length;
    return ok(res,{app:"hr",kpis:{employees,presentToday:present,attendancePct:employees?Number((present/employees*100).toFixed(1)):0,payroll:sum(payroll,"amount"),leavePending,openJobs,candidates},trend:[],insights:[{severity:leavePending>5?"medium":"good",title:"Leave approvals",text:`${leavePending} leave requests are pending.`},{severity:openJobs>0?"medium":"good",title:"Recruitment",text:`${openJobs} vacancies are currently open.`}]});
  }
  if(app==="production"){
    const [plans,execution,wip,qc,machines,maintenance]=await Promise.all([
-    GenericRecord.find({tenantKey,app:"production",resource:"planning"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"execution"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"wip"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"quality"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"machines"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"maintenance",status:{$in:["PLANNED","IN_PROGRESS"]}}).limit(500).lean()
+    GenericRecord.find({tenantKey,app:"production",resource:"planning",...periodGeneric}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"execution",...periodGeneric}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"wip"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"quality",...periodGeneric}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"machines"}).limit(500).lean(),GenericRecord.find({tenantKey,app:"production",resource:"maintenance",status:{$in:["PLANNED","IN_PROGRESS"]}}).limit(500).lean()
    ]);
    const planned=sum(plans,"quantity"),actual=sum(execution,"quantity"),reject=qc.reduce((s,x)=>s+Number(x.data?.rejectedQty||0),0),checked=sum(qc,"quantity");
    return ok(res,{app:"production",kpis:{planned,actual,planAchievement:planned?Number((actual/planned*100).toFixed(1)):0,wip:sum(wip,"quantity"),rejectionPct:checked?Number((reject/checked*100).toFixed(1)):0,machines:machines.length,maintenance:maintenance.length},insights:[{severity:maintenance.length?"medium":"good",title:"Maintenance attention",text:`${maintenance.length} maintenance jobs are open.`},{severity:checked&&reject/checked>.03?"high":"good",title:"Quality",text:checked?`Current rejection is ${(reject/checked*100).toFixed(1)}%.`:"No QC data yet."}]});
  }
  const {SalesInvoice,Receipt,Expense,StockMovement}=financialModels(tenantKey,financialYear);
+ const toMonthEnd={$lt:monthEnd};
  const [products,customers,leads,activeTargets,invoices,receipts,expenses,stockMoves]=await Promise.all([
-  Product.countDocuments({tenantKey,status:"ACTIVE"}),CustomerLink.countDocuments({tenantKey,status:"ACTIVE"}),Lead.countDocuments({tenantKey}),Target.find({tenantKey,status:{$in:["PUBLISHED","ACTIVE"]}}).lean(),SalesInvoice.find({tenantKey,financialYear,status:"POSTED"}).limit(3000).lean(),Receipt.find({tenantKey,financialYear,status:"POSTED"}).limit(3000).lean(),Expense.find({tenantKey,financialYear,status:"POSTED"}).limit(3000).lean(),StockMovement.find({tenantKey,financialYear}).limit(5000).lean()
+  Product.countDocuments({tenantKey,status:"ACTIVE"}),CustomerLink.countDocuments({tenantKey,status:"ACTIVE"}),Lead.countDocuments({tenantKey}),Target.find({tenantKey,financialYear,status:{$in:["PUBLISHED","ACTIVE"]}}).lean(),SalesInvoice.find({tenantKey,financialYear,status:"POSTED",date:periodDate}).limit(3000).lean(),Receipt.find({tenantKey,financialYear,status:"POSTED",date:periodDate}).limit(3000).lean(),Expense.find({tenantKey,financialYear,status:"POSTED",date:periodDate}).limit(3000).lean(),StockMovement.find({tenantKey,financialYear,date:toMonthEnd}).limit(5000).lean()
  ]);
  const sales=sum(invoices,"subtotal"),grossProfit=sum(invoices,"grossProfit"),collections=sum(receipts,"amount"),expenseTotal=sum(expenses,"amount");
  let green=0,blue=0,red=0;for(const inv of invoices)for(const it of inv.items||[]){if(it.marginColor==="GREEN")green+=Number(it.taxable||0);else if(it.marginColor==="BLUE")blue+=Number(it.taxable||0);else red+=Number(it.taxable||0)}const marginTotal=green+blue+red||1;

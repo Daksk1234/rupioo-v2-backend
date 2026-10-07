@@ -669,6 +669,9 @@ const companyProfileSchema = new Schema({
   signatureFileId:{type:String,default:""},
   invoiceTerms:{type:String,default:"GOODS ONCE SOLD CANNOT BE TAKEN BACK, TRANSPORTATION RISK AT BUYER SIDE"},
   gpayNumber:{type:String,default:""},
+  // Stock ageing rules configured by the company Superadmin.
+  stockOverdueDays:{type:Number,default:60,min:1,max:3650},
+  deadStockDays:{type:Number,default:180,min:1,max:3650},
   hasMultipleBranches:{type:Boolean,default:false},
   branchCount:{type:Number,default:1,min:1},
   planCode:{type:String,index:true},
@@ -788,6 +791,14 @@ const productSchema = new Schema({
   unit: { type: String, default: "PCS" },
   openingStock: { type: Number, default: 0 },
   openingRate: { type: Number, default: 0 },
+  // Historical FY opening support used by Stock Reports.  If an exact FY
+  // opening exists it wins; otherwise the report carries the previous FY closing.
+  openingFinancialYear: { type: String, default: "" },
+  financialYearOpeningStock: { type: Number },
+  financialYearOpeningRate: { type: Number },
+  openingStockByFY: { type: Schema.Types.Mixed },
+  openingStocks: { type: Schema.Types.Mixed },
+  financialYearOpenings: { type: Schema.Types.Mixed },
   currentStock: { type: Number, default: 0 },
   // Quantity committed to verified sales orders but not yet invoiced. Available-to-Promise = currentStock - reservedStock.
   reservedStock: { type: Number, default: 0, min: 0 },
@@ -823,6 +834,7 @@ const productSchema = new Schema({
   status: { type: String, default: "ACTIVE" }
 }, { timestamps: true });
 productSchema.index({ tenantKey: 1, sku: 1 }, { unique: true });
+productSchema.index({ tenantKey: 1, status: 1, warehouseId: 1, category: 1, subCategory: 1 });
 
 const transporterSchema = new Schema({
   tenantKey: { type: String, required: true, index: true },

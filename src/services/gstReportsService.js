@@ -277,6 +277,194 @@ export async function buildTaxReport({ tenantKey, financialYear, startDate, endD
   return {report:"TAX",financialYear,generatedAt:new Date(),rows:[{totalTaxInput:r2(io.totals.totalInput),totalTaxOut:r2(io.totals.totalOutput),BalanceTax:r2(io.totals.availableGST)}]};
 }
 
+function annualRange(financialYear) {
+  const y = Number(String(financialYear || "").slice(0, 4));
+  if (!Number.isFinite(y) || y < 2017) throw Object.assign(new Error("Invalid financial year"), { statusCode: 400 });
+  return { startDate: `${y}-04-01`, endDate: `${y + 1}-03-31` };
+}
+
+function addTax(target, taxable = 0, cgst = 0, sgst = 0, igst = 0, invoiceValue = 0) {
+  target.taxableValue = r2(N(target.taxableValue) + N(taxable));
+  target.cgst = r2(N(target.cgst) + N(cgst));
+  target.sgst = r2(N(target.sgst) + N(sgst));
+  target.igst = r2(N(target.igst) + N(igst));
+  target.totalTax = r2(N(target.cgst) + N(target.sgst) + N(target.igst));
+  target.invoiceValue = r2(N(target.invoiceValue) + N(invoiceValue));
+  return target;
+}
+
+function mergeHsnRows(target, rows = []) {
+  for (const row of rows) {
+    const key = `${text(row.HSN_Code) || "-"}|${N(row.gstPercentage)}|${text(row.uqc)}`;
+    const prev = target.get(key) || {
+      HSN_Code: text(row.HSN_Code) || "-", Product_Desc: text(row.Product_Desc), uqc: text(row.uqc), gstPercentage: r2(row.gstPercentage),
+      qty: 0, taxableAmount: 0, cgstAmt: 0, sgstAmt: 0, igstAmt: 0, cessAmount: 0, grandTotal: 0,
+    };
+    for (const k of ["qty","taxableAmount","cgstAmt","sgstAmt","igstAmt","cessAmount","grandTotal"]) prev[k] = r2(N(prev[k]) + N(row[k]));
+    target.set(key, prev);
+  }
+}
+
+function reconRow(particular, sourceA, sourceB, sourceALabel = "Books", sourceBLabel = "GST Report") {
+  const a = r2(sourceA), b = r2(sourceB), difference = r2(a - b);
+  return { particular, sourceALabel, sourceA:a, sourceBLabel, sourceB:b, difference, status: Math.abs(difference) <= 0.01 ? "MATCH" : "REVIEW" };
+}
+
+export async function buildGstr9({ tenantKey, financialYear }) {
+  const { startDate, endDate } = annualRange(financialYear);
+  const ctx = await context(tenantKey, financialYear, startDate, endDate);
+  const outward = {
+    b2b: { particular: "4A/4B - Registered taxable outward supplies", taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 },
+    b2c: { particular: "4A/4B - Unregistered taxable outward supplies", taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 },
+    zero: { particular: "5 - Zero/Nil rated outward supplies (0% rate in books)", taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 },
+  };
+  const salesBooks = { taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 };
+  const outwardHsn = new Map();
+  for (const inv of ctx.sales) {
+    const party = partyMeta(inv, ctx.linkMap, "sales");
+    const inter = isInterState({ company: ctx.company, party, explicitGstType: inv.gstType });
+    const groups = allocateByRate(inv, inter);
+    const totals = invoiceTotalsFromRateGroups(groups, inv);
+    addTax(salesBooks, totals.taxable, totals.cgst, totals.sgst, totals.igst, inv.grandTotal);
+    let invoiceValueAllocated = false;
+    for (const group of groups) {
+      const bucket = N(group.rate) === 0 ? outward.zero : (party.registered ? outward.b2b : outward.b2c);
+      addTax(bucket, group.taxable, group.cgst, group.sgst, group.igst, invoiceValueAllocated ? 0 : inv.grandTotal);
+      invoiceValueAllocated = true;
+    }
+    mergeHsnRows(outwardHsn, hsnBucketForInvoice(inv, party, ctx.company, "sales"));
+  }
+
+  const notes = await creditDebitNotes(tenantKey, startDate, endDate, ctx.linkMap, ctx.company);
+  const noteRows = notes.map((note) => {
+    const tax = r2(N(note.taxableValue) * N(note.rate) / 100);
+    const sign = upper(note.noteType) === "C" ? -1 : 1;
+    const igst = note.isInterState ? r2(tax * sign) : 0;
+    const cgst = note.isInterState ? 0 : r2((tax / 2) * sign);
+    const sgst = note.isInterState ? 0 : r2((tax - tax / 2) * sign);
+    return {
+      noteType: upper(note.noteType) === "C" ? "CREDIT NOTE" : "DEBIT NOTE", noteNumber: note.noteNumber, noteDate: note.noteDate,
+      partyName: note.receiverName, taxableValue: r2(N(note.taxableValue) * sign), cgst, sgst, igst, totalTax: r2(cgst + sgst + igst), noteValue: r2(N(note.noteValue) * sign),
+    };
+  });
+  const noteTotals = noteRows.reduce((a, row) => addTax(a, row.taxableValue, row.cgst, row.sgst, row.igst, row.noteValue), { taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 });
+
+  const purchaseBooks = { taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 };
+  const gstr2bLike = { taxableValue:0,cgst:0,sgst:0,igst:0,totalTax:0,invoiceValue:0 };
+  const inwardHsn = new Map();
+  for (const inv of ctx.purchases) {
+    const party = partyMeta(inv, ctx.linkMap, "purchase");
+    const groups = allocateByRate(inv, isInterState({ company: ctx.company, party }));
+    const totals = invoiceTotalsFromRateGroups(groups, inv);
+    addTax(purchaseBooks, totals.taxable, totals.cgst, totals.sgst, totals.igst, inv.grandTotal);
+    if (party.registered) addTax(gstr2bLike, totals.taxable, totals.cgst, totals.sgst, totals.igst, inv.grandTotal);
+    mergeHsnRows(inwardHsn, hsnBucketForInvoice(inv, party, ctx.company, "purchase"));
+  }
+
+  const netTaxableTurnover = r2(salesBooks.taxableValue + noteTotals.taxableValue);
+  const outputCgst = r2(salesBooks.cgst + noteTotals.cgst);
+  const outputSgst = r2(salesBooks.sgst + noteTotals.sgst);
+  const outputIgst = r2(salesBooks.igst + noteTotals.igst);
+  const outputTax = r2(outputCgst + outputSgst + outputIgst);
+  const purchaseItc = r2(purchaseBooks.cgst + purchaseBooks.sgst + purchaseBooks.igst);
+  const twoBItc = r2(gstr2bLike.cgst + gstr2bLike.sgst + gstr2bLike.igst);
+
+  const sections = {
+    "Outward Supplies": [outward.b2b, outward.b2c, outward.zero, {
+      particular: "TOTAL OUTWARD SUPPLIES", taxableValue: netTaxableTurnover, cgst: outputCgst, sgst: outputSgst, igst: outputIgst,
+      totalTax: outputTax, invoiceValue: r2(salesBooks.invoiceValue + noteTotals.invoiceValue),
+    }],
+    "Credit Debit Notes": noteRows,
+    "ITC Summary": [
+      { particular: "Purchase books input tax", taxableValue: purchaseBooks.taxableValue, cgst: purchaseBooks.cgst, sgst: purchaseBooks.sgst, igst: purchaseBooks.igst, totalTax: purchaseItc },
+      { particular: "GSTR-2B-like eligible registered purchases", taxableValue: gstr2bLike.taxableValue, cgst: gstr2bLike.cgst, sgst: gstr2bLike.sgst, igst: gstr2bLike.igst, totalTax: twoBItc },
+      { particular: "ITC difference requiring review", taxableValue: r2(purchaseBooks.taxableValue-gstr2bLike.taxableValue), cgst:r2(purchaseBooks.cgst-gstr2bLike.cgst), sgst:r2(purchaseBooks.sgst-gstr2bLike.sgst), igst:r2(purchaseBooks.igst-gstr2bLike.igst), totalTax:r2(purchaseItc-twoBItc) },
+    ],
+    "Tax Liability": [
+      { taxType:"CGST", liability:outputCgst }, { taxType:"SGST", liability:outputSgst }, { taxType:"IGST", liability:outputIgst }, { taxType:"TOTAL", liability:outputTax },
+    ],
+    "HSN Outward": Array.from(outwardHsn.values()).sort((a,b)=>String(a.HSN_Code).localeCompare(String(b.HSN_Code))||N(a.gstPercentage)-N(b.gstPercentage)),
+    "HSN Inward": Array.from(inwardHsn.values()).sort((a,b)=>String(a.HSN_Code).localeCompare(String(b.HSN_Code))||N(a.gstPercentage)-N(b.gstPercentage)),
+    "Annual Reconciliation": [
+      reconRow("Taxable turnover", salesBooks.taxableValue, netTaxableTurnover, "Sales Books", "GSTR-9"),
+      reconRow("CGST output", salesBooks.cgst, outputCgst, "Sales Books", "GSTR-9"),
+      reconRow("SGST output", salesBooks.sgst, outputSgst, "Sales Books", "GSTR-9"),
+      reconRow("IGST output", salesBooks.igst, outputIgst, "Sales Books", "GSTR-9"),
+      reconRow("Input tax / ITC", purchaseItc, twoBItc, "Purchase Books", "GSTR-2B"),
+    ],
+  };
+  return {
+    report:"GSTR9", financialYear, generatedAt:new Date(), period:{startDate,endDate},
+    company:{gstin:text(ctx.company?.gstin), legalName:text(ctx.company?.companyName), tradeName:text(ctx.company?.tradeName)},
+    summary:{ salesInvoiceCount:ctx.sales.length, purchaseInvoiceCount:ctx.purchases.length, invoiceValue:salesBooks.invoiceValue, taxableTurnover:netTaxableTurnover, cgst:outputCgst, sgst:outputSgst, igst:outputIgst, outputTax, purchaseBooksITC:purchaseItc, gstr2bITC:twoBItc, itcDifference:r2(purchaseItc-twoBItc) },
+    sections,
+    reviewNotes:[
+      "This report is generated from V2 books for annual reconciliation and filing preparation.",
+      "ITC reversal/reclaim and tax-payment/challan details require dedicated source records before they can be auto-populated as filed values.",
+    ],
+  };
+}
+
+async function ledgerTaxBooks({ tenantKey, financialYear, startDate, endDate }) {
+  const { LedgerEntry } = financialModels(tenantKey, financialYear);
+  const dq = dateQuery(startDate, endDate);
+  const base = { tenantKey, financialYear, status:"POSTED", ...(dq ? { date:dq } : {}) };
+  const rows = await LedgerEntry.aggregate([
+    { $match: { ...base, $or:[
+      { accountCode:"SYS_SALES", transactionType:{ $in:["SALES_INVOICE","SALES_CREDIT_NOTE"] } },
+      { accountCode:"SYS_DUTIES_TAXES", transactionType:{ $in:["SALES_INVOICE","SALES_CREDIT_NOTE","PURCHASE_INVOICE","PURCHASE_DEBIT_NOTE"] } },
+    ] } },
+    { $group:{ _id:{ accountCode:"$accountCode", transactionType:"$transactionType" }, debit:{ $sum:{ $ifNull:["$debit",0] } }, credit:{ $sum:{ $ifNull:["$credit",0] } } } },
+  ]);
+  const value = (accountCode, types, side="credit") => r2(rows.filter(x=>x._id.accountCode===accountCode && types.includes(x._id.transactionType)).reduce((s,x)=>s + (side==="credit" ? N(x.credit)-N(x.debit) : N(x.debit)-N(x.credit)),0));
+  return {
+    salesTurnover:value("SYS_SALES",["SALES_INVOICE","SALES_CREDIT_NOTE"],"credit"),
+    outputTax:value("SYS_DUTIES_TAXES",["SALES_INVOICE","SALES_CREDIT_NOTE"],"credit"),
+    inputTax:value("SYS_DUTIES_TAXES",["PURCHASE_INVOICE","PURCHASE_DEBIT_NOTE"],"debit"),
+  };
+}
+
+export async function buildGstr9c({ tenantKey, financialYear }) {
+  const { startDate, endDate } = annualRange(financialYear);
+  const [g9, books] = await Promise.all([
+    buildGstr9({ tenantKey, financialYear }),
+    ledgerTaxBooks({ tenantKey, financialYear, startDate, endDate }),
+  ]);
+  const turnoverDifference = r2(g9.summary.taxableTurnover - books.salesTurnover);
+  const taxDifference = r2(g9.summary.outputTax - books.outputTax);
+  const itcDifference = r2(g9.summary.gstr2bITC - books.inputTax);
+  const statusOf = (v) => Math.abs(N(v)) <= 0.01 ? "MATCH" : "REVIEW";
+  const sections = {
+    "Turnover Reconciliation": [
+      { particular:"Taxable turnover", books:books.salesTurnover, gstr9:g9.summary.taxableTurnover, difference:turnoverDifference, status:statusOf(turnoverDifference) },
+    ],
+    "Tax Reconciliation": [
+      { particular:"Output tax liability", books:books.outputTax, gstr9:g9.summary.outputTax, difference:taxDifference, status:statusOf(taxDifference) },
+      { particular:"CGST as per GSTR-9", books:g9.summary.cgst, gstr9:g9.summary.cgst, difference:0, status:"MATCH" },
+      { particular:"SGST as per GSTR-9", books:g9.summary.sgst, gstr9:g9.summary.sgst, difference:0, status:"MATCH" },
+      { particular:"IGST as per GSTR-9", books:g9.summary.igst, gstr9:g9.summary.igst, difference:0, status:"MATCH" },
+    ],
+    "ITC Reconciliation": [
+      { particular:"Input tax in purchase ledger vs GSTR-2B-like ITC", books:books.inputTax, gstr9:g9.summary.gstr2bITC, difference:itcDifference, status:statusOf(itcDifference) },
+      { particular:"Purchase books ITC vs GSTR-2B-like ITC", books:g9.summary.purchaseBooksITC, gstr9:g9.summary.gstr2bITC, difference:g9.summary.itcDifference, status:statusOf(g9.summary.itcDifference) },
+    ],
+    "Review Items": [
+      { area:"Turnover", difference:turnoverDifference, status:statusOf(turnoverDifference) },
+      { area:"Tax Liability", difference:taxDifference, status:statusOf(taxDifference) },
+      { area:"ITC", difference:itcDifference, status:statusOf(itcDifference) },
+    ],
+  };
+  return {
+    report:"GSTR9C", financialYear, generatedAt:new Date(), period:{startDate,endDate}, company:g9.company,
+    summary:{ booksTurnover:books.salesTurnover, gstr9Turnover:g9.summary.taxableTurnover, turnoverDifference, booksOutputTax:books.outputTax, gstr9OutputTax:g9.summary.outputTax, taxDifference, booksInputTax:books.inputTax, gstr2bITC:g9.summary.gstr2bITC, itcDifference, overallStatus:[turnoverDifference,taxDifference,itcDifference].every(x=>Math.abs(N(x))<=0.01)?"MATCH":"REVIEW" },
+    sections,
+    reviewNotes:[
+      "GSTR-9C is presented as an internal reconciliation between posted V2 ledgers and the annual GSTR-9 report.",
+      "Manual statutory adjustments (for example unbilled revenue, advances, valuation/foreign-exchange adjustments) are not invented by the system; differences remain visible for review.",
+    ],
+  };
+}
+
 export async function buildGstReport(kind,args){
   const key=upper(kind).replace(/[^A-Z0-9]/g,"");
   if(key==="GSTR1")return buildGstr1(args);
@@ -285,5 +473,7 @@ export async function buildGstReport(kind,args){
   if(key==="HSN"||key==="HSNWISE")return buildHsnReport(args);
   if(key==="INPUTOUTPUT"||key==="GSTINPUTOUTPUT")return buildInputOutput(args);
   if(key==="TAX")return buildTaxReport(args);
+  if(key==="GSTR9")return buildGstr9(args);
+  if(key==="GSTR9C")return buildGstr9c(args);
   throw Object.assign(new Error("Unknown GST report"),{statusCode:404});
 }

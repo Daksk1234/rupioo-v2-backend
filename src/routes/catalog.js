@@ -135,18 +135,25 @@ router.get("/old-dms-price-list/products", async (req, res) => {
     const averageSaleRate = Number(saleHistory?.averageRate || 0);
     const averagePurchaseRate = Number(purchaseHistory?.averageRate || 0);
     const fallbackPurchase = purchaseRateOf(product);
-    const saleRate = averageSaleRate > 0 ? averageSaleRate : Number(product.salePrice || 0);
     const purchaseRate = averagePurchaseRate > 0 ? averagePurchaseRate : fallbackPurchase;
-    const automaticProfit = purchaseRate > 0 && saleRate > 0
-      ? actualProfitPct({ cost: purchaseRate, saleRate })
+    const configuredProfit = Math.max(3, Number(product.profitPercentage || product.minimumProfitPct || 3));
+    // IMPORTANT: Profit is applied to the SALE RATE, not to Average Purchase.
+    // Formula requested for the price list:
+    // Sales Rate Including Profit = Sale Rate + (Sale Rate * Profit % / 100).
+    const baseSaleRate = averageSaleRate > 0 ? averageSaleRate : Number(product.salePrice || 0);
+    const saleRateIncludingProfit = baseSaleRate > 0
+      ? round2(baseSaleRate + (baseSaleRate * configuredProfit / 100))
+      : 0;
+    const actualProfit = purchaseRate > 0 && saleRateIncludingProfit > 0
+      ? actualProfitPct({ cost: purchaseRate, saleRate: saleRateIncludingProfit })
       : 0;
     const priced = priceFromOldDmsLogic(
-      product,
+      { ...product, salePrice: saleRateIncludingProfit, profitPercentage: configuredProfit },
       maxDiscount,
       {
         costOverride: purchaseRate,
-        saleRateOverride: saleRate,
-        profitOverride: automaticProfit,
+        saleRateOverride: saleRateIncludingProfit,
+        profitOverride: configuredProfit,
       },
     );
 
@@ -156,18 +163,20 @@ router.get("/old-dms-price-list/products", async (req, res) => {
       purchaseRate,
       priceCostBase: purchaseRate,
       averagePurchaseRate: round2(purchaseRate),
-      averageSaleRate: round2(saleRate),
+      averageSaleRate: round2(baseSaleRate),
+      saleRateIncludingProfit: round2(saleRateIncludingProfit),
       purchaseObservations: Number(purchaseHistory?.observations || 0),
       saleObservations: Number(saleHistory?.observations || 0),
-      profitPercentage: round2(automaticProfit),
-      salePrice: round2(saleRate),
+      profitPercentage: round2(configuredProfit),
+      actualProfitPercentage: round2(actualProfit),
+      salePrice: round2(baseSaleRate),
       maxGradeDiscountPct: priced.maxGradeDiscountPct,
       gradeLoading: priced.gradeLoading,
       gstRate: priced.gstRate,
       mrp: priced.mrp,
-      lossStatus: saleRate > 0 && purchaseRate > 0 && saleRate < purchaseRate,
-      belowMinimum: saleRate > 0 && purchaseRate > 0 && saleRate < round2(purchaseRate * 1.03),
-      profitColorCode: profitColor(automaticProfit),
+      lossStatus: saleRateIncludingProfit > 0 && purchaseRate > 0 && saleRateIncludingProfit < purchaseRate,
+      belowMinimum: configuredProfit < 3,
+      profitColorCode: profitColor(configuredProfit),
       pricingSource: averageSaleRate > 0 || averagePurchaseRate > 0 ? "HISTORICAL_AVERAGE" : "PRODUCT_MASTER",
     };
   });
@@ -175,15 +184,15 @@ router.get("/old-dms-price-list/products", async (req, res) => {
   const admin = isAdminAuth(req.auth);
   const safeItems = admin
     ? items
-    : items.map(({ profitPercentage, profitColorCode, lossStatus, belowMinimum, ...item }) => item);
+    : items.map(({ actualProfitPercentage, profitColorCode, lossStatus, belowMinimum, ...item }) => item);
   return ok(res, {
     items: safeItems,
     maxDiscount,
     financialYear,
     meta: pageMeta(page, limit, total),
     ...(admin ? {
-      formula: "Profit % = (Average Sale Rate - Average Purchase Rate) / Average Purchase Rate × 100",
-      averageMethod: "Simple arithmetic mean of posted invoice line rates; each invoice line is one observation.",
+      formula: "Sales Rate Including Profit = Sale Rate + (Sale Rate × Profit %). Minimum Profit % is 3%.",
+      averageMethod: "Average Purchase is the simple arithmetic mean of posted purchase invoice line effective rates for the selected FY.",
     } : {}),
   });
 });
@@ -192,49 +201,67 @@ router.put("/old-dms-price-list/products", async (req, res) => {
   const rows = Array.isArray(req.body?.Products) ? req.body.Products : [];
   if (!rows.length) return fail(res, "Products are required", 400);
   const maxDiscount = await getMaxActiveGradeDiscount(req.auth.tenantKey);
+  const financialYear = cleanText(req.body?.financialYear) || currentFinancialYear();
   const ids = rows.map((row) => row?.id).filter(Boolean);
   const products = await Product.find({ tenantKey: req.auth.tenantKey, _id: { $in: ids } }).lean();
   const map = new Map(products.map((p) => [String(p._id), p]));
+  let purchaseHistory = new Map();
+  let saleHistory = new Map();
+  try {
+    const history = await historicalAverageRates({
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      productIds: products.map((product) => String(product._id)),
+    });
+    purchaseHistory = history.purchases;
+    saleHistory = history.sales;
+  } catch (error) {
+    console.error("price list profit update average-rate lookup failed:", error?.message || error);
+  }
   const ops = [];
 
   for (const row of rows) {
     const product = map.get(String(row?.id || ""));
     if (!product) continue;
-    const cost = costBaseOf(product);
+    const historicalPurchase = Number(purchaseHistory.get(String(product._id))?.averageRate || 0);
+    const historicalSale = Number(saleHistory.get(String(product._id))?.averageRate || 0);
+    const cost = historicalPurchase > 0 ? historicalPurchase : costBaseOf(product);
     let profitPercentage = Number(row.profitPercentage);
-    let saleRate = Number(row.salePrice ?? row.SalesRate);
+    let baseSaleRate = Number(row.salePrice ?? row.SalesRate);
+    let updateBaseSaleRate = false;
 
-    if (row.changedField === "salePrice" && Number.isFinite(saleRate) && saleRate > 0) {
-      const minimum = round2(cost * 1.03);
-      if (cost > 0 && saleRate < minimum) {
-        return fail(res, `${product.name}: Sales Rate cannot be below cost + 3% (minimum ${minimum})`, 400);
-      }
-      profitPercentage = Math.max(3, actualProfitPct({ cost, saleRate }));
-    } else if (Number.isFinite(profitPercentage) && row.profitPercentage !== "") {
-      profitPercentage = Math.max(3, profitPercentage);
-      saleRate = round2(cost * (1 + profitPercentage / 100));
-    } else if (Number.isFinite(saleRate) && saleRate > 0) {
-      const minimum = round2(cost * 1.03);
-      if (cost > 0 && saleRate < minimum) {
-        return fail(res, `${product.name}: Sales Rate cannot be below cost + 3% (minimum ₹${minimum.toFixed(2)})`, 409);
-      }
-      profitPercentage = Math.max(3, actualProfitPct({ cost, saleRate }));
-    } else {
+    if (row.changedField === "salePrice" && Number.isFinite(baseSaleRate) && baseSaleRate > 0) {
+      updateBaseSaleRate = true;
       profitPercentage = Math.max(3, Number(product.profitPercentage || product.minimumProfitPct || 3));
-      saleRate = round2(cost * (1 + profitPercentage / 100));
+    } else {
+      // Profit % edits never replace the base Sale Rate.
+      // Prefer the selected FY historical Sale Rate; otherwise use Product.salePrice.
+      baseSaleRate = historicalSale > 0 ? historicalSale : Number(product.salePrice || 0);
+      profitPercentage = Number.isFinite(profitPercentage) && row.profitPercentage !== ""
+        ? Math.max(3, profitPercentage)
+        : Math.max(3, Number(product.profitPercentage || product.minimumProfitPct || 3));
     }
 
-    const priced = priceFromOldDmsLogic({ ...product, salePrice: saleRate, profitPercentage }, maxDiscount);
+    const saleRateIncludingProfit = baseSaleRate > 0
+      ? round2(baseSaleRate + (baseSaleRate * profitPercentage / 100))
+      : 0;
+
+    const priced = priceFromOldDmsLogic(
+      { ...product, salePrice: saleRateIncludingProfit, profitPercentage },
+      maxDiscount,
+      { costOverride: cost, saleRateOverride: saleRateIncludingProfit, profitOverride: profitPercentage },
+    );
+    const setValues = {
+      profitPercentage: priced.profitPercentage,
+      mrp: priced.mrp,
+      maxGradeDiscountPct: priced.maxGradeDiscountPct,
+      profitColorCode: profitColor(priced.profitPercentage),
+    };
+    if (updateBaseSaleRate) setValues.salePrice = round2(baseSaleRate);
     ops.push({
       updateOne: {
         filter: { _id: product._id, tenantKey: req.auth.tenantKey },
-        update: { $set: {
-          profitPercentage: priced.profitPercentage,
-          salePrice: priced.saleRate,
-          mrp: priced.mrp,
-          maxGradeDiscountPct: priced.maxGradeDiscountPct,
-          profitColorCode: profitColor(priced.profitPercentage),
-        } },
+        update: { $set: setValues },
       },
     });
   }
@@ -257,10 +284,17 @@ router.post("/old-dms-price-list/apply-profit", async (req, res) => {
     const current = Number(product.profitPercentage || product.minimumProfitPct || 3);
     if (current > threshold) continue;
     const cost = costBaseOf(product);
-    const saleRate = round2(cost * (1 + threshold / 100));
-    const priced = priceFromOldDmsLogic({ ...product, salePrice: saleRate, profitPercentage: threshold }, maxDiscount);
+    const baseSaleRate = Number(product.salePrice || 0);
+    const saleRateIncludingProfit = baseSaleRate > 0
+      ? round2(baseSaleRate + (baseSaleRate * threshold / 100))
+      : 0;
+    const priced = priceFromOldDmsLogic(
+      { ...product, salePrice: saleRateIncludingProfit, profitPercentage: threshold },
+      maxDiscount,
+      { costOverride: cost, saleRateOverride: saleRateIncludingProfit, profitOverride: threshold },
+    );
     ops.push({ updateOne: { filter: { _id: product._id, tenantKey: req.auth.tenantKey }, update: { $set: {
-      profitPercentage: priced.profitPercentage, salePrice: priced.saleRate, mrp: priced.mrp,
+      profitPercentage: priced.profitPercentage, mrp: priced.mrp,
       maxGradeDiscountPct: priced.maxGradeDiscountPct, profitColorCode: profitColor(priced.profitPercentage),
     } } } });
   }

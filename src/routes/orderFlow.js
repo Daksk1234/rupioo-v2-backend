@@ -426,6 +426,49 @@ router.get("/orders/:id", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
+router.delete("/orders/:id", async (req, res) => {
+  try {
+    const financialYear = await getFy(req);
+    const models = financialModels(req.auth.tenantKey, financialYear);
+    const order = await requireOrder(req, req.params.id, models);
+    const orderId = String(order._id);
+    const orderNo = order.orderNo;
+
+    // Deleting an order is a true hard delete. First release any stock still
+    // reserved by the order so Product.reservedStock does not become orphaned.
+    const releasedQty = await releaseOrderReservation(
+      order,
+      req.auth.tenantKey,
+      "Sales order permanently deleted",
+    );
+
+    // Remove order-only workflow history/notifications and detach the order from
+    // any delivery run. Posted invoices / credit notes remain independent records.
+    await Promise.all([
+      models.OrderEvent.deleteMany({ tenantKey: req.auth.tenantKey, financialYear, orderId }),
+      models.OrderNotification.deleteMany({ tenantKey: req.auth.tenantKey, financialYear, orderId }),
+      models.DeliveryRun.updateMany(
+        { tenantKey: req.auth.tenantKey, financialYear, "stops.orderId": orderId },
+        { $pull: { stops: { orderId } } },
+      ),
+    ]);
+
+    await models.SalesOrder.deleteOne({
+      _id: order._id,
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+    });
+
+    return ok(
+      res,
+      { _id: orderId, orderNo, deleted: true, hardDeleted: true, releasedReservedQty: releasedQty },
+      "Sales order permanently deleted from database",
+    );
+  } catch (error) {
+    return fail(res, error.message, error.statusCode || 500);
+  }
+});
+
 router.get("/orders/:id/invoice-draft", async (req, res) => {
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
@@ -444,6 +487,7 @@ router.get("/orders/:id/invoice-draft", async (req, res) => {
       financialYear,
       orderId: String(order._id), orderNo: order.orderNo,
       customerGlobalId: order.customerGlobalId, customerName: order.customerNameSnapshot,
+      warehouseId: clean(order.warehouseId), warehouseName: clean(order.warehouseNameSnapshot),
       packageCount: num(order.packing?.packageCount), actualWeight: num(order.packing?.actualWeight),
       items,
     });

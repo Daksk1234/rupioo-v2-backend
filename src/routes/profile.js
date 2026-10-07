@@ -1,16 +1,57 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 import { CompanyProfile, Group, Plan, PlatformPayment, User } from "../models/index.js";
+import { MailConnection } from "../models/mailConnection.model.js";
 import { requireAuth } from "../middleware/auth.js";
 import { fail, ok } from "../utils/http.js";
 import { subscriptionSnapshot } from "../utils/subscription.js";
 import { gstChangeConfirmation, migrateCompanyTenantKey, normalizeCompanyGstin, validateGstinChangeTarget } from "../services/tenantMigrationService.js";
+import { encryptSecret } from "../services/mail/crypto.js";
+import { verifySmtpConnection } from "../services/mail/smtpMail.service.js";
+import { detectMailProvider, isValidEmail } from "../services/mail/providerDetection.service.js";
 
 const router = express.Router();
 router.use(requireAuth);
 
 const clean = (value) => String(value ?? "").trim();
 const lower = (value) => clean(value).toLowerCase();
+
+async function smtpPresetForEmail(email, body = {}) {
+  const requestedHost = clean(body.smtpHost);
+  const requestedPort = Number(body.smtpPort || 0);
+  if (requestedHost) {
+    const port = requestedPort > 0 ? requestedPort : 587;
+    return {
+      host: requestedHost,
+      port,
+      secure: body.smtpSecure === true || String(body.smtpSecure || "").toLowerCase() === "true" || port === 465,
+      detectedProvider: "custom",
+    };
+  }
+
+  const domain = String(email.split("@")[1] || "").toLowerCase();
+  if (["yahoo.com", "ymail.com"].includes(domain)) {
+    return { host: "smtp.mail.yahoo.com", port: 465, secure: true, detectedProvider: "yahoo" };
+  }
+  if (["icloud.com", "me.com", "mac.com"].includes(domain)) {
+    return { host: "smtp.mail.me.com", port: 587, secure: false, detectedProvider: "icloud" };
+  }
+
+  const detected = await detectMailProvider(email);
+  if (detected.provider === "google") {
+    return { host: "smtp.gmail.com", port: 465, secure: true, detectedProvider: "google" };
+  }
+  if (detected.provider === "microsoft") {
+    return { host: "smtp.office365.com", port: 587, secure: false, detectedProvider: "microsoft" };
+  }
+  if (/hostinger/i.test(String(detected.reason || ""))) {
+    return { host: "smtp.hostinger.com", port: 465, secure: true, detectedProvider: "hostinger" };
+  }
+
+  const error = new Error("Could not determine the SMTP server for this email. Enter SMTP Host in Advanced App Password settings.");
+  error.statusCode = 400;
+  throw error;
+}
 
 function assertSuperadmin(req, res) {
   if (req.auth?.role !== "SUPERADMIN") {
@@ -50,6 +91,9 @@ async function loadProfile(req) {
   ]);
 
   const subscription = subscriptionSnapshot(company);
+  const mailConnection = await MailConnection.findOne({ database: company.tenantKey })
+    .select("email provider authMode status smtpHost smtpPort smtpSecure smtpUser encryptedSmtpPassword lastHealthAt lastSuccessfulSendAt lastError")
+    .lean();
 
   return {
     user: {
@@ -69,6 +113,22 @@ async function loadProfile(req) {
       : null,
     subscription,
     payments,
+    mail: mailConnection
+      ? {
+          connected: mailConnection.status === "connected",
+          email: mailConnection.email || "",
+          provider: mailConnection.provider || "",
+          authMode: mailConnection.authMode || "",
+          status: mailConnection.status || "disconnected",
+          smtpHost: mailConnection.smtpHost || "",
+          smtpPort: Number(mailConnection.smtpPort || 0),
+          smtpSecure: Boolean(mailConnection.smtpSecure),
+          hasAppPassword: Boolean(mailConnection.encryptedSmtpPassword),
+          lastHealthAt: mailConnection.lastHealthAt || null,
+          lastSuccessfulSendAt: mailConnection.lastSuccessfulSendAt || null,
+          lastError: mailConnection.lastError || "",
+        }
+      : { connected: false, status: "disconnected", hasAppPassword: false },
   };
 }
 
@@ -127,7 +187,14 @@ router.put("/", async (req, res) => {
     if (req.body[key] !== undefined) company[key] = clean(req.body[key]);
   }
 
-
+  for (const [key, label] of [["stockOverdueDays", "Overdue days"], ["deadStockDays", "Dead stock days"]]) {
+    if (req.body[key] === undefined) continue;
+    const value = Math.trunc(Number(req.body[key]));
+    if (!Number.isFinite(value) || value < 1 || value > 3650) {
+      return fail(res, `${label} must be between 1 and 3650`, 400);
+    }
+    company[key] = value;
+  }
 
   if (req.body.bankDetails && typeof req.body.bankDetails === "object") {
     company.bankDetails = { ...(company.bankDetails?.toObject?.() || company.bankDetails || {}), ...req.body.bankDetails };
@@ -214,6 +281,86 @@ router.put("/", async (req, res) => {
     tenantKeyChanged: Boolean(tenantMigration?.changed),
     newTenantKey: tenantMigration?.newTenantKey || data?.company?.tenantKey || company.tenantKey,
   }, tenantMigration?.changed ? "GSTIN updated and company data moved to the new tenantKey" : "Superadmin profile updated");
+});
+
+router.post("/mail-app-password", async (req, res) => {
+  if (!assertSuperadmin(req, res)) return;
+  try {
+    const user = await User.findById(req.auth.sub).select("name email tenantKey").lean();
+    const company = await CompanyProfile.findOne({ tenantKey: req.auth.tenantKey })
+      .select("companyName tradeName tenantKey")
+      .lean();
+    if (!user || !company) return fail(res, "Superadmin/company profile not found", 404);
+
+    const email = lower(user.email);
+    if (!isValidEmail(email)) return fail(res, "Superadmin email is not valid", 400);
+    let appPassword = String(req.body.appPassword || "").trim();
+    if (!appPassword) return fail(res, "App Password is required", 400);
+
+    const preset = await smtpPresetForEmail(email, req.body || {});
+    if (preset.detectedProvider === "google") appPassword = appPassword.replace(/\s+/g, "");
+    if (appPassword.length < 6) return fail(res, "App Password is too short", 400);
+
+    const encryptedSmtpPassword = encryptSecret(appPassword);
+    const candidate = {
+      email,
+      smtpHost: preset.host,
+      smtpPort: preset.port,
+      smtpSecure: preset.secure,
+      smtpUser: email,
+      encryptedSmtpPassword,
+    };
+    // Verify BEFORE replacing an existing OAuth/SMTP connection so a mistyped
+    // App Password cannot break a working company mailbox.
+    await verifySmtpConnection(candidate);
+
+    await MailConnection.findOneAndUpdate(
+      { database: company.tenantKey },
+      {
+        $set: {
+          database: company.tenantKey,
+          superadminId: String(user._id),
+          email,
+          fromName: clean(company.tradeName || company.companyName || user.name || email),
+          provider: "smtp",
+          authMode: "smtp",
+          status: "connected",
+          smtpHost: preset.host,
+          smtpPort: preset.port,
+          smtpSecure: preset.secure,
+          smtpUser: email,
+          encryptedSmtpPassword,
+          encryptedRefreshToken: "",
+          encryptedAccessToken: "",
+          accessTokenExpiresAt: null,
+          needsUpgrade: false,
+          consentAccepted: true,
+          consentAcceptedAt: new Date(),
+          lastHealthAt: new Date(),
+          lastError: "",
+        },
+      },
+      { upsert: true, new: true },
+    );
+
+    const data = await loadProfile(req);
+    return ok(res, data, `App Password connected. Invoice email will be sent from ${email}.`);
+  } catch (error) {
+    return fail(res, error.message || "Unable to connect App Password", error.statusCode || 400);
+  }
+});
+
+router.delete("/mail-app-password", async (req, res) => {
+  if (!assertSuperadmin(req, res)) return;
+  await MailConnection.findOneAndUpdate(
+    { database: req.auth.tenantKey, authMode: { $in: ["smtp", "smtp_legacy"] } },
+    {
+      $set: { status: "disconnected", lastError: "App Password removed by Superadmin", lastErrorAt: new Date() },
+      $unset: { encryptedSmtpPassword: "" },
+    },
+  );
+  const data = await loadProfile(req);
+  return ok(res, data, "App Password removed");
 });
 
 router.post("/change-password", async (req, res) => {

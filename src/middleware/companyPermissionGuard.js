@@ -16,6 +16,11 @@ const actionForRequest = (req) => {
   // Personal working-sheet persistence does not post accounting/stock, so autosave
   // follows the same View ceiling as the Sales-with-Product page itself.
   if (path.startsWith("/transactions/sales-with-products/draft")) return "view";
+  // Sales Invoice workflow actions are POST requests, but they modify/distribute
+  // an existing invoice. Treat Delivery as Edit and Email as Download instead
+  // of incorrectly requiring Create permission.
+  if (/^\/transactions\/sales-invoices\/[^/]+\/process(?:\/|$)/i.test(path)) return "edit";
+  if (/^\/transactions\/sales-invoices\/[^/]+\/email(?:\/|$)/i.test(path)) return "download";
   if (method === "GET" || method === "HEAD") return "view";
   if (path.includes("bulk-upload")) return "create";
   if (path.includes("bulk-edit")) return "edit";
@@ -82,7 +87,12 @@ function mappedPageForApi(req) {
 }
 
 function reportKeysForName(name) {
-  return REPORT_PERMISSION_MAP[String(name || "").trim()] || [];
+  const raw = String(name || "").trim();
+  if (!raw) return [];
+  if (REPORT_PERMISSION_MAP[raw]) return REPORT_PERMISSION_MAP[raw];
+  const wanted = raw.toLowerCase();
+  const match = Object.entries(REPORT_PERMISSION_MAP).find(([label]) => label.toLowerCase() === wanted);
+  return match?.[1] || [];
 }
 
 export function companyPermissionGuard(req, res, next) {
@@ -104,12 +114,13 @@ export function companyPermissionGuard(req, res, next) {
     return anyReport ? next() : fail(res, "No report permission assigned by your Plan Group", 403);
   }
 
-  if (path.startsWith("/reports/run")) {
+  if (path.startsWith("/reports/run") || path.startsWith("/reports/export.xlsx")) {
     const keys = reportKeysForName(req.query?.name);
     if (!keys.length) return fail(res, "This report is not included in the configured permission catalogue", 403);
-    return canScreenAction(permissions, keys, "view")
+    const action = path.startsWith("/reports/export.xlsx") ? "download" : "view";
+    return canScreenAction(permissions, keys, action)
       ? next()
-      : fail(res, `View permission required for ${req.query?.name || "report"}`, 403);
+      : fail(res, `${action === "download" ? "Download" : "View"} permission required for ${req.query?.name || "report"}`, 403);
   }
 
   const pagePath = mappedPageForApi(req);
@@ -118,6 +129,30 @@ export function companyPermissionGuard(req, res, next) {
   // Profit/margin configuration is sensitive management data, irrespective of page-group permissions.
   if (pagePath === "/dms/price-management" && !isAdminAuth(req.auth)) {
     return fail(res, "Price/profit management is restricted to Admin users", 403);
+  }
+
+  // Sales Invoice workflow endpoints accept more than one legitimate permission.
+  // Resolve those OR-rules here before the generic page/action check so the
+  // middleware cannot reject a request that the route itself is authorized to run.
+  const isSalesInvoiceProcess = /^\/transactions\/sales-invoices\/[^/]+\/process(?:\/|$)/i.test(path);
+  if (isSalesInvoiceProcess) {
+    const allowed =
+      canPageAction(permissions, "/dms/sales-invoices", "edit") ||
+      canPageAction(permissions, "/dms/dispatch", "edit");
+    return allowed
+      ? next()
+      : fail(res, "Edit permission required for Sales Invoice or Dispatch Details", 403);
+  }
+
+  const isSalesInvoiceEmail = /^\/transactions\/sales-invoices\/[^/]+\/email(?:\/|$)/i.test(path);
+  if (isSalesInvoiceEmail) {
+    const allowed =
+      canPageAction(permissions, "/dms/sales-invoices", "download") ||
+      canPageAction(permissions, "/dms/sales-invoices", "edit") ||
+      canPageAction(permissions, "/dms/dispatch", "edit");
+    return allowed
+      ? next()
+      : fail(res, "Download/Edit permission required to email this Sales Invoice", 403);
   }
 
   const action = actionForRequest(req);

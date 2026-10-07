@@ -39,8 +39,9 @@ import { requireAnyPermission } from "../middleware/permission.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
 import { env } from "../config/env.js";
 import { sendBusinessEmail } from "../services/mailService.js";
+import { sendCompanyMail } from "../services/mail/mail.service.js";
 import { buildMasterSalesInvoicePdf } from "../services/masterInvoicePdfService.js";
-import { readFile } from "../services/storageService.js";
+import { readFile, saveUploadedFile } from "../services/storageService.js";
 import {
   resolveCustomerDeliveryMode,
   resolveFirmDeliveryLocation,
@@ -58,7 +59,10 @@ import {
 import personalFinanceRoutes from "./personalFinance.js";
 import {
   allocateCashInvoiceNumber,
+  cashInvoiceNumberFromSerial,
   isSystemCashParty,
+  isRegisteredParty,
+  suffixForFinancialYear,
   nextCashInvoiceNumber,
   nextDocumentNoteNumber,
 } from "../services/documentNumberService.js";
@@ -92,10 +96,16 @@ for (const [pathKey, documentType] of Object.entries(
         tenantKey: req.auth.tenantKey,
         requested: req.query.financialYear,
       });
+      const partyGlobalId = cleanText(req.query.partyGlobalId || "");
+      const party = partyGlobalId ? await CustomerLink.findOne({
+        tenantKey: req.auth.tenantKey, globalCustomerId: partyGlobalId, status: "ACTIVE",
+      }).lean() : null;
+      if (partyGlobalId && !party) return fail(res, "Selected party not found", 404);
       const documentNo = await nextDocumentNoteNumber({
         tenantKey: req.auth.tenantKey,
         financialYear,
         type: documentType,
+        registered: party ? isRegisteredParty(party) : true,
       });
       return ok(res, { documentNo, financialYear });
     } catch (error) {
@@ -433,6 +443,7 @@ router.post(
             });
           continue;
         }
+        let createdVoucher = null;
         try {
           const date = transactionDate(body.date);
           const fy =
@@ -468,10 +479,11 @@ router.post(
               continue;
             }
             const mode = upper(body.mode || "BANK");
-            await models.Receipt.create({
+            createdVoucher = await models.Receipt.create({
               tenantKey: req.auth.tenantKey,
               financialYear: fy,
               receiptNo,
+              sourceKey: receiptNo,
               date,
               customerGlobalId: customer.globalCustomerId,
               partyNameSnapshot:
@@ -522,10 +534,11 @@ router.post(
               party,
             ]);
             const partyName = partyMap.get(party)?.name || party || "Party";
-            await models.Payment.create({
+            createdVoucher = await models.Payment.create({
               tenantKey: req.auth.tenantKey,
               financialYear: fy,
               paymentNo,
+              sourceKey: paymentNo,
               date,
               partyGlobalId: party,
               partyNameSnapshot: partyName,
@@ -596,6 +609,9 @@ router.post(
           }
           inserted++;
         } catch (e) {
+          if (createdVoucher && ["receipts", "payments"].includes(type)) {
+            await createdVoucher.deleteOne(); // never leave a voucher without its journal
+          }
           if (errors.length < 100)
             errors.push({ row: i + 2, error: e.message });
         }
@@ -717,21 +733,32 @@ router.post("/:type/bulk-delete", async (req, res, next) => {
 const floor2 = (n) => Math.floor((Number(n) || 0) * 100) / 100;
 const ceil2 = (n) => Math.ceil((Number(n) || 0) * 100) / 100;
 const round2 = (n) => Number((Number(n) || 0).toFixed(2));
-const saleFromMrpByGrade = (mrp, gradePct) =>
-  floor2(Number(mrp || 0) / (1 + Number(gradePct || 0) / 100));
 const basicFromSaleGst = (sale, gstPct) =>
   ceil2(Number(sale || 0) / (1 + Number(gstPct || 0) / 100));
+const saleFromBasicGst = (basic, gstPct) =>
+  round2(Number(basic || 0) * (1 + Number(gstPct || 0) / 100));
+const basicAfterGradeDiscount = (basic, gradePct) => {
+  const base = Math.max(0, Number(basic || 0));
+  const pct = Math.min(100, Math.max(0, Number(gradePct || 0)));
+  return floor2(base * (1 - pct / 100));
+};
 
 async function resolvedProductRate({ customer, product, row }) {
   const gradePct = Number(
     row.gradeDiscountPct ?? customer.gradeDiscountPct ?? 0,
   );
   let saleRate = Number(row.saleRate ?? 0);
-  if (!saleRate)
-    saleRate = saleFromMrpByGrade(
-      product.mrp || product.salePrice || 0,
-      gradePct,
-    );
+  if (!saleRate) {
+    const gstRate = Number(row.gstRate ?? product.gstRate ?? 0);
+    // Product.salePrice is the product's BASIC (ex-GST) sales rate in V2.
+    // Grade discount is a true percentage reduction from that Basic Rate.
+    // Example: Basic 100, Grade 10% => customer Basic 90 (not 90.91).
+    const baseBasic = Number(product.salePrice || 0) > 0
+      ? Number(product.salePrice)
+      : basicFromSaleGst(product.mrp || 0, gstRate);
+    const customerBasic = basicAfterGradeDiscount(baseBasic, gradePct);
+    saleRate = saleFromBasicGst(customerBasic, gstRate);
+  }
   return { saleRate, gradeDiscountPct: gradePct };
 }
 
@@ -741,14 +768,161 @@ function formatSalesInvoiceNumber(prefix, serial, suffix) {
     .join("-");
 }
 
-async function salesInvoiceSeries(tenantKey, { consume = false } = {}) {
-  let company = await CompanyProfile.findOne({ tenantKey });
+function salesInvoiceSerialText(serial, paddingWidth = 0) {
+  const value = String(Math.max(1, Math.trunc(Number(serial) || 1)));
+  return Number(paddingWidth || 0) > 0
+    ? value.padStart(Number(paddingWidth), "0")
+    : value;
+}
+
+async function latestSalesInvoicePadding(tenantKey, prefix, suffix) {
+  const years = await salesInvoiceSeriesFinancialYears(tenantKey, "");
+  let latest = null;
+  const before = `${prefix}-`;
+  const after = `-${suffix}`;
+  for (const fy of years) {
+    try {
+      const { SalesInvoice } = financialModels(tenantKey, fy);
+      // A small recent window is enough to recover the user's latest numbering style.
+      const rows = await SalesInvoice.find({
+        tenantKey,
+        invoiceNo: { $nin: [null, ""] },
+      })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .select("invoiceNo createdAt")
+        .lean();
+      for (const row of rows) {
+        const text = cleanText(row.invoiceNo);
+        if (!text.toLowerCase().startsWith(before.toLowerCase())) continue;
+        if (!text.toLowerCase().endsWith(after.toLowerCase())) continue;
+        const serialText = text.slice(before.length, text.length - after.length);
+        if (!/^\d+$/.test(serialText)) continue;
+        const createdAt = new Date(row.createdAt || 0).getTime();
+        if (!latest || createdAt > latest.createdAt) {
+          latest = { serialText, createdAt };
+        }
+        break;
+      }
+    } catch {
+      // An older FY DB may not exist. It should not block invoice numbering.
+    }
+  }
+  if (!latest?.serialText) return 0;
+  return /^0\d+$/.test(latest.serialText) ? latest.serialText.length : 0;
+}
+
+async function configuredSalesInvoiceNumberFromSerial(tenantKey, serialText, financialYear) {
+  const raw = cleanText(serialText);
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw Object.assign(
+      new Error("Invoice Number must contain digits only and be 1 or more"),
+      { statusCode: 400 },
+    );
+  }
+  const company = await CompanyProfile.findOne({ tenantKey })
+    .select("salesInvoicePrefix salesInvoiceSuffix")
+    .lean();
   if (!company)
     throw Object.assign(new Error("Company profile not found"), {
       statusCode: 404,
     });
-  const prefix = cleanText(company.salesInvoicePrefix),
-    suffix = cleanText(company.salesInvoiceSuffix);
+  const prefix = cleanText(company.salesInvoicePrefix);
+  const suffix = suffixForFinancialYear(company.salesInvoiceSuffix, financialYear);
+  if (!prefix || !suffix) {
+    throw Object.assign(
+      new Error(
+        "Complete Sales Invoice Prefix, Starting Number and Suffix in Super Admin Profile before creating invoices",
+      ),
+      { statusCode: 409 },
+    );
+  }
+  return {
+    invoiceNo: formatSalesInvoiceNumber(prefix, raw, suffix),
+    serial: Number(raw),
+    serialText: raw,
+    prefix,
+    suffix,
+  };
+}
+
+function invoiceSerialForInput(invoiceNo, prefix, suffix) {
+  const text = cleanText(invoiceNo);
+  if (!text) return "";
+  const regularBefore = `${cleanText(prefix)}-`;
+  const regularAfter = `-${cleanText(suffix)}`;
+  if (
+    text.toLowerCase().startsWith(regularBefore.toLowerCase()) &&
+    text.toLowerCase().endsWith(regularAfter.toLowerCase())
+  ) {
+    const middle = text.slice(
+      regularBefore.length,
+      text.length - regularAfter.length,
+    );
+    if (/^\d+$/.test(middle)) return middle;
+  }
+
+  // Unregistered invoices use PREFIX + C + NUMBER + SUFFIX.
+  const compactPrefix = cleanText(prefix).replace(/\s+/g, "");
+  const compactSuffix = cleanText(suffix).replace(/[^0-9A-Za-z]/g, "");
+  if (
+    compactPrefix &&
+    compactSuffix &&
+    text.toLowerCase().startsWith(`${compactPrefix}C`.toLowerCase()) &&
+    text.toLowerCase().endsWith(compactSuffix.toLowerCase())
+  ) {
+    const middle = text.slice(
+      compactPrefix.length + 1,
+      text.length - compactSuffix.length,
+    );
+    if (/^\d+$/.test(middle)) return middle;
+  }
+  return /^\d+$/.test(text) ? text : "";
+}
+
+async function registeredInvoiceRows(tenantKey, rows, prefix) {
+  const partyIds = [...new Set(rows.map((row) => cleanText(row.customerGlobalId)).filter(Boolean))];
+  const parties = partyIds.length ? await CustomerLink.find({
+    tenantKey, globalCustomerId: { $in: partyIds },
+  }).select("globalCustomerId gstin gstNumber displayIdentifier").lean() : [];
+  const partyById = new Map(parties.map((party) => [String(party.globalCustomerId), party]));
+  return rows.filter((row) => {
+    const number = cleanText(row.invoiceNo);
+    // The C marker always identifies the unregistered series, even if the
+    // party's GSTIN was edited after the original invoice was posted.
+    if (number.toLowerCase().startsWith(`${prefix}C`.toLowerCase()) &&
+        /^\d/.test(number.slice(prefix.length + 1))) return false;
+    if (isRegisteredParty({ gstin: row.gstinSnapshot })) return true;
+    const party = partyById.get(String(row.customerGlobalId || ""));
+    if (party) return isRegisteredParty(party);
+    // Preserve historical registered invoices whose party master was archived.
+    return number.toLowerCase().startsWith(`${prefix}-`.toLowerCase());
+  });
+}
+
+async function salesInvoiceSeries(
+  tenantKey,
+  financialYear,
+  { consume = false } = {},
+) {
+  const fy = cleanText(financialYear);
+  if (!/^\d{4}-\d{2}$/.test(fy)) {
+    throw Object.assign(new Error("A valid Financial Year is required for Sales Invoice numbering"), {
+      statusCode: 400,
+    });
+  }
+
+  const company = await CompanyProfile.findOne({ tenantKey })
+    .select("salesInvoicePrefix salesInvoiceSuffix salesInvoiceStartingNumber")
+    .lean();
+  if (!company) {
+    throw Object.assign(new Error("Company profile not found"), {
+      statusCode: 404,
+    });
+  }
+
+  const prefix = cleanText(company.salesInvoicePrefix);
+  const suffix = suffixForFinancialYear(company.salesInvoiceSuffix, fy);
   const start = Math.max(
     1,
     Math.trunc(Number(company.salesInvoiceStartingNumber || 1)),
@@ -761,55 +935,88 @@ async function salesInvoiceSeries(tenantKey, { consume = false } = {}) {
       { statusCode: 409 },
     );
   }
-  if (
-    !company.salesInvoiceNextNumber ||
-    Number(company.salesInvoiceNextNumber) < start
-  ) {
-    await CompanyProfile.updateOne(
-      {
-        tenantKey,
-        $or: [
-          { salesInvoiceNextNumber: { $exists: false } },
-          { salesInvoiceNextNumber: null },
-          { salesInvoiceNextNumber: { $lt: start } },
-        ],
-      },
-      { $set: { salesInvoiceNextNumber: start } },
+
+  // IMPORTANT: Sales Invoice numbering is FINANCIAL-YEAR WISE and the source
+  // of truth is every EXISTING, NON-DELETED invoice number in the FY selected by
+  // the invoice date. Workflow state must NEVER control numbering: invoice 040
+  // may later become RELEASED_TO_WAREHOUSE / READY_FOR_DISPATCH / DELIVERED, but
+  // it still permanently occupies serial 040. Otherwise a new invoice could be
+  // offered 040 again. A soft-deleted test invoice is excluded so an eligible
+  // deleted number can be released by releaseDeletedTestSalesNumber() on save.
+  // Never use CompanyProfile.salesInvoiceNextNumber and never inspect another FY.
+  const { SalesInvoice } = financialModels(tenantKey, fy);
+  const rows = await SalesInvoice.find({
+    tenantKey,
+    status: { $ne: "DELETED" },
+    invoiceNo: { $nin: [null, ""] },
+  })
+    .select("invoiceNo date createdAt status workflowStatus financialYear customerGlobalId gstinSnapshot")
+    .lean();
+  const registeredRows = await registeredInvoiceRows(tenantKey, rows, prefix);
+
+  const parsed = registeredRows
+    .map((row) => ({
+      row,
+      info: salesInvoiceSerialInfo(row.invoiceNo, prefix, suffix, fy),
+    }))
+    .filter(
+      (entry) =>
+        entry.info &&
+        Number.isFinite(Number(entry.info.serial)) &&
+        Number(entry.info.serial) >= start,
     );
-    company = await CompanyProfile.findOne({ tenantKey });
-  }
-  if (!consume) {
-    const serial = Math.max(
-      start,
-      Math.trunc(Number(company.salesInvoiceNextNumber || start)),
-    );
-    return {
-      invoiceNo: formatSalesInvoiceNumber(prefix, serial, suffix),
-      serial,
-      prefix,
-      suffix,
-      startingNumber: start,
-    };
-  }
-  const before = await CompanyProfile.findOneAndUpdate(
-    { tenantKey },
-    { $inc: { salesInvoiceNextNumber: 1 } },
-    { new: false },
+
+  // Continue after the HIGHEST active serial in this FY/registered series.
+  // This is deliberately not a row-count calculation: manually entered numbers,
+  // imported history, and workflow transitions must not make an existing number
+  // available again. Example: if PE-040-26-27 exists (even DELIVERED), next is 041.
+  // If the only test invoice 001 was deleted, no active serial remains and the
+  // series can correctly offer 001 again.
+  const usedSerials = new Set(parsed.map((entry) => Number(entry.info.serial)));
+  const highestSerial = parsed.reduce(
+    (max, entry) => Math.max(max, Number(entry.info.serial) || 0),
+    0,
   );
-  const serial = Math.max(
-    start,
-    Math.trunc(Number(before?.salesInvoiceNextNumber || start)),
-  );
+  let serial = highestSerial >= start ? highestSerial + 1 : start;
+  while (usedSerials.has(serial)) serial += 1;
+
+  // Preserve the numeric style most recently used INSIDE THIS FY only.
+  // The parser understands both PREFIX-039-SUFFIX and compact legacy values
+  // such as PREFIX0392627, so FY digits can no longer become part of the serial.
+  const latest = [...parsed].sort((a, b) => {
+    const aTime = new Date(a.row.createdAt || a.row.date || 0).getTime();
+    const bTime = new Date(b.row.createdAt || b.row.date || 0).getTime();
+    return bTime - aTime;
+  })[0];
+  const latestSerialText = cleanText(latest?.info?.serialText || "");
+  const paddingWidth = /^0\d+$/.test(latestSerialText)
+    ? latestSerialText.length
+    : 0;
+  const serialText = salesInvoiceSerialText(serial, paddingWidth);
+
+  // `consume` is intentionally accepted for backward compatibility with the
+  // create route. We do not increment a global counter: the saved invoice in
+  // this FY advances the next value naturally.
+  void consume;
+
   return {
-    invoiceNo: formatSalesInvoiceNumber(prefix, serial, suffix),
+    invoiceNo: formatSalesInvoiceNumber(prefix, serialText, suffix),
     serial,
+    serialText,
+    paddingWidth,
     prefix,
     suffix,
     startingNumber: start,
+    financialYear: fy,
   };
 }
 
-function salesInvoiceSerialInfo(invoiceNo, prefix, suffix) {
+function salesInvoiceSerialInfo(
+  invoiceNo,
+  prefix,
+  suffix,
+  financialYear = "",
+) {
   const text = cleanText(invoiceNo);
   if (!text) return null;
   if (/^\d+$/.test(text)) {
@@ -822,16 +1029,63 @@ function salesInvoiceSerialInfo(invoiceNo, prefix, suffix) {
     };
   }
 
-  // For older financial years the configured suffix may have changed
-  // (for example 2025-26 -> 2026-27). The serial is still the first
-  // numeric block after the configured prefix, so read it directly
-  // instead of rejecting the old invoice because today's suffix differs.
-  if (prefix && text.toLowerCase().startsWith(prefix.toLowerCase())) {
-    const afterPrefix = text.slice(prefix.length);
-    const match = afterPrefix.match(/\d+/);
-    if (match) {
-      const serialStart = prefix.length + (match.index || 0);
-      const serialText = match[0];
+  const configuredPrefix = cleanText(prefix);
+  const configuredSuffix = cleanText(suffix);
+  const fy = cleanText(financialYear);
+  const startsWithPrefix =
+    configuredPrefix &&
+    text.toLowerCase().startsWith(configuredPrefix.toLowerCase());
+
+  // Build all known suffix spellings for this FY. This is important for old
+  // compact invoice numbers where the suffix is numeric and there are no
+  // separators, e.g. EKO0392627. Without stripping 2627 first, the old parser
+  // incorrectly read 0392627 as the serial and suggested 0392628.
+  const suffixCandidates = [];
+  const addSuffix = (value) => {
+    const v = cleanText(value);
+    if (v && !suffixCandidates.some((x) => x.toLowerCase() === v.toLowerCase()))
+      suffixCandidates.push(v);
+  };
+  addSuffix(configuredSuffix);
+  if (/^\d{4}-\d{2}$/.test(fy)) {
+    const startYear = fy.slice(0, 4);
+    const shortStart = startYear.slice(2);
+    const shortEnd = fy.slice(-2);
+    addSuffix(fy); // 2025-26
+    addSuffix(fy.replace(/-/g, "")); // 202526
+    addSuffix(`${shortStart}-${shortEnd}`); // 25-26
+    addSuffix(`${shortStart}${shortEnd}`); // 2526
+  }
+  suffixCandidates.sort((a, b) => b.length - a.length);
+
+  if (startsWithPrefix) {
+    for (const candidateSuffix of suffixCandidates) {
+      if (!text.toLowerCase().endsWith(candidateSuffix.toLowerCase())) continue;
+      const bodyStart = configuredPrefix.length;
+      const bodyEnd = text.length - candidateSuffix.length;
+      if (bodyEnd <= bodyStart) continue;
+      const body = text.slice(bodyStart, bodyEnd);
+      const match = body.match(/^[\s\-_/.:]*(\d+)[\s\-_/.:]*$/);
+      if (!match) continue;
+      const serialText = match[1];
+      const relative = body.indexOf(serialText);
+      const serialStart = bodyStart + relative;
+      return {
+        invoiceNo: text,
+        serial: Number(serialText),
+        serialText,
+        serialStart,
+        serialEnd: serialStart + serialText.length,
+      };
+    }
+
+    // Separator-based historical numbers remain safe even when their suffix is
+    // completely custom: PREFIX-039-OLD-SUFFIX -> 039.
+    const afterPrefix = text.slice(configuredPrefix.length);
+    const separated = afterPrefix.match(/^[\s\-_/.:]+(\d+)(?=[\s\-_/.:]|$)/);
+    if (separated) {
+      const serialText = separated[1];
+      const serialStart = configuredPrefix.length + separated.index + separated[0].indexOf(serialText);
       return {
         invoiceNo: text,
         serial: Number(serialText),
@@ -842,25 +1096,22 @@ function salesInvoiceSerialInfo(invoiceNo, prefix, suffix) {
     }
   }
 
-  let start = 0,
-    end = text.length;
-  if (prefix && text.toLowerCase().startsWith(prefix.toLowerCase()))
-    start = prefix.length;
-  if (suffix && text.toLowerCase().endsWith(suffix.toLowerCase()))
-    end = Math.max(start, end - suffix.length);
-  const middle = text.slice(start, end);
-  const leading = (middle.match(/^[^\d]*/) || [""])[0].length;
-  const trailing = (middle.match(/[^\d]*$/) || [""])[0].length;
-  const serialEndInMiddle = Math.max(leading, middle.length - trailing);
-  const serialText = middle.slice(leading, serialEndInMiddle);
-  if (!/^\d+$/.test(serialText)) return null;
-  return {
-    invoiceNo: text,
-    serial: Number(serialText),
-    serialText,
-    serialStart: start + leading,
-    serialEnd: start + serialEndInMiddle,
-  };
+  // Last-resort parsing for genuinely old/custom formats. Prefer a standalone
+  // numeric token; do not concatenate every digit in the invoice number.
+  const token = text.match(/(?:^|[^0-9])(\d+)(?=$|[^0-9])/);
+  if (token) {
+    const serialText = token[1];
+    const offset = token[0].lastIndexOf(serialText);
+    const serialStart = (token.index || 0) + offset;
+    return {
+      invoiceNo: text,
+      serial: Number(serialText),
+      serialText,
+      serialStart,
+      serialEnd: serialStart + serialText.length,
+    };
+  }
+  return null;
 }
 
 function formatObservedSalesInvoiceNumber({
@@ -929,39 +1180,39 @@ async function salesInvoiceNumberExistsAcrossSeries({
 }
 
 async function salesInvoiceNumberAnalysis({ tenantKey, financialYear }) {
-  const series = await salesInvoiceSeries(tenantKey);
+  const series = await salesInvoiceSeries(tenantKey, financialYear);
   const prefix = cleanText(series.prefix),
     suffix = cleanText(series.suffix);
 
-  // Sales Invoice numbering uses one Superadmin-level next-number counter, not a
-  // separate counter per FY. Therefore a back-dated invoice must still see gaps
-  // from the complete numbering series. Scan every configured FY DB plus the FY
-  // selected by the invoice date, then combine the observed invoice numbers.
-  const scannedFinancialYears = await salesInvoiceSeriesFinancialYears(
-    tenantKey,
-    financialYear,
-  );
+  // Number ranges/missing numbers are also FY-specific. An invoice number used
+  // in 2025-26 must have no effect on the sequence for 2026-27.
+  const scannedFinancialYears = [financialYear];
   const observed = [];
-  for (const fy of scannedFinancialYears) {
-    try {
-      const { SalesInvoice } = financialModels(tenantKey, fy);
-      const invoiceNos = await SalesInvoice.distinct("invoiceNo", {
-        tenantKey,
-        invoiceNo: { $nin: [null, ""] },
+  try {
+    const { SalesInvoice } = financialModels(tenantKey, financialYear);
+    const rows = await SalesInvoice.find({
+      tenantKey, status: "POSTED", invoiceNo: { $nin: [null, ""] },
+    }).select("invoiceNo customerGlobalId gstinSnapshot").lean();
+    const invoiceNos = (await registeredInvoiceRows(tenantKey, rows, prefix))
+      .map((row) => row.invoiceNo);
+    for (const invoiceNo of invoiceNos) {
+      observed.push({
+        invoiceNo: cleanText(invoiceNo),
+        financialYear,
       });
-      for (const invoiceNo of invoiceNos || [])
-        observed.push({ invoiceNo: cleanText(invoiceNo), financialYear: fy });
-    } catch {
-      // Historical FY databases may not exist yet. An unavailable/empty FY must
-      // not prevent the invoice page from loading its global number series.
     }
+  } catch {
+    // A new FY may not have a database/collection yet. Treat it as an empty
+    // invoice series and start from the configured starting number.
   }
 
   const uniqueInvoiceNos = [
     ...new Set(observed.map((row) => row.invoiceNo).filter(Boolean)),
   ];
   const matched = uniqueInvoiceNos
-    .map((invoiceNo) => salesInvoiceSerialInfo(invoiceNo, prefix, suffix))
+    .map((invoiceNo) =>
+      salesInvoiceSerialInfo(invoiceNo, prefix, suffix, financialYear),
+    )
     .filter((row) => row && Number.isFinite(row.serial) && row.serial >= 0)
     .sort((a, b) => a.serial - b.serial);
 
@@ -988,16 +1239,12 @@ async function salesInvoiceNumberAnalysis({ tenantKey, financialYear }) {
   );
   const startSerial = configuredStart;
 
-  // IMPORTANT: missing numbers belong to the CURRENT Superadmin invoice pattern,
-  // not merely to the same numeric serial seen in any historical series. Example:
-  // PE-083-24-25 must NOT make PE-083-25-26 look used. Build the current pattern
-  // from the actual autogenerated number and only mark numbers with the same text
-  // before/after the serial as used. We still scan every configured FY database,
-  // so the result remains independent of the date selected on the invoice form.
+  // Missing numbers belong only to this FY's current invoice pattern.
   const currentPatternSample = salesInvoiceSerialInfo(
     series.invoiceNo,
     prefix,
     suffix,
+    financialYear,
   );
   const patternBefore = currentPatternSample
     ? currentPatternSample.invoiceNo.slice(0, currentPatternSample.serialStart)
@@ -1041,19 +1288,19 @@ async function salesInvoiceNumberAnalysis({ tenantKey, financialYear }) {
   const highestUsedSerial = currentSeriesMatched.length
     ? currentSeriesMatched[currentSeriesMatched.length - 1].serial
     : startSerial - 1;
-  // If a number was consumed by the Superadmin counter but no invoice was saved,
-  // it is also a genuine pending/missing number in this SAME invoice pattern.
+  // The FY database is the source of truth; there is no cross-FY/global counter.
   const endSerial = Math.max(
     highestUsedSerial,
     Math.max(startSerial - 1, Number(series.serial || startSerial) - 1),
   );
   const used = new Set(currentSeriesMatched.map((row) => row.serial));
   const earliest = currentSeriesMatched[0] || null;
-  // Infer padding from this exact series only: 001 => width 3; 1 => no padding.
-  const paddingWidth =
-    earliest && /^0\d+$/.test(earliest.serialText)
+  // Use the latest user-selected numeric style for missing-number display too.
+  // This keeps 001/002 or 01/02 consistent everywhere after the user changes it.
+  const paddingWidth = Number(series.paddingWidth || 0) ||
+    (earliest && /^0\d+$/.test(earliest.serialText)
       ? earliest.serialText.length
-      : 0;
+      : 0);
   const sample = earliest || currentPatternSample;
   const missingInvoiceNumbers = [];
   for (let serial = startSerial; serial <= endSerial; serial += 1) {
@@ -1485,6 +1732,10 @@ export function normalizedEInvoice(body = {}, existing = {}) {
 
 router.get("/sales-invoices/next-number", async (req, res) => {
   try {
+    const financialYear = await resolveFinancialYear({
+      tenantKey: req.auth.tenantKey,
+      requested: req.query.financialYear,
+    });
     const customerGlobalId = cleanText(req.query.customerGlobalId || "");
     if (customerGlobalId) {
       const customer = await CustomerLink.findOne({
@@ -1492,23 +1743,36 @@ router.get("/sales-invoices/next-number", async (req, res) => {
         globalCustomerId: customerGlobalId,
         status: "ACTIVE",
       }).lean();
-      if (customer && isSystemCashParty(customer)) {
-        const financialYear = await resolveFinancialYear({
+      if (!customer) return fail(res, "Selected party not found or inactive", 404);
+      if (!isRegisteredParty(customer)) {
+        const invoiceNo = await nextCashInvoiceNumber({
           tenantKey: req.auth.tenantKey,
-          requested: req.query.financialYear,
-        });
-        return ok(res, {
-          invoiceNo: await nextCashInvoiceNumber({
-            tenantKey: req.auth.tenantKey,
-            financialYear,
-            customerGlobalId: customer.globalCustomerId,
-          }),
           financialYear,
+          customerGlobalId: customer.globalCustomerId,
+        });
+        const configured = await salesInvoiceSeries(
+          req.auth.tenantKey,
+          financialYear,
+        );
+        return ok(res, {
+          invoiceNo,
+          serialText: invoiceSerialForInput(
+            invoiceNo,
+            configured.prefix,
+            configured.suffix,
+          ),
+          financialYear,
+          prefix: configured.prefix.replace(/\s+/g, ""),
+          suffix: configured.suffix.replace(/[^0-9A-Za-z]/g, ""),
           cashInvoice: true,
+          registrationSeries: "UNREGISTERED",
         });
       }
     }
-    return ok(res, await salesInvoiceSeries(req.auth.tenantKey));
+    return ok(
+      res,
+      await salesInvoiceSeries(req.auth.tenantKey, financialYear),
+    );
   } catch (e) {
     return fail(res, e.message, e.statusCode || 400);
   }
@@ -1547,6 +1811,8 @@ router.get("/sales-invoices", async (req, res) => {
     filter.customerGlobalId = cleanText(req.query.customerGlobalId);
   if (req.query.includeDeleted !== "true")
     filter.status = { $nin: ["DELETED", "CANCELLED"] };
+  const salesListRange = transactionQueryDateRange(req);
+  if (salesListRange) filter.date = salesListRange;
   let [items, total] = await Promise.all([
     SalesInvoice.find(filter)
       .sort({ date: -1, createdAt: -1 })
@@ -1609,6 +1875,100 @@ router.get("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
   return ok(res, salesInvoiceForAuth(enriched, req.auth));
 });
 
+router.put(
+  "/sales-invoices/:id/cn-data",
+  requireObjectIdParam,
+  upload.single("cnImage"),
+  async (req, res) => {
+    try {
+      const financialYear = await resolveFinancialYear({
+        tenantKey: req.auth.tenantKey,
+        requested: req.body.financialYear || req.query.financialYear,
+      });
+      const { SalesInvoice } = financialModels(req.auth.tenantKey, financialYear);
+      const invoice = await SalesInvoice.findOne({
+        _id: req.params.id,
+        tenantKey: req.auth.tenantKey,
+        financialYear,
+        status: { $nin: ["DELETED", "CANCELLED"] },
+      });
+      if (!invoice) return fail(res, "Sales invoice not found", 404);
+
+      if (req.auth.role !== "MASTER" && req.auth.role !== "SUPERADMIN") {
+        if (
+          req.auth.dataScope === "WAREHOUSE" &&
+          (!req.auth.warehouseId || invoice.warehouseId !== req.auth.warehouseId)
+        )
+          return fail(res, "Invoice is outside your assigned warehouse", 403);
+        if (
+          req.auth.dataScope === "ASSIGNED" &&
+          invoice.assignedTo !== req.auth.sub &&
+          invoice.createdBy !== req.auth.sub
+        )
+          return fail(res, "Invoice is outside your assigned work", 403);
+      }
+
+      const cnNumber = cleanText(req.body.cnNumber);
+      const cnQty = Number(req.body.cnQty);
+      const cnDate = req.body.cnDate ? new Date(req.body.cnDate) : null;
+      if (!cnNumber) return fail(res, "CN Number is required", 400);
+      if (!Number.isFinite(cnQty) || cnQty <= 0)
+        return fail(res, "CN Qty must be greater than zero", 400);
+      if (!cnDate || Number.isNaN(cnDate.getTime()))
+        return fail(res, "Valid CN Date is required", 400);
+
+      const incomingImage = req.file || null;
+      const existingImageFileId = cleanText(invoice.consignmentNote?.imageFileId || "");
+      if (!incomingImage && !existingImageFileId)
+        return fail(res, "CN Image is required", 400);
+      if (
+        incomingImage &&
+        !String(incomingImage.mimetype || "").startsWith("image/") &&
+        String(incomingImage.mimetype || "") !== "application/pdf"
+      )
+        return fail(res, "CN Image must be an image or PDF file", 400);
+
+      let imageFileId = existingImageFileId;
+      let imageName = cleanText(invoice.consignmentNote?.imageName || "");
+      let imageMimeType = cleanText(invoice.consignmentNote?.imageMimeType || "");
+      if (incomingImage) {
+        const meta = await saveUploadedFile({
+          file: incomingImage,
+          tenantKey: req.auth.tenantKey,
+          module: "DMS",
+          entityType: "SALES_INVOICE_CN",
+          entityId: String(invoice._id),
+          uploadedBy: req.auth.sub,
+          access: "PRIVATE",
+        });
+        imageFileId = meta.fileId;
+        imageName = meta.originalName || incomingImage.originalname || "CN Image";
+        imageMimeType = meta.mimeType || incomingImage.mimetype || "application/octet-stream";
+      }
+
+      invoice.consignmentNote = {
+        cnDate,
+        cnQty,
+        cnNumber,
+        imageFileId,
+        imageName,
+        imageMimeType,
+        savedAt: new Date(),
+        savedBy: req.auth.sub,
+        savedByNameSnapshot: req.auth.name || req.auth.fullName || req.auth.email || "",
+      };
+      await invoice.save();
+      return ok(
+        res,
+        salesInvoiceForAuth(invoice, req.auth),
+        `CN data saved for invoice ${invoice.invoiceNo}`,
+      );
+    } catch (error) {
+      return fail(res, error.message || "Unable to save CN data", error.statusCode || 400);
+    }
+  },
+);
+
 router.get(
   "/sales-invoices/:id/pdf",
   requireObjectIdParam,
@@ -1633,13 +1993,12 @@ router.get(
         financialYear,
         invoice,
       });
-      const fileName = safeFilePart(
-        `Invoice-${invoice.invoiceNo || req.params.id}.pdf`,
-      );
+      const fileName = invoicePdfFileName(invoice, req.params.id);
       res.setHeader("Content-Type", "application/pdf");
+      const asciiFileName = safeFilePart(fileName);
       res.setHeader(
         "Content-Disposition",
-        `${req.query.download === "1" ? "attachment" : "inline"}; filename="${fileName}"`,
+        `${req.query.download === "1" ? "attachment" : "inline"}; filename="${asciiFileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
       );
       return res.send(pdf);
     } catch (error) {
@@ -1647,6 +2006,49 @@ router.get(
     }
   },
 );
+
+const escapeSalesRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// A soft-deleted test invoice still occupies its number because invoiceNo has a
+// unique index. Only an unissued, fully reversed DIRECT test invoice can release
+// that slot. Preserve the deleted document and historical journal/stock rows under
+// a unique audit reference; never erase accounting history or recycle issued IDs.
+async function releaseDeletedTestSalesNumber({ tenantKey, financialYear, invoiceNo }) {
+  const { SalesInvoice, LedgerEntry, StockMovement, CreditNote, SalesOrder } = financialModels(tenantKey, financialYear);
+  const deleted = await SalesInvoice.findOne({ tenantKey, financialYear, invoiceNo, status: "DELETED" });
+  if (!deleted) return false;
+  if (deleted.voidedInvoiceNo || deleted.sourceOrderId || deleted.billingMode === "ORDER"
+      || deleted.eInvoice?.irn || deleted.eInvoice?.ackNo || deleted.eInvoice?.status === "GENERATED"
+      || deleted.delivery?.deliveredAt || deleted.delivery?.emailedAt
+      || deleted.delivery?.emailStatus === "SENT"
+      || deleted.delivery?.proofFiles?.length || deleted.delivery?.proofFileIds?.length
+      || Number(deleted.creditNoteAmount || 0) !== 0) {
+    throw Object.assign(new Error(`Deleted invoice ${invoiceNo} is linked to issued or external documents and cannot be reused.`), { statusCode: 409 });
+  }
+  const hasNotes = await CreditNote.exists({ tenantKey, financialYear,
+    $or: [{ invoiceId: String(deleted._id) }, { referenceDocumentId: String(deleted._id) }, { invoiceNo }] });
+  const hasOrder = await SalesOrder.exists({ tenantKey, financialYear,
+    $or: [{ "invoice.invoiceId": String(deleted._id) }, { "invoice.invoiceNo": invoiceNo }] });
+  if (hasNotes || hasOrder) throw Object.assign(new Error(`Invoice ${invoiceNo} is linked to an order or note and cannot be reused.`), { statusCode: 409 });
+  const oldJournal = await LedgerEntry.find({ tenantKey, financialYear, transactionId: invoiceNo })
+    .select("status").lean();
+  if (oldJournal.some((entry) => entry.status !== "REVERSED"))
+    throw Object.assign(new Error(`Invoice ${invoiceNo} has unresolved journal entries. Reconcile it before reusing the number.`), { statusCode: 409 });
+  // Changing transactionId on reversed journal rows and unsetting their old
+  // deterministic postingKey ensures the strict ledger de-duplication rule still
+  // works for the new voucher when its printed number is reused.
+  const archiveNo = `VOID-${String(deleted._id)}`;
+  const archived = await SalesInvoice.updateOne({ _id: deleted._id, tenantKey, financialYear, invoiceNo, status: "DELETED" }, {
+    $set: { invoiceNo: archiveNo, voidedInvoiceNo: invoiceNo, voidedAt: new Date() },
+  });
+  if (archived.modifiedCount !== 1) throw Object.assign(new Error("Invoice number changed during reuse. Retry."), { statusCode: 409 });
+  await LedgerEntry.updateMany({ tenantKey, financialYear, transactionId: invoiceNo, status: "REVERSED" },
+    { $set: { transactionId: archiveNo }, $unset: { postingKey: "" } });
+  await StockMovement.updateMany({ tenantKey, financialYear, referenceId: invoiceNo,
+    type: { $in: ["SALE", "SALE_EDIT_REVERSAL", "SALE_DELETE_REVERSAL"] } },
+    { $set: { referenceId: archiveNo } });
+  return true;
+}
 
 router.post("/sales-invoices", async (req, res) => {
   try {
@@ -1665,18 +2067,32 @@ router.post("/sales-invoices", async (req, res) => {
       String(req.body.manualInvoiceNo || "").toLowerCase() === "true";
     let series;
     if (preserveRequestedInvoiceNo && requestedInvoiceNo) {
+      // Import/scan flows already supply the complete printed invoice number.
       series = { invoiceNo: requestedInvoiceNo, manualInvoiceNo: true };
     } else if (manualInvoiceNo) {
       if (!requestedInvoiceNo)
         return fail(res, "Invoice Number is required", 400);
-      if (isSystemCashParty(calc.customer)) {
+
+      if (!isRegisteredParty(calc.customer)) {
+        // A normal unregistered sale must ALWAYS be PREFIX+C+SERIAL+SUFFIX.
+        // Only explicit historical import flows may preserve printed legacy IDs.
+        if (!/^\d+$/.test(requestedInvoiceNo))
+          return fail(res, "Enter only the numeric serial. The C prefix and FY suffix are automatic for unregistered sales.", 400);
+        const numericInput = true;
+        const requestedFull = numericInput
+          ? await cashInvoiceNumberFromSerial({
+              tenantKey: calc.tenantKey,
+              financialYear: calc.financialYear,
+              serialText: requestedInvoiceNo,
+            })
+          : requestedInvoiceNo;
         const preview = await nextCashInvoiceNumber({
           tenantKey: calc.tenantKey,
           financialYear: calc.financialYear,
           customerGlobalId: calc.customer.globalCustomerId,
         });
         series =
-          cleanText(preview) === requestedInvoiceNo
+          cleanText(preview) === cleanText(requestedFull)
             ? {
                 invoiceNo: await allocateCashInvoiceNumber({
                   tenantKey: calc.tenantKey,
@@ -1685,15 +2101,34 @@ router.post("/sales-invoices", async (req, res) => {
                 }),
                 cashInvoice: true,
               }
-            : { invoiceNo: requestedInvoiceNo, manualInvoiceNo: true };
+            : {
+                invoiceNo: requestedFull,
+                manualInvoiceNo: true,
+                manualSerial: numericInput ? Number(requestedInvoiceNo) : null,
+                serialText: numericInput ? requestedInvoiceNo : "",
+                cashInvoice: true,
+              };
       } else {
-        const preview = await salesInvoiceSeries(req.auth.tenantKey);
+        const requested = /^\d+$/.test(requestedInvoiceNo)
+          ? await configuredSalesInvoiceNumberFromSerial(
+              req.auth.tenantKey,
+              requestedInvoiceNo,
+              calc.financialYear,
+            )
+          : { invoiceNo: requestedInvoiceNo };
+        const preview = await salesInvoiceSeries(req.auth.tenantKey, calc.financialYear);
         series =
-          cleanText(preview.invoiceNo) === requestedInvoiceNo
-            ? await salesInvoiceSeries(req.auth.tenantKey, { consume: true })
-            : { invoiceNo: requestedInvoiceNo, manualInvoiceNo: true };
+          cleanText(preview.invoiceNo) === cleanText(requested.invoiceNo)
+            ? await salesInvoiceSeries(req.auth.tenantKey, calc.financialYear, { consume: true })
+            : {
+                ...requested,
+                manualInvoiceNo: true,
+                manualSerial: Number.isFinite(requested.serial)
+                  ? requested.serial
+                  : null,
+              };
       }
-    } else if (isSystemCashParty(calc.customer)) {
+    } else if (!isRegisteredParty(calc.customer)) {
       series = {
         invoiceNo: await allocateCashInvoiceNumber({
           tenantKey: calc.tenantKey,
@@ -1703,10 +2138,32 @@ router.post("/sales-invoices", async (req, res) => {
         cashInvoice: true,
       };
     } else {
-      series = await salesInvoiceSeries(req.auth.tenantKey, { consume: true });
+      series = await salesInvoiceSeries(req.auth.tenantKey, calc.financialYear, { consume: true });
     }
     const models = financialModels(calc.tenantKey, calc.financialYear);
     const { SalesInvoice, StockMovement, SalesOrder, OrderEvent } = models;
+    // One last source-of-truth check: never save an unregistered invoice under
+    // the registered series, even if the browser sent an outdated number.
+    const registeredSale = isRegisteredParty(calc.customer);
+    const company = await CompanyProfile.findOne({ tenantKey: calc.tenantKey })
+      .select("salesInvoicePrefix salesInvoiceSuffix").lean();
+    const expectedPrefix = cleanText(company?.salesInvoicePrefix).replace(/\s+/g, "");
+    const expectedSuffix = suffixForFinancialYear(company?.salesInvoiceSuffix, calc.financialYear)
+      .replace(/[^0-9A-Za-z]/g, "");
+    if (!registeredSale) {
+      const expected = new RegExp(`^${escapeSalesRegex(expectedPrefix)}C\\d+${escapeSalesRegex(expectedSuffix)}$`, "i");
+      if (!expected.test(series.invoiceNo))
+        return fail(res, "An unregistered sale must have Prefix + C + Serial + FY suffix. Invoice was not saved.", 409);
+    }
+    // A deleted TEST invoice is archived (not erased), so its number can be
+    // reused without colliding with the unique index or strict journal keys.
+    if (!preserveRequestedInvoiceNo) {
+      await releaseDeletedTestSalesNumber({
+        tenantKey: calc.tenantKey,
+        financialYear: calc.financialYear,
+        invoiceNo: series.invoiceNo,
+      });
+    }
     if (
       await SalesInvoice.exists({
         tenantKey: calc.tenantKey,
@@ -1760,7 +2217,7 @@ router.post("/sales-invoices", async (req, res) => {
       const orderItems = new Map(
         (sourceOrder.items || []).map((x) => [String(x.productId), x]),
       );
-      for (const it of calc.items) {
+    for (const it of calc.items) {
         const oi = orderItems.get(String(it.productId));
         if (!oi)
           return fail(
@@ -1792,7 +2249,7 @@ router.post("/sales-invoices", async (req, res) => {
         calc.customer.displayIdentifier ||
         "Customer",
       gstinSnapshot:
-        calc.customer.displayIdentifier?.length === 15
+        isRegisteredParty(calc.customer) && calc.customer.displayIdentifier?.length === 15
           ? calc.customer.displayIdentifier
           : "",
       addressSnapshot: calc.customerAddress?.address || "",
@@ -1839,6 +2296,10 @@ router.post("/sales-invoices", async (req, res) => {
       createdBy: req.auth.sub,
       createdByNameSnapshot: req.auth.name || "",
     });
+
+    // Regular Sales Invoice sequencing is derived from invoices already saved in
+    // calc.financialYear. Do not update the legacy global CompanyProfile counter;
+    // otherwise an old FY could leak its sequence into a new FY.
 
     for (const it of calc.items) {
       if (sourceOrder) {
@@ -2060,7 +2521,7 @@ router.put("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
     existing.customerGlobalId = calc.customer.globalCustomerId;
     existing.customerNameSnapshot = calc.customer.localName;
     existing.gstinSnapshot =
-      calc.customer.displayIdentifier?.length === 15
+      isRegisteredParty(calc.customer) && calc.customer.displayIdentifier?.length === 15
         ? calc.customer.displayIdentifier
         : "";
     existing.addressSnapshot =
@@ -2139,12 +2600,16 @@ router.delete("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
     financialYear,
   });
   if (!invoice) return fail(res, "Sales invoice not found", 404);
-  if (invoice.status === "DELETED" || invoice.status === "CANCELLED")
-    return ok(
-      res,
-      salesInvoiceForAuth(invoice, req.auth),
-      "Sales invoice already deleted",
-    );
+
+  // Old builds used soft delete. If one of those legacy DELETED/CANCELLED rows is
+  // deleted again, physically remove it without running stock/account reversal twice.
+  if (invoice.status === "DELETED" || invoice.status === "CANCELLED") {
+    const invoiceNo = invoice.invoiceNo;
+    const id = String(invoice._id);
+    await models.SalesInvoice.deleteOne({ _id: invoice._id, tenantKey: req.auth.tenantKey, financialYear });
+    return ok(res, { _id: id, invoiceNo, deleted: true, hardDeleted: true }, "Sales invoice permanently deleted from database");
+  }
+
   const issuedCreditNote = await models.CreditNote.findOne({
     tenantKey: req.auth.tenantKey,
     financialYear,
@@ -2176,11 +2641,12 @@ router.delete("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
         creditNoteNo: issuedCreditNote.creditNoteNo,
       },
     );
+
   await reversePostedTransaction({
     tenantKey: req.auth.tenantKey,
     financialYear,
     transactionId: invoice.invoiceNo,
-    reason: "Sales invoice deleted",
+    reason: "Sales invoice permanently deleted",
   });
   for (const it of invoice.items || []) {
     await Product.updateOne(
@@ -2200,13 +2666,22 @@ router.delete("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
       referenceId: invoice.invoiceNo,
     });
   }
-  invoice.status = "DELETED";
-  invoice.workflowStatus = "DELETED";
-  await invoice.save();
+
+  const deletedPayload = {
+    _id: String(invoice._id),
+    invoiceNo: invoice.invoiceNo,
+    deleted: true,
+    hardDeleted: true,
+  };
+  await models.SalesInvoice.deleteOne({
+    _id: invoice._id,
+    tenantKey: req.auth.tenantKey,
+    financialYear,
+  });
   return ok(
     res,
-    salesInvoiceForAuth(invoice, req.auth),
-    "Sales invoice deleted, stock restored and accounting reversed",
+    deletedPayload,
+    "Sales invoice permanently deleted; stock restored and accounting reversed",
   );
 });
 
@@ -2214,6 +2689,23 @@ const safeFilePart = (value) =>
   String(value || "file")
     .replace(/[^a-z0-9._-]+/gi, "_")
     .slice(0, 90);
+const safeDownloadFilePart = (value, fallback = "file") => {
+  const cleaned = String(value || fallback)
+    .replace(/[\\/:*?"<>|\r\n]+/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/-+/g, "-")
+    .trim();
+  return (cleaned || fallback).slice(0, 90);
+};
+const invoicePdfFileName = (invoice = {}, fallbackId = "Invoice") =>
+  `${safeDownloadFilePart(invoice.customerNameSnapshot || "Customer", "Customer")}-${safeDownloadFilePart(invoice.invoiceNo || fallbackId, "Invoice")}.pdf`;
+const escapeEmailHtml = (value) => String(value ?? "")
+  .replace(/&/g, "&amp;")
+  .replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;")
+  .replace(/'/g, "&#39;");
+const emailMoney = (value) => Number(value || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const customerEmailOf = (customer) => {
   const contacts = Array.isArray(customer?.contacts) ? customer.contacts : [];
   return String(
@@ -2342,12 +2834,56 @@ async function buildInvoicePdfBuffer({
   return buildMasterSalesInvoicePdf({ invoice, ...context });
 }
 
-async function emailDeliveredInvoice({
+async function sendInvoiceThroughConfiguredMailbox({ tenantKey, to, subject, text, html, attachments = [] }) {
+  const smartAttachments = attachments.map((item) => ({
+    filename: item.filename,
+    content: item.content,
+    mimeType: item.mimeType || item.contentType || "application/octet-stream",
+  }));
+  try {
+    await sendCompanyMail({
+      database: tenantKey,
+      to: [to],
+      subject,
+      text,
+      html,
+      attachments: smartAttachments,
+    });
+    return { provider: "COMPANY_MAIL" };
+  } catch (error) {
+    // Backward compatibility: companies that have not yet connected their own
+    // mailbox may still use the existing environment SMTP configuration.
+    if (error?.code !== "MAIL_NOT_CONNECTED") throw error;
+    try {
+      await sendBusinessEmail({
+        to,
+        subject,
+        text,
+        html,
+        attachments: smartAttachments.map((item) => ({
+          filename: item.filename,
+          content: item.content,
+          contentType: item.mimeType,
+        })),
+      });
+      return { provider: "LEGACY_SMTP" };
+    } catch (legacyError) {
+      const wrapped = new Error(
+        `Company email is not connected. Add the Superadmin App Password in Profile or connect Email & Communication. ${legacyError?.message || ""}`.trim(),
+      );
+      wrapped.code = "MAIL_NOT_CONNECTED";
+      throw wrapped;
+    }
+  }
+}
+
+async function emailSalesInvoice({
   tenantKey,
   financialYear,
   invoice,
   customer,
   uploadedFiles = [],
+  delivered = false,
 }) {
   const to = customerEmailOf(customer);
   if (!to)
@@ -2356,6 +2892,7 @@ async function emailDeliveredInvoice({
       to: "",
       error: "Customer email is not available",
     };
+
   const pdf = await buildInvoicePdfBuffer({
     tenantKey,
     financialYear,
@@ -2364,55 +2901,221 @@ async function emailDeliveredInvoice({
   });
   const attachments = [
     {
-      filename: `${safeFilePart(invoice.invoiceNo)}.pdf`,
+      filename: invoicePdfFileName(invoice),
       content: pdf,
-      contentType: "application/pdf",
+      mimeType: "application/pdf",
     },
     ...uploadedFiles
       .filter((entry) => entry?.file?.buffer)
       .map((entry) => ({
         filename: entry.file.originalname || `${entry.kind}.bin`,
         content: entry.file.buffer,
-        contentType: entry.file.mimetype || "application/octet-stream",
+        mimeType: entry.file.mimetype || "application/octet-stream",
       })),
   ];
-  await sendBusinessEmail({
+
+  const transporterName = cleanText(
+    invoice.delivery?.transporterName ||
+      invoice.transportAssignment?.transporterNameSnapshot ||
+      "",
+  );
+  const noOfPackages = Number(
+    invoice.delivery?.noOfPackages ?? invoice.noOfPackages ?? 0,
+  );
+  const cnNumber = cleanText(
+    invoice.delivery?.cnNumber || invoice.consignmentNote?.cnNumber || "",
+  );
+  const cnQty = Number(invoice.consignmentNote?.cnQty || 0);
+  const cnDate = invoice.consignmentNote?.cnDate
+    ? new Date(invoice.consignmentNote.cnDate).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      })
+    : "";
+  const biltyNo = cleanText(invoice.delivery?.biltyNo || "");
+  const vehicleNo = cleanText(invoice.delivery?.vehicleNo || "");
+  const remarks = cleanText(invoice.delivery?.remarks || "");
+  const invoiceDate = invoice.date
+    ? new Date(invoice.date).toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      })
+    : "";
+  const deliveredAt = invoice.delivery?.deliveredAt
+    ? new Date(invoice.delivery.deliveredAt).toLocaleString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : "";
+
+  const dispatchLines = [
+    transporterName ? `Transporter: ${transporterName}` : "",
+    Number.isFinite(noOfPackages) && noOfPackages > 0
+      ? `No. of Packages: ${noOfPackages}`
+      : "",
+    cnNumber ? `CN Number: ${cnNumber}` : "",
+    cnDate ? `CN Date: ${cnDate}` : "",
+    Number.isFinite(cnQty) && cnQty > 0 ? `CN Qty: ${cnQty}` : "",
+    biltyNo ? `Bilty/LR Number: ${biltyNo}` : "",
+    vehicleNo ? `Vehicle Number: ${vehicleNo}` : "",
+    deliveredAt ? `Delivered At: ${deliveredAt}` : "",
+    remarks ? `Remarks: ${remarks}` : "",
+  ].filter(Boolean);
+
+  const subject = delivered
+    ? `Dispatch Update - Invoice ${invoice.invoiceNo}`
+    : `Invoice ${invoice.invoiceNo} - ${invoice.customerNameSnapshot || "Customer"}`;
+
+  const text = [
+    `Dear ${invoice.customerNameSnapshot || "Customer"},`,
+    "",
+    delivered
+      ? `Your invoice ${invoice.invoiceNo} has been marked delivered.`
+      : `Please find attached invoice ${invoice.invoiceNo}.`,
+    invoiceDate ? `Invoice Date: ${invoiceDate}` : "",
+    `Invoice Amount: INR ${emailMoney(invoice.grandTotal)}`,
+    ...(dispatchLines.length ? ["", "Dispatch Details", ...dispatchLines] : []),
+    "",
+    uploadedFiles.length
+      ? "The invoice PDF and available Bilty/LR document are attached."
+      : "The invoice PDF is attached.",
+    "",
+    "Thank you for your business.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const dispatchRows = [
+    ["Transporter", transporterName],
+    ["No. of Packages", Number.isFinite(noOfPackages) && noOfPackages > 0 ? String(noOfPackages) : ""],
+    ["CN Number", cnNumber],
+    ["CN Date", cnDate],
+    ["CN Qty", Number.isFinite(cnQty) && cnQty > 0 ? String(cnQty) : ""],
+    ["Bilty / LR Number", biltyNo],
+    ["Vehicle Number", vehicleNo],
+    ["Delivered At", deliveredAt],
+    ["Remarks", remarks],
+  ].filter(([, value]) => value);
+
+  const dispatchHtml = dispatchRows.length
+    ? `<div style="margin:22px 0 0;border:1px solid #dbe4ee;border-radius:12px;overflow:hidden">
+        <div style="background:#f3f7fb;padding:11px 16px;font-size:13px;font-weight:700;color:#334155;text-transform:uppercase;letter-spacing:.04em">Dispatch Details</div>
+        <table role="presentation" style="width:100%;border-collapse:collapse">${dispatchRows
+          .map(
+            ([label, value]) =>
+              `<tr><td style="padding:10px 16px;border-top:1px solid #edf2f7;width:42%;color:#64748b;font-size:13px">${escapeEmailHtml(label)}</td><td style="padding:10px 16px;border-top:1px solid #edf2f7;color:#0f172a;font-size:14px;font-weight:600">${escapeEmailHtml(value)}</td></tr>`,
+          )
+          .join("")}</table>
+      </div>`
+    : "";
+
+  const html = `<!doctype html>
+<html><body style="margin:0;background:#f4f7fb;padding:24px;font-family:Arial,Helvetica,sans-serif;color:#1e293b">
+  <table role="presentation" style="width:100%;border-collapse:collapse"><tr><td align="center">
+    <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px rgba(15,23,42,.06)">
+      <div style="background:#0f3d68;padding:24px 28px;color:#ffffff">
+        <div style="font-size:12px;text-transform:uppercase;letter-spacing:.12em;opacity:.8">${delivered ? "Dispatch & Delivery Update" : "Invoice"}</div>
+        <div style="margin-top:6px;font-size:24px;font-weight:700">${escapeEmailHtml(invoice.invoiceNo || "Invoice")}</div>
+      </div>
+      <div style="padding:28px">
+        <p style="margin:0 0 14px;font-size:15px">Dear <strong>${escapeEmailHtml(invoice.customerNameSnapshot || "Customer")}</strong>,</p>
+        <p style="margin:0 0 22px;line-height:1.6;color:#475569">${delivered ? "Your invoice has been marked delivered. The invoice PDF is attached for your records." : "Please find your invoice PDF attached. The important invoice and dispatch details are summarized below."}</p>
+
+        <div style="display:block;border:1px solid #dbe4ee;border-radius:12px;overflow:hidden">
+          <table role="presentation" style="width:100%;border-collapse:collapse">
+            <tr><td style="padding:12px 16px;background:#f8fafc;color:#64748b;font-size:13px">Invoice Number</td><td style="padding:12px 16px;background:#f8fafc;text-align:right;font-weight:700;color:#0f172a">${escapeEmailHtml(invoice.invoiceNo || "")}</td></tr>
+            ${invoiceDate ? `<tr><td style="padding:12px 16px;border-top:1px solid #edf2f7;color:#64748b;font-size:13px">Invoice Date</td><td style="padding:12px 16px;border-top:1px solid #edf2f7;text-align:right;font-weight:600">${escapeEmailHtml(invoiceDate)}</td></tr>` : ""}
+            <tr><td style="padding:12px 16px;border-top:1px solid #edf2f7;color:#64748b;font-size:13px">Invoice Amount</td><td style="padding:12px 16px;border-top:1px solid #edf2f7;text-align:right;font-size:18px;font-weight:700;color:#0f3d68">₹${escapeEmailHtml(emailMoney(invoice.grandTotal))}</td></tr>
+          </table>
+        </div>
+
+        ${dispatchHtml}
+
+        <div style="margin-top:24px;padding:14px 16px;background:#f8fafc;border-radius:10px;color:#64748b;font-size:13px;line-height:1.55">
+          ${uploadedFiles.length ? "The invoice PDF and the available Bilty/LR document are attached to this email." : "The invoice PDF is attached to this email."}
+        </div>
+        <p style="margin:24px 0 0;color:#475569;font-size:14px">Thank you for your business.</p>
+      </div>
+    </div>
+  </td></tr></table>
+</body></html>`;
+
+  const sent = await sendInvoiceThroughConfiguredMailbox({
+    tenantKey,
     to,
-    subject: `Invoice ${invoice.invoiceNo} - Delivered`,
-    text: [
-      `Dear ${invoice.customerNameSnapshot || "Customer"},`,
-      "",
-      `Your invoice ${invoice.invoiceNo} has been delivered.`,
-      `Amount: INR ${Number(invoice.grandTotal || 0).toFixed(2)}`,
-      invoice.delivery?.deliveredTo
-        ? `Delivered to: ${invoice.delivery.deliveredTo}`
-        : "",
-      invoice.delivery?.biltyNo
-        ? `Bilty/LR No: ${invoice.delivery.biltyNo}`
-        : "",
-      "",
-      "The invoice PDF and available delivery proof/bilty documents are attached.",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    html: `<div style="font-family:Arial,sans-serif;color:#263238"><h2>Invoice ${invoice.invoiceNo} delivered</h2><p>Dear ${invoice.customerNameSnapshot || "Customer"},</p><p>Your invoice has been marked delivered.</p><p><b>Amount:</b> INR ${Number(invoice.grandTotal || 0).toFixed(2)}</p>${invoice.delivery?.deliveredTo ? `<p><b>Delivered to:</b> ${invoice.delivery.deliveredTo}</p>` : ""}${invoice.delivery?.biltyNo ? `<p><b>Bilty/LR No:</b> ${invoice.delivery.biltyNo}</p>` : ""}<p>The invoice PDF and delivery documents are attached.</p></div>`,
+    subject,
+    text,
+    html,
     attachments,
   });
-  return { status: "SENT", to, error: "" };
+  return { status: "SENT", to, error: "", provider: sent.provider };
 }
+
+async function emailDeliveredInvoice(args) {
+  return emailSalesInvoice({ ...args, delivered: true });
+}
+
+router.post(
+  "/sales-invoices/:id/email",
+  requireObjectIdParam,
+  requireAnyPermission(
+    "dms.sales.sales_invoice.download",
+    "dms.sales.sales_invoice.edit",
+    "dms.sales.dispatch_details.edit",
+  ),
+  async (req, res) => {
+    try {
+      const financialYear = await resolveFinancialYear({
+        tenantKey: req.auth.tenantKey,
+        requested: req.body.financialYear || req.query.financialYear,
+      });
+      const { SalesInvoice } = financialModels(req.auth.tenantKey, financialYear);
+      const invoice = await SalesInvoice.findOne({
+        _id: req.params.id,
+        tenantKey: req.auth.tenantKey,
+        financialYear,
+        status: { $ne: "DELETED" },
+      });
+      if (!invoice) return fail(res, "Sales invoice not found", 404);
+      const customer = await CustomerLink.findOne({
+        tenantKey: req.auth.tenantKey,
+        globalCustomerId: invoice.customerGlobalId,
+      }).lean();
+      if (!customer) return fail(res, "Customer record not found", 404);
+      const result = await emailSalesInvoice({
+        tenantKey: req.auth.tenantKey,
+        financialYear,
+        invoice,
+        customer,
+      });
+      return ok(
+        res,
+        { invoiceId: String(invoice._id), invoiceNo: invoice.invoiceNo, ...result },
+        result.status === "SENT"
+          ? `Invoice emailed to ${result.to}`
+          : `Invoice email not sent: ${result.error}`,
+      );
+    } catch (error) {
+      return fail(res, error.message || "Unable to email invoice", error?.code === "MAIL_NOT_CONNECTED" ? 409 : 500);
+    }
+  },
+);
 
 router.post(
   "/sales-invoices/:id/process",
   requireObjectIdParam,
   requireAnyPermission(
-    "dms.sales.sales_invoice.process",
-    "dms.sales.sales_invoices.process",
-    "dms.sales.dispatch.process",
-    "dms.sales.dispatch_details.process",
+    "dms.sales.sales_invoice.edit",
+    "dms.sales.dispatch_details.edit",
   ),
   upload.fields([
-    { name: "deliveryProof", maxCount: 1 },
     { name: "biltyCopy", maxCount: 1 },
+    { name: "cnImage", maxCount: 1 },
   ]),
   async (req, res) => {
     const financialYear = await resolveFinancialYear({
@@ -2457,52 +3160,110 @@ router.post(
       }).lean();
       if (!customer)
         return fail(res, "Customer record not found for delivery", 404);
-      const proof = req.files?.deliveryProof?.[0] || null;
       const bilty = req.files?.biltyCopy?.[0] || null;
       const nonLocal =
         upper(
           invoice.transportAssignment?.mode || customer.regionType || "LOCAL",
         ) !== "LOCAL";
-      if (!cleanText(req.body.deliveredTo))
-        return fail(res, "Delivered To is required", 400);
-      if (!proof)
-        return fail(
-          res,
-          "Delivery proof is required before marking Delivered",
-          400,
-        );
+      const transporterName = cleanText(
+        req.body.transporterName || invoice.transportAssignment?.transporterNameSnapshot || "",
+      );
+      const noOfPackages = Number(req.body.noOfPackages ?? invoice.noOfPackages ?? 0);
+      const cnNumber = cleanText(req.body.cnNumber || "");
+      const cnQtyRaw = req.body.cnQty;
+      const cnQty = cnQtyRaw === undefined || cnQtyRaw === null || String(cnQtyRaw).trim() === "" ? null : Number(cnQtyRaw);
+      const cnDate = req.body.cnDate ? new Date(req.body.cnDate) : null;
+      const cnImage = req.files?.cnImage?.[0] || null;
+      const existingCnImageFileId = cleanText(invoice.consignmentNote?.imageFileId || "");
+      const cnTouched = Boolean(
+        cnNumber ||
+        req.body.cnDate ||
+        (cnQtyRaw !== undefined && String(cnQtyRaw).trim() !== "") ||
+        cnImage ||
+        existingCnImageFileId
+      );
+      const biltyNo = cleanText(req.body.biltyNo || "");
+      if (!Number.isFinite(noOfPackages) || noOfPackages < 0)
+        return fail(res, "No. of Packages must be zero or more", 400);
+      if (cnTouched) {
+        if (!cnNumber) return fail(res, "CN Number is required when CN details are added", 400);
+        if (!Number.isFinite(cnQty) || cnQty <= 0) return fail(res, "CN Qty must be greater than zero", 400);
+        if (!cnDate || Number.isNaN(cnDate.getTime())) return fail(res, "Valid CN Date is required", 400);
+        if (!cnImage && !existingCnImageFileId) return fail(res, "CN Image/PDF is required when CN details are added", 400);
+        if (cnImage && !String(cnImage.mimetype || "").startsWith("image/") && String(cnImage.mimetype || "") !== "application/pdf")
+          return fail(res, "CN Image must be an image or PDF file", 400);
+      }
+      if (nonLocal && !biltyNo)
+        return fail(res, "Bilty/LR Number is mandatory for a non-local customer", 400);
       if (nonLocal && !bilty)
         return fail(
           res,
           "Bilty/LR copy is mandatory for a non-local customer",
           400,
         );
-      const uploaded = [
-        { kind: "DELIVERY_PROOF", file: proof },
-        ...(bilty ? [{ kind: "BILTY_COPY", file: bilty }] : []),
-      ];
+
+      const uploaded = bilty ? [{ kind: "BILTY_COPY", file: bilty }] : [];
       let stored = [];
-      try {
-        stored = await storeDeliveryFiles({
-          tenantKey: req.auth.tenantKey,
-          invoiceNo: invoice.invoiceNo,
-          files: uploaded,
-        });
-      } catch (error) {
-        return fail(
-          res,
-          `Unable to save delivery proof: ${error.message}`,
-          500,
-        );
+      if (uploaded.length) {
+        try {
+          stored = await storeDeliveryFiles({
+            tenantKey: req.auth.tenantKey,
+            invoiceNo: invoice.invoiceNo,
+            files: uploaded,
+          });
+        } catch (error) {
+          return fail(
+            res,
+            `Unable to save Bilty/LR copy: ${error.message}`,
+            500,
+          );
+        }
       }
+
+      invoice.noOfPackages = noOfPackages;
+      if (transporterName)
+        invoice.set("transportAssignment.transporterNameSnapshot", transporterName);
+
+      if (cnTouched) {
+        let imageFileId = existingCnImageFileId;
+        let imageName = cleanText(invoice.consignmentNote?.imageName || "");
+        let imageMimeType = cleanText(invoice.consignmentNote?.imageMimeType || "");
+        if (cnImage) {
+          const meta = await saveUploadedFile({
+            file: cnImage,
+            tenantKey: req.auth.tenantKey,
+            module: "DMS",
+            entityType: "SALES_INVOICE_CN",
+            entityId: String(invoice._id),
+            uploadedBy: req.auth.sub,
+            access: "PRIVATE",
+          });
+          imageFileId = meta.fileId;
+          imageName = meta.originalName || cnImage.originalname || "CN Image";
+          imageMimeType = meta.mimeType || cnImage.mimetype || "application/octet-stream";
+        }
+        invoice.consignmentNote = {
+          cnDate,
+          cnQty,
+          cnNumber,
+          imageFileId,
+          imageName,
+          imageMimeType,
+          savedAt: new Date(),
+          savedBy: req.auth.sub,
+          savedByNameSnapshot: req.auth.name || req.auth.fullName || req.auth.email || "",
+        };
+      }
+
       invoice.delivery = {
         deliveredAt: req.body.deliveredAt
           ? new Date(req.body.deliveredAt)
           : new Date(),
-        deliveredTo: cleanText(req.body.deliveredTo),
-        mobile: cleanText(req.body.deliveryMobile),
+        transporterName,
+        noOfPackages,
+        cnNumber,
         vehicleNo: cleanText(req.body.vehicleNo),
-        biltyNo: cleanText(req.body.biltyNo),
+        biltyNo,
         remarks: cleanText(req.body.deliveryRemarks),
         proofFiles: stored,
         emailStatus: "PENDING",
@@ -2516,7 +3277,10 @@ router.post(
           financialYear,
           invoice,
           customer,
-          uploadedFiles: uploaded,
+          uploadedFiles: [
+            ...uploaded,
+            ...(cnImage ? [{ kind: "CN_IMAGE", file: cnImage }] : []),
+          ],
         });
         invoice.delivery.emailStatus = result.status;
         invoice.delivery.emailTo = result.to;
@@ -2669,6 +3433,43 @@ async function calculatePurchaseInvoice({ auth, body }) {
   const billTax = billLevelTaxSummary(items, billDiscount, otherCharges);
   const taxableTotal = billTax.taxableTotal,
     taxTotal = billTax.taxTotal;
+
+  // Allocate the invoice-level Discount + Charges back to each purchase item for
+  // stock valuation/average purchase price.  `item.taxable` remains the entered
+  // Basic Total (pre bill adjustment), while `netTaxable` is the real taxable
+  // purchase value represented by that product.  The final row receives any
+  // paise rounding residual so item net values always add up EXACTLY to the
+  // invoice taxableTotal.
+  let allocatedDiscount = 0;
+  let allocatedCharges = 0;
+  let allocatedNetTaxable = 0;
+  items.forEach((it, index) => {
+    const isLast = index === items.length - 1;
+    const rawTaxable = Math.max(0, Number(it.taxable || 0));
+    const share = billTax.subtotal > 0 ? rawTaxable / billTax.subtotal : 0;
+    const discountShare = isLast
+      ? round2(billTax.discount - allocatedDiscount)
+      : round2(billTax.discount * share);
+    const chargeShare = isLast
+      ? round2(billTax.charges - allocatedCharges)
+      : round2(billTax.charges * share);
+    const netTaxable = isLast
+      ? round2(taxableTotal - allocatedNetTaxable)
+      : round2(Math.max(0, rawTaxable - discountShare + chargeShare));
+    const netRate = Number(it.qty || 0) > 0
+      ? Number((netTaxable / Number(it.qty)).toFixed(6))
+      : 0;
+
+    it.billDiscountShare = discountShare;
+    it.billChargeShare = chargeShare;
+    it.netTaxable = netTaxable;
+    it.netRate = netRate;
+
+    allocatedDiscount = round2(allocatedDiscount + discountShare);
+    allocatedCharges = round2(allocatedCharges + chargeShare);
+    allocatedNetTaxable = round2(allocatedNetTaxable + netTaxable);
+  });
+
   const transportationCost = Math.max(0, Number(body.transportationCost || 0));
   const labourCost = Math.max(0, Number(body.labourCost || 0));
   const localFreight = Math.max(0, Number(body.localFreight || 0));
@@ -2679,16 +3480,22 @@ async function calculatePurchaseInvoice({ auth, body }) {
   const basicPurchaseTotalAfterAdjustments = round2(
     Math.max(0, billTax.taxableTotal),
   );
-  const landedExpensePercentage =
+  const landedExpensePercentageRaw =
     basicPurchaseTotalAfterAdjustments > 0
-      ? round2((landedCharges / basicPurchaseTotalAfterAdjustments) * 100)
+      ? (landedCharges / basicPurchaseTotalAfterAdjustments) * 100
       : 0;
+  const landedExpensePercentage = round2(landedExpensePercentageRaw);
   const landedTax = 0;
 
   for (const it of items) {
-    const basicPurchasePrice = Math.max(0, Number(it.effectiveRate || 0));
+    // Landed price must start from the NET purchase rate after bill discount/
+    // charges, not from the pre-discount Basic Total rate.
+    const basicPurchasePrice = Math.max(
+      0,
+      Number(it.netRate ?? it.effectiveRate ?? it.rate ?? 0),
+    );
     it.landedCostSnapshot = round2(
-      basicPurchasePrice + (basicPurchasePrice * landedExpensePercentage) / 100,
+      basicPurchasePrice + (basicPurchasePrice * landedExpensePercentageRaw) / 100,
     );
   }
 
@@ -2719,6 +3526,33 @@ async function calculatePurchaseInvoice({ auth, body }) {
   };
 }
 
+function assertPurchaseClientTotals(body, calc) {
+  const checks = [
+    ["Basic Total", body.expectedSubtotal, calc.subtotal],
+    ["Taxable Value", body.expectedTaxableTotal, calc.taxableTotal],
+    ["GST", body.expectedTaxTotal, calc.taxTotal],
+    ["Grand Total", body.expectedGrandTotal, calc.grandTotal],
+  ];
+  const mismatches = checks
+    .filter(([, expected]) => expected !== undefined && expected !== null && expected !== "")
+    .map(([label, expected, saved]) => ({
+      label,
+      shown: round2(Number(expected || 0)),
+      calculated: round2(Number(saved || 0)),
+    }))
+    .filter((row) => Math.abs(row.shown - row.calculated) > 0.011);
+
+  if (mismatches.length) {
+    const message = mismatches
+      .map((row) => `${row.label}: screen ${row.shown.toFixed(2)} / save ${row.calculated.toFixed(2)}`)
+      .join(", ");
+    throw Object.assign(
+      new Error(`Purchase Invoice calculation mismatch. Nothing was saved. ${message}`),
+      { statusCode: 409, details: { calculationMismatch: mismatches } },
+    );
+  }
+}
+
 function summarizePurchaseItems(items = []) {
   const out = new Map();
   for (const it of items || []) {
@@ -2726,10 +3560,15 @@ function summarizePurchaseItems(items = []) {
     if (!id) continue;
     const row = out.get(id) || { qty: 0, value: 0, lastRate: 0, lastLanded: 0 };
     const qty = Number(it.qty || 0),
-      rate = Number(it.effectiveRate ?? it.rate ?? 0),
+      // New purchase invoices store the bill-adjusted rate explicitly.  Old
+      // invoices do not, so they continue to subtract the historical raw rate
+      // that was originally accumulated; the next edit therefore repairs the
+      // product average instead of corrupting it.
+      rate = Number(it.netRate ?? it.effectiveRate ?? it.rate ?? 0),
+      netTaxable = Number(it.netTaxable),
       landed = Number(it.landedCostSnapshot ?? rate);
     row.qty += qty;
-    row.value += qty * rate;
+    row.value += Number.isFinite(netTaxable) ? netTaxable : qty * rate;
     row.lastRate = rate;
     row.lastLanded = landed;
     out.set(id, row);
@@ -2933,6 +3772,8 @@ router.get("/purchase-invoices", async (req, res) => {
   if (req.query.supplierGlobalId)
     f.supplierGlobalId = cleanText(req.query.supplierGlobalId);
   if (req.query.includeDeleted !== "true") f.status = { $ne: "DELETED" };
+  const purchaseListRange = transactionQueryDateRange(req);
+  if (purchaseListRange) f.date = purchaseListRange;
   let [items, total] = await Promise.all([
     PurchaseInvoice.find(f)
       .sort({ date: -1, createdAt: -1 })
@@ -2977,6 +3818,7 @@ router.post("/purchase-invoices", async (req, res) => {
       auth: req.auth,
       body: req.body,
     });
+    assertPurchaseClientTotals(req.body, calc);
     const invoiceNo = cleanText(req.body.invoiceNo) || makeId("PINV"),
       { PurchaseInvoice } = financialModels(calc.tenantKey, calc.financialYear);
     if (
@@ -3078,6 +3920,7 @@ router.put("/purchase-invoices/:id", async (req, res) => {
         `The selected date belongs to FY ${calc.financialYear}. An existing invoice cannot be moved across financial-year databases. Delete/recreate it with the new date.`,
         409,
       );
+    assertPurchaseClientTotals(req.body, calc);
     await applyPurchaseProductChanges({
       tenantKey: req.auth.tenantKey,
       financialYear,
@@ -3152,8 +3995,14 @@ router.delete("/purchase-invoices/:id", async (req, res) => {
     financialYear,
   });
   if (!invoice) return fail(res, "Purchase invoice not found", 404);
-  if (invoice.status === "DELETED")
-    return ok(res, invoice, "Purchase invoice already deleted");
+
+  // Permanently remove legacy soft-deleted rows without reversing stock/accounting twice.
+  if (invoice.status === "DELETED") {
+    const payload = { _id: String(invoice._id), invoiceNo: invoice.invoiceNo, deleted: true, hardDeleted: true };
+    await models.PurchaseInvoice.deleteOne({ _id: invoice._id, tenantKey: req.auth.tenantKey, financialYear });
+    return ok(res, payload, "Purchase invoice permanently deleted from database");
+  }
+
   try {
     await applyPurchaseProductChanges({
       tenantKey: req.auth.tenantKey,
@@ -3168,19 +4017,44 @@ router.delete("/purchase-invoices/:id", async (req, res) => {
       tenantKey: req.auth.tenantKey,
       financialYear,
       transactionId: invoice.invoiceNo,
-      reason: "Purchase invoice deleted",
+      reason: "Purchase invoice permanently deleted",
     });
-    invoice.status = "DELETED";
-    await invoice.save();
+    const payload = { _id: String(invoice._id), invoiceNo: invoice.invoiceNo, deleted: true, hardDeleted: true };
+    await models.PurchaseInvoice.deleteOne({
+      _id: invoice._id,
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+    });
     return ok(
       res,
-      invoice,
-      "Purchase invoice deleted; stock and accounting reversed",
+      payload,
+      "Purchase invoice permanently deleted; stock and accounting reversed",
     );
   } catch (e) {
     return fail(res, e.message, e.statusCode || 400, e.details);
   }
 });
+
+function transactionQueryDateRange(req) {
+  const fromDate = String(req.query.fromDate || "").trim();
+  const toDate = String(req.query.toDate || "").trim();
+  if (!fromDate && !toDate) return null;
+  if ((fromDate && !/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) || (toDate && !/^\d{4}-\d{2}-\d{2}$/.test(toDate))) {
+    const error = new Error("Invalid date filter; use YYYY-MM-DD");
+    error.statusCode = 400;
+    throw error;
+  }
+  const range = {};
+  if (fromDate) {
+    const from = new Date(`${fromDate}T00:00:00.000Z`);
+    if (!Number.isNaN(from.getTime())) range.$gte = from;
+  }
+  if (toDate) {
+    const to = new Date(`${toDate}T23:59:59.999Z`);
+    if (!Number.isNaN(to.getTime())) range.$lte = to;
+  }
+  return Object.keys(range).length ? range : null;
+}
 
 router.get("/receipts", async (req, res) => {
   const financialYear = await resolveFinancialYear({
@@ -3192,6 +4066,8 @@ router.get("/receipts", async (req, res) => {
     q = String(req.query.q || "").trim();
   const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
   const filter = { tenantKey: req.auth.tenantKey, financialYear };
+  const dateRange = transactionQueryDateRange(req);
+  if (dateRange) filter.date = dateRange;
   if (q)
     filter.$or = [
       { receiptNo: new RegExp(q, "i") },
@@ -3223,6 +4099,8 @@ router.get("/payments", async (req, res) => {
     q = String(req.query.q || "").trim();
   const { Payment } = financialModels(req.auth.tenantKey, financialYear);
   const filter = { tenantKey: req.auth.tenantKey, financialYear };
+  const dateRange = transactionQueryDateRange(req);
+  if (dateRange) filter.date = dateRange;
   if (q)
     filter.$or = [
       { paymentNo: new RegExp(q, "i") },
@@ -3273,10 +4151,12 @@ router.post("/payments", async (req, res) => {
       );
     const { Payment } = financialModels(tenantKey, financialYear);
     const paymentNo = req.body.paymentNo || makeId("PAY");
+    if (await Payment.exists({tenantKey,financialYear,paymentNo})) return fail(res,"Payment number already exists in this FY",409);
     const payment = await Payment.create({
       tenantKey,
       financialYear,
       paymentNo,
+      sourceKey:paymentNo,
       date,
       partyGlobalId: party.globalCustomerId,
       partyNameSnapshot: party.localName || party.displayIdentifier,
@@ -3290,7 +4170,8 @@ router.post("/payments", async (req, res) => {
       createdBy: req.auth.sub,
       createdByNameSnapshot: req.auth.name || "",
     });
-    await postBalancedEntries({
+    try {
+      await postBalancedEntries({
       tenantKey,
       financialYear,
       transactionId: paymentNo,
@@ -3309,6 +4190,7 @@ router.post("/payments", async (req, res) => {
         },
       ],
     });
+    } catch (error) { await payment.deleteOne(); throw error; }
     return ok(res, payment, "Payment posted", 201);
   } catch (error) {
     return fail(res, error.message, error.statusCode || 400);
@@ -3325,6 +4207,8 @@ router.get("/expenses", async (req, res) => {
     q = String(req.query.q || "").trim();
   const { Expense } = financialModels(req.auth.tenantKey, financialYear);
   const filter = { tenantKey: req.auth.tenantKey, financialYear };
+  const dateRange = transactionQueryDateRange(req);
+  if (dateRange) filter.date = dateRange;
   if (q)
     filter.$or = [
       { expenseNo: new RegExp(q, "i") },
@@ -3375,10 +4259,12 @@ router.post("/receipts", async (req, res) => {
       );
     const { Receipt } = financialModels(tenantKey, financialYear);
     const receiptNo = req.body.receiptNo || makeId("RCT");
+    if (await Receipt.exists({tenantKey,financialYear,receiptNo})) return fail(res,"Receipt number already exists in this FY",409);
     const receipt = await Receipt.create({
       tenantKey,
       financialYear,
       receiptNo,
+      sourceKey:receiptNo,
       date,
       customerGlobalId: party.globalCustomerId,
       partyNameSnapshot: party.localName || party.displayIdentifier,
@@ -3393,7 +4279,8 @@ router.post("/receipts", async (req, res) => {
       createdBy: req.auth.sub,
       createdByNameSnapshot: req.auth.name || "",
     });
-    await postBalancedEntries({
+    try {
+      await postBalancedEntries({
       tenantKey,
       financialYear,
       transactionId: receiptNo,
@@ -3411,6 +4298,7 @@ router.post("/receipts", async (req, res) => {
         { accountCode: partyAccountCodeOf(party), credit: amount },
       ],
     });
+    } catch (error) { await receipt.deleteOne(); throw error; }
     return ok(res, receipt, "Receipt posted", 201);
   } catch (error) {
     return fail(res, error.message, error.statusCode || 400);

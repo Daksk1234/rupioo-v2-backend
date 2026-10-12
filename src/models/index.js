@@ -314,10 +314,27 @@ const customerLinkSchema = new Schema({
   regionType: { type: String, default: "LOCAL" },
   category: String,
   dueDate: Date,
+  // Legacy single-transporter fields are retained for old reports/imports.
+  // New V2 customer transport assignment is automatic and can map MANY
+  // transporters to one customer from the Transporter service-area master.
   assignedTransport: String,
   assignedTransportGlobalId: String,
   assignedTransportBookingStationId: String,
   assignedTransportDeliveryStationId: String,
+  assignedTransporters: [{
+    transporterId: { type: String, index: true },
+    globalTransporterId: String,
+    transporterName: String,
+    stationId: String,
+    baseStationName: String,
+    baseStationPincode: String,
+    baseStationCity: String,
+    matchType: { type: String, enum: ["PINCODE", "CITY"], default: "PINCODE" },
+    matchedPincode: String,
+    matchedCity: String,
+  }],
+  transporterMatchType: { type: String, enum: ["PINCODE", "CITY", "NONE"], default: "NONE" },
+  transporterMappedAt: Date,
   serviceArea: String,
   bankDetails: [{
     ifsc: { type: String, uppercase: true, trim: true },
@@ -368,7 +385,20 @@ const customerLinkSchema = new Schema({
   systemManaged: { type: Boolean, default: false, index: true },
   systemKey: { type: String, uppercase: true, trim: true, index: true, sparse: true },
   systemNote: String,
-  companyHealth: { score: Number, grade: String, color: String, updatedAt: Date }
+  companyHealth: { score: Number, grade: String, color: String, updatedAt: Date },
+
+  // Customer App onboarding metadata. A CustomerLink remains the single source
+  // of truth for one GlobalCustomer <-> one Superadmin company relationship.
+  registrationSource: { type: String, enum: ["DMS", "SELF_APP", "SALESPERSON_APP", "IMPORT"], default: "DMS", index: true },
+  registrationRequestedAt: Date,
+  registrationMeta: {
+    supplierId: String, pincode: String, mobile: String, email: String,
+    emailVerified: { type: Boolean, default: false },
+    termsAcceptedAt: Date,
+    gstAutoFetched: { type: Boolean, default: false },
+    appVersion: String, deviceLabel: String
+  },
+  customerAppLastSeenAt: Date
 }, { timestamps: true });
 customerLinkSchema.index({ tenantKey: 1, globalCustomerId: 1 }, { unique: true });
 customerLinkSchema.index({ tenantKey: 1, systemKey: 1 }, { unique: true, partialFilterExpression: { systemKey: { $type: "string" } } });
@@ -842,8 +872,20 @@ const transporterSchema = new Schema({
   name: { type: String, required: true, index: true },
   gstin: String, pan: String,
   stations: [{
-    name: String, type: { type: String, default: "BOTH" }, address: String, pincode: String,
-    latitude: Number, longitude: Number,
+    name: String,
+    type: { type: String, default: "BOTH" },
+    address: String,
+    pincode: String,
+    city: String,
+    state: String,
+    // Service areas belong to the Superadmin's own Transporter List.
+    // This prevents one company's transporter coverage from leaking into
+    // another company that happens to use the same Global Transporter.
+    servicePincodes: [String],
+    serviceCities: [String],
+    serviceStates: [String],
+    latitude: Number,
+    longitude: Number,
     contacts: [{ name: String, designation: String, phone: String, email: String, active: { type: Boolean, default: true } }]
   }],
   paymentTerms: String, freightNotes: String, status: { type: String, default: "ACTIVE" }
@@ -1225,6 +1267,65 @@ const otpSchema = new Schema({
 }, { timestamps: true });
 
 
+// One global Customer App login can access multiple Superadmin companies.
+// The account is intentionally tenant-neutral; tenant access is derived from
+// CustomerLink membership after every request.
+const customerPortalAccountSchema = new Schema({
+  globalCustomerId: { type: String, required: true, unique: true, index: true },
+  email: { type: String, lowercase: true, trim: true, index: true, sparse: true },
+  mobile: { type: String, trim: true, index: true, sparse: true },
+  passwordHash: { type: String, required: true, select: false },
+  status: { type: String, enum: ["ACTIVE", "BLOCKED", "DISABLED"], default: "ACTIVE", index: true },
+  emailVerified: { type: Boolean, default: false },
+  mobileVerified: { type: Boolean, default: false },
+  passwordResetVersion: { type: Number, default: 0 },
+  passwordConfiguredAt: Date,
+  lastLoginAt: Date, lastLoginIp: String, lastLoginUserAgent: String, loginCount: { type: Number, default: 0 },
+  createdFrom: { type: String, default: "CUSTOMER_APP" }
+}, { timestamps: true });
+customerPortalAccountSchema.index({ email: 1 }, { unique: true, sparse: true });
+customerPortalAccountSchema.index({ mobile: 1 }, { unique: true, sparse: true });
+
+const customerSupportTicketSchema = new Schema({
+  ticketNo: { type: String, required: true, unique: true, index: true },
+  tenantKey: { type: String, required: true, index: true },
+  globalCustomerId: { type: String, required: true, index: true },
+  type: { type: String, enum: ["PAYMENT", "BILL", "SCHEME", "ORDER", "GENERAL"], default: "GENERAL", index: true },
+  referenceType: String, referenceId: String, referenceNo: String,
+  subject: { type: String, required: true }, description: String,
+  status: { type: String, enum: ["OPEN", "IN_REVIEW", "RESOLVED", "REJECTED", "CLOSED"], default: "OPEN", index: true },
+  priority: { type: String, enum: ["LOW", "NORMAL", "HIGH", "URGENT"], default: "NORMAL", index: true },
+  attachments: [{ fileName: String, storedName: String, mimeType: String, size: Number }],
+  replies: [{ byType: String, byId: String, byName: String, message: String, at: { type: Date, default: Date.now } }],
+  createdByCustomer: { type: Boolean, default: true }, resolvedAt: Date, resolution: String
+}, { timestamps: true });
+customerSupportTicketSchema.index({ tenantKey: 1, globalCustomerId: 1, createdAt: -1 });
+
+const customerDamageClaimSchema = new Schema({
+  claimNo: { type: String, required: true, unique: true, index: true },
+  tenantKey: { type: String, required: true, index: true },
+  globalCustomerId: { type: String, required: true, index: true },
+  invoiceId: String, invoiceNo: { type: String, index: true }, invoiceDate: Date,
+  items: [{ productId: String, productName: String, billedQty: Number, damagedQty: Number, reason: String }],
+  notes: String, images: [{ fileName: String, storedName: String, mimeType: String, size: Number }],
+  status: { type: String, enum: ["SUBMITTED", "IN_REVIEW", "APPROVED", "PARTIAL", "REJECTED", "CLOSED"], default: "SUBMITTED", index: true },
+  reviewedBy: String, reviewedByName: String, reviewedAt: Date, resolution: String, approvedAmount: Number
+}, { timestamps: true });
+customerDamageClaimSchema.index({ tenantKey: 1, globalCustomerId: 1, createdAt: -1 });
+
+const customerPromotionSchema = new Schema({
+  tenantKey: { type: String, required: true, index: true },
+  promotionId: { type: String, required: true, unique: true, index: true },
+  title: { type: String, required: true }, subtitle: String, description: String, terms: String,
+  bannerUrl: String, bannerFileId: String,
+  startAt: { type: Date, index: true }, endAt: { type: Date, index: true },
+  status: { type: String, enum: ["DRAFT", "ACTIVE", "PAUSED", "EXPIRED"], default: "DRAFT", index: true },
+  audience: { type: String, enum: ["ALL", "GRADE", "CUSTOMERS"], default: "ALL" },
+  gradeCodes: [String], customerGlobalIds: [String],
+  scheme: { type: Schema.Types.Mixed, default: {} }, createdBy: String, updatedBy: String
+}, { timestamps: true });
+customerPromotionSchema.index({ tenantKey: 1, status: 1, startAt: 1, endAt: 1 });
+
 const legacyMigrationMapSchema = new Schema({
   tenantKey: { type:String, required:true, index:true },
   entity: { type:String, required:true, index:true },
@@ -1313,6 +1414,10 @@ export const Barcode = mongoose.model("Barcode", barcodeSchema);
 export const Branding = mongoose.model("Branding", brandingSchema);
 export const FileMeta = mongoose.model("FileMeta", fileMetaSchema);
 export const OtpChallenge = mongoose.model("OtpChallenge", otpSchema);
+export const CustomerPortalAccount = mongoose.model("CustomerPortalAccount", customerPortalAccountSchema);
+export const CustomerSupportTicket = mongoose.model("CustomerSupportTicket", customerSupportTicketSchema);
+export const CustomerDamageClaim = mongoose.model("CustomerDamageClaim", customerDamageClaimSchema);
+export const CustomerPromotion = mongoose.model("CustomerPromotion", customerPromotionSchema);
 export const LegacyMigrationMap = mongoose.model("LegacyMigrationMap", legacyMigrationMapSchema);
 export const LegacyMigrationRun = mongoose.model("LegacyMigrationRun", legacyMigrationRunSchema);
 export const LegacyMigrationItem = mongoose.model("LegacyMigrationItem", legacyMigrationItemSchema);

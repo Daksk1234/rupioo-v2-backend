@@ -130,20 +130,6 @@ function parseStatementDate(value) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function validateRunningOrder(rows) {
-  if (!rows.length) return { ok:true, rows, statementOpening:0 };
-  const first = rows[0];
-  const statementOpening = round2(first.runningBalance + first.debit - first.credit);
-  let previous = first.runningBalance;
-  const errors = [];
-  for (let i=1;i<rows.length;i++) {
-    const expected = round2(previous - rows[i].debit + rows[i].credit);
-    if (Math.abs(expected - rows[i].runningBalance) > 0.06) errors.push({ row:rows[i].rowNo, expected, actual:rows[i].runningBalance });
-    previous = rows[i].runningBalance;
-  }
-  return { ok:!errors.length, rows, statementOpening, errors };
-}
-
 function parseStatementAmount(value,{signedBalance=false}={}) {
   if (value === null || value === undefined || clean(value) === "") return null;
   const raw = clean(value).replace(/,/g, "").replace(/[₹$]/g, "");
@@ -197,11 +183,17 @@ function normalizeStatementRows(rawRows, cols) {
     const rawCredit = cols.credit ? row[cols.credit] : "";
     const rawBalance = cols.runningBalance ? row[cols.runningBalance] : "";
 
+    // Running Balance is deliberately optional. V2 calculates it itself after
+    // upload so a bank-exported or manually prepared balance column can never
+    // block an otherwise valid statement import.
     const blankRow = !clean(rawDate) && !sourcePartyName && !remarks && !clean(rawDebit) && !clean(rawCredit) && !clean(rawBalance);
     if (blankRow) continue;
 
     if (isLegacyTemplateSampleRow(row, cols)) { ignoredTemplateRows++; continue; }
 
+    // Backward compatibility with the old template. An old "OPENING BALANCE"
+    // line is read only as a hint; it is never used to validate transaction
+    // running balances anymore.
     const openingRow = !clean(rawDate) && /^OPENING\s+BALANCE\b/i.test(remarks);
     if (openingRow) {
       const parsedOpening = parseStatementAmount(rawBalance,{signedBalance:true});
@@ -215,14 +207,16 @@ function normalizeStatementRows(rawRows, cols) {
     const mode = normalizeStatementMode(valueFor(row, cols.mode), remarks);
     const debitParsed = parseStatementAmount(rawDebit);
     const creditParsed = parseStatementAmount(rawCredit);
-    const balanceParsed = parseStatementAmount(rawBalance,{signedBalance:true});
     const debit = Math.max(0, Number(debitParsed ?? 0));
     const credit = Math.max(0, Number(creditParsed ?? 0));
 
     if (!date) { errors.push({row:rowNo,error:"Invalid date"}); continue; }
     if ((debit > 0 && credit > 0) || (debit <= 0 && credit <= 0)) { errors.push({row:rowNo,error:"Enter either Debit or Credit, not both"}); continue; }
-    if (balanceParsed === null || !Number.isFinite(Number(balanceParsed))) { errors.push({row:rowNo,error:"Running Balance is required"}); continue; }
-    out.push({rowNo,date,sourcePartyName,partyName:partyHint,partyHint,remarks,mode,debit:round2(debit),credit:round2(credit),runningBalance:round2(balanceParsed)});
+
+    out.push({
+      rowNo,date,sourcePartyName,partyName:partyHint,partyHint,remarks,mode,
+      debit:round2(debit),credit:round2(credit),runningBalance:null,
+    });
   }
   return {rows:out,errors,openingBalanceHint,ignoredOpeningRows,ignoredTemplateRows};
 }
@@ -501,7 +495,7 @@ async function resolveNarrationsWithAi(rows=[],matcher){
 function statementFingerprint(financialYear,bankAccountId,row){
   return crypto.createHash("sha256").update([
     financialYear,bankAccountId,row.date.toISOString().slice(0,10),normalizeName(row.sourcePartyName ?? row.partyName),normalizeName(row.remarks),row.mode,
-    Number(row.debit||0).toFixed(2),Number(row.credit||0).toFixed(2),Number(row.runningBalance||0).toFixed(2)
+    Number(row.debit||0).toFixed(2),Number(row.credit||0).toFixed(2),Number(row.rowNo||0)
   ].join("|")).digest("hex");
 }
 
@@ -525,10 +519,144 @@ async function existingPostedBankRow({ BankStatementRow, tenantKey, financialYea
   const candidates = await BankStatementRow.find({
     ...filter, date: row.date,
     debit: Number(row.debit || 0), credit: Number(row.credit || 0),
-    runningBalance: Number(row.runningBalance || 0),
-  }).select("_id date remarks debit credit runningBalance").lean();
+  }).select("_id rowNo date remarks debit credit runningBalance").lean();
   const same = bankStatementIdentity(bankAccountId, row);
   return candidates.find((old) => bankStatementIdentity(bankAccountId, old) === same) || null;
+}
+
+
+const statementDateKey = (value) => {
+  const d=value instanceof Date?value:new Date(value);
+  return Number.isNaN(d.getTime())?0:d.getTime();
+};
+
+function sortStatementRows(rows=[]) {
+  return [...rows].sort((a,b)=>
+    statementDateKey(a.date)-statementDateKey(b.date)
+    || Number(a.rowNo||0)-Number(b.rowNo||0)
+  );
+}
+
+function signedOpeningValue(opening={}) {
+  const amount=Math.abs(Number(opening?.amount||0));
+  return opening?.type==="CR"?-amount:amount;
+}
+
+function manualTransactionFilter(tenantKey,financialYear,bankAccountId){
+  return {
+    tenantKey,financialYear,bankAccountId,
+    status:{$nin:["DELETED","CANCELLED","REVERSED"]},
+    $or:[
+      {statementImportId:{$exists:false}},
+      {statementImportId:""},
+      {statementImportId:null},
+    ],
+  };
+}
+
+function movementSort(a,b){
+  return statementDateKey(a.date)-statementDateKey(b.date)
+    || Number(a.priority||0)-Number(b.priority||0)
+    || statementDateKey(a.createdAt)-statementDateKey(b.createdAt)
+    || Number(a.rowNo||0)-Number(b.rowNo||0)
+    || String(a.id||"").localeCompare(String(b.id||""));
+}
+
+async function loadPostedBankMovements({tenantKey,financialYear,bankAccountId}){
+  const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
+  const manualFilter=manualTransactionFilter(tenantKey,financialYear,bankAccountId);
+  const [statementRows,receipts,payments]=await Promise.all([
+    BankStatementRow.find({
+      tenantKey,financialYear,bankAccountId,
+      transactionId:{$nin:[null,""]},
+      classification:{$nin:["DELETED","CANCELLED","REVERSED"]},
+    }).select("_id importId rowNo date debit credit runningBalance transactionId transactionType createdAt").lean(),
+    Receipt.find(manualFilter).select("_id receiptNo date amount runningBalance createdAt").lean(),
+    Payment.find(manualFilter).select("_id paymentNo date amount runningBalance createdAt").lean(),
+  ]);
+
+  return [
+    ...statementRows.map(x=>({
+      kind:"STATEMENT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:x.rowNo,
+      debit:Number(x.debit||0),credit:Number(x.credit||0),priority:0,
+    })),
+    ...receipts.map(x=>({
+      kind:"RECEIPT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
+      debit:0,credit:Number(x.amount||0),priority:0,
+    })),
+    ...payments.map(x=>({
+      kind:"PAYMENT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
+      debit:Number(x.amount||0),credit:0,priority:0,
+    })),
+  ].sort(movementSort);
+}
+
+async function calculateDraftRunningBalances({tenantKey,financialYear,bankAccountId,openingSigned,draftRows=[]}){
+  const posted=await loadPostedBankMovements({tenantKey,financialYear,bankAccountId});
+  const drafts=sortStatementRows(draftRows).map(x=>({
+    ...x,
+    _draft:true,
+    kind:"DRAFT",
+    id:`DRAFT:${Number(x.rowNo||0)}`,
+    createdAt:null,
+    priority:1,
+  }));
+  const merged=[...posted,...drafts].sort(movementSort);
+  let running=round2(openingSigned);
+  let balanceBeforeFirstDraft=null;
+  const calculated=new Map();
+  for(const row of merged){
+    if(row._draft && balanceBeforeFirstDraft===null)balanceBeforeFirstDraft=running;
+    running=round2(running-Number(row.debit||0)+Number(row.credit||0));
+    if(row._draft)calculated.set(Number(row.rowNo),running);
+  }
+  const rows=drafts.map(x=>({
+    ...x,
+    runningBalance:round2(calculated.get(Number(x.rowNo))??openingSigned),
+  })).map(({_draft,kind,id,createdAt,priority,...x})=>x);
+  return {
+    rows,
+    balanceBeforeFirstDraft:round2(balanceBeforeFirstDraft===null?openingSigned:balanceBeforeFirstDraft),
+    closingBalance:rows.length?Number(rows[rows.length-1].runningBalance||0):round2(openingSigned),
+  };
+}
+
+async function recalculatePostedBankRunningBalances({tenantKey,financialYear,bank}){
+  const opening=openingForYear(bank,financialYear);
+  if(!opening.exists)return {updated:0,closingBalance:0};
+  const openingSigned=signedOpeningValue(opening);
+  const movements=await loadPostedBankMovements({tenantKey,financialYear,bankAccountId:bank.bankAccountId});
+  if(!movements.length)return {updated:0,closingBalance:round2(openingSigned)};
+
+  const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
+  const statementOps=[],receiptOps=[],paymentOps=[];
+  let running=round2(openingSigned);
+
+  for(const movement of movements){
+    running=round2(running-Number(movement.debit||0)+Number(movement.credit||0));
+    if(movement.kind==="STATEMENT"){
+      statementOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
+      if(clean(movement.doc.transactionId)){
+        if(upper(movement.doc.transactionType)==="RECEIPT"){
+          receiptOps.push({updateOne:{filter:{tenantKey,financialYear,receiptNo:movement.doc.transactionId},update:{$set:{runningBalance:running}}}});
+        }else if(upper(movement.doc.transactionType)==="PAYMENT"){
+          paymentOps.push({updateOne:{filter:{tenantKey,financialYear,paymentNo:movement.doc.transactionId},update:{$set:{runningBalance:running}}}});
+        }
+      }
+    }else if(movement.kind==="RECEIPT"){
+      receiptOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
+    }else if(movement.kind==="PAYMENT"){
+      paymentOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
+    }
+  }
+
+  await Promise.all([
+    statementOps.length?BankStatementRow.bulkWrite(statementOps,{ordered:false}):null,
+    receiptOps.length?Receipt.bulkWrite(receiptOps,{ordered:false}):null,
+    paymentOps.length?Payment.bulkWrite(paymentOps,{ordered:false}):null,
+  ]);
+
+  return {updated:movements.length,closingBalance:round2(running)};
 }
 
 async function buildPartyMatcher(tenantKey) {
@@ -575,12 +703,13 @@ async function deleteBankTransactionIds({tenantKey,financialYear,ids=[]}){
   const unique=[...new Set((ids||[]).map(clean).filter(Boolean))];
   if(!unique.length)return {deleted:0,statement:0,receipts:0,payments:0};
   const {BankStatementRow,Receipt,Payment,LedgerEntry}=financialModels(tenantKey,financialYear);
-  let deleted=0,statement=0,receipts=0,payments=0;const importIds=new Set();
+  let deleted=0,statement=0,receipts=0,payments=0;const importIds=new Set(),bankAccountIds=new Set();
   for(const token of unique){
     const [kind,rawId]=token.includes(":")?token.split(/:(.+)/):["",token];
     const id=clean(rawId);if(!id)continue;
     if(kind==="BST"){
       const row=await BankStatementRow.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      if(clean(row.bankAccountId))bankAccountIds.add(clean(row.bankAccountId));
       const tx=clean(row.transactionId);if(tx){
         if(row.transactionType==="RECEIPT")receipts+=(await Receipt.deleteMany({tenantKey,financialYear,receiptNo:tx})).deletedCount||0;
         else payments+=(await Payment.deleteMany({tenantKey,financialYear,paymentNo:tx})).deletedCount||0;
@@ -591,6 +720,7 @@ async function deleteBankTransactionIds({tenantKey,financialYear,ids=[]}){
     }
     if(kind==="RCT"){
       const row=await Receipt.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      if(clean(row.bankAccountId))bankAccountIds.add(clean(row.bankAccountId));
       const tx=clean(row.receiptNo);if(tx)await LedgerEntry.deleteMany({tenantKey,financialYear,transactionId:tx});
       if(clean(row.statementImportId)){
         const linked=await BankStatementRow.find({tenantKey,financialYear,transactionId:tx}).select("importId").lean();
@@ -601,6 +731,7 @@ async function deleteBankTransactionIds({tenantKey,financialYear,ids=[]}){
     }
     if(kind==="PAY"){
       const row=await Payment.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      if(clean(row.bankAccountId))bankAccountIds.add(clean(row.bankAccountId));
       const tx=clean(row.paymentNo);if(tx)await LedgerEntry.deleteMany({tenantKey,financialYear,transactionId:tx});
       if(clean(row.statementImportId)){
         const linked=await BankStatementRow.find({tenantKey,financialYear,transactionId:tx}).select("importId").lean();
@@ -611,6 +742,13 @@ async function deleteBankTransactionIds({tenantKey,financialYear,ids=[]}){
     }
   }
   for(const importId of importIds)await refreshStatementImportAfterDelete({tenantKey,financialYear,importId});
+
+  // Any deletion changes every later Running Balance for that bank.
+  for(const bankAccountId of bankAccountIds){
+    const bank=await BankAccount.findOne({tenantKey,bankAccountId,status:{$ne:"DELETED"}});
+    if(bank)await recalculatePostedBankRunningBalances({tenantKey,financialYear,bank});
+  }
+
   return {deleted,statement,receipts,payments};
 }
 
@@ -685,7 +823,8 @@ router.put("/:id/opening-balance", async (req,res)=>{
   const amount=Math.abs(Number(req.body.amount||0)); if(!Number.isFinite(amount))return fail(res,"Enter a valid opening balance",400);
   const type=upper(req.body.type)==="CR"?"CR":"DR";
   await upsertOpeningBalance(bank,financialYear,amount,type,"MANUAL",req.auth.sub);
-  return ok(res,openingForYear(bank,financialYear),`Opening balance saved for ${financialYear}`);
+  await recalculatePostedBankRunningBalances({tenantKey:req.auth.tenantKey,financialYear,bank});
+  return ok(res,openingForYear(bank,financialYear),`Opening balance saved for ${financialYear}; Running Balance rebuilt automatically`);
 });
 
 
@@ -742,7 +881,7 @@ async function bankLedgerAudit({tenantKey,financialYear}){
     Receipt.aggregate([{$match:{tenantKey,financialYear}},{$group:{_id:"$receiptNo",count:{$sum:1}}},{$match:{count:{$gt:1}}}]),
     Payment.aggregate([{$match:{tenantKey,financialYear}},{$group:{_id:"$paymentNo",count:{$sum:1}}},{$match:{count:{$gt:1}}}]),
     BankStatementRow.find({tenantKey,financialYear,transactionId:{$nin:[null,""]}})
-      .select("_id bankAccountId transactionId date remarks debit credit runningBalance").sort({createdAt:1,_id:1}).lean(),
+      .select("_id bankAccountId transactionId rowNo date remarks debit credit runningBalance").sort({createdAt:1,_id:1}).lean(),
   ]);
   const seen=new Map(),duplicateStatements=[];
   for(const row of postedStatements){
@@ -814,12 +953,15 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     if(!req.file?.buffer)return fail(res,"Bank statement Excel/CSV file is required",400);
     const bank=await BankAccount.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});
     if(!bank)return fail(res,"Active bank account not found",404);
+
     // CSV dates must stay as text here. SheetJS can otherwise auto-parse
-    // DD-MM-YYYY values as MM-DD-YYYY (for example 03-04-2025), which
-    // makes one FY 2025-26 statement falsely appear to span 2024-25/2026-27.
-    const isCsv = /\.csv$/i.test(clean(req.file.originalname)) || /csv/i.test(clean(req.file.mimetype));
-    let rawRows; try{rawRows=readRows(req.file.buffer,{preserveText:isCsv});}catch{return fail(res,"Unable to read bank statement file",400);}
+    // DD-MM-YYYY values as MM-DD-YYYY.
+    const isCsv=/\.csv$/i.test(clean(req.file.originalname))||/csv/i.test(clean(req.file.mimetype));
+    let rawRows;
+    try{rawRows=readRows(req.file.buffer,{preserveText:isCsv});}
+    catch{return fail(res,"Unable to read bank statement file",400);}
     if(!rawRows.length)return fail(res,"Uploaded bank statement has no rows",400);
+
     const fields=[
       {key:"date",label:"Date",aliases:["txn date","transaction date","value date"],required:true},
       {key:"partyName",label:"Party Name",aliases:["party","particulars","name","beneficiary","description"]},
@@ -827,59 +969,163 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
       {key:"mode",label:"Mode",aliases:["transaction mode","type"]},
       {key:"debit",label:"Debit",aliases:["withdrawal","debit amount"],required:true},
       {key:"credit",label:"Credit",aliases:["deposit","credit amount"],required:true},
-      {key:"runningBalance",label:"Running Balance",aliases:["balance","closing balance"],required:true},
+      // Legacy bank exports may still contain Balance / Running Balance. We
+      // accept it for compatibility but never validate or trust it.
+      {key:"runningBalance",label:"Running Balance",aliases:["balance","closing balance"],required:false},
     ];
     const cols=resolveColumns(rawRows[0],fields);
-    const missing=fields.filter(f=>f.required&&!cols[f.key]).map(f=>f.label); if(missing.length)return fail(res,`Missing column(s): ${missing.join(", ")}`,400);
-    const normalized=normalizeStatementRows(rawRows,cols); if(normalized.errors.length)return fail(res,"Bank statement has invalid rows",400,{errors:normalized.errors.slice(0,50)});
-    let rows=normalized.rows;
-    if(!rows.length)return fail(res,"Uploaded bank statement has no transaction rows",400);
-    const rowYears=[...new Set(rows.map(r=>financialYearFromDate(r.date)).filter(Boolean))];
-    if(rowYears.length!==1)return fail(res,rowYears.length?`Statement contains transactions from multiple financial years (${rowYears.join(", ")}). Upload each financial year separately.`:"Could not determine Financial Year from statement dates",400);
-    const financialYear=rowYears[0];
-    const bounds=financialYearBounds(financialYear); if(!bounds)return fail(res,"Invalid Financial Year derived from statement dates",400);
-    const outside=rows.filter(r=>r.date<bounds.start||r.date>bounds.end); if(outside.length)return fail(res,`Statement contains dates outside ${financialYear}`,400,{rows:outside.slice(0,20).map(x=>x.rowNo)});
-    let running=validateRunningOrder(rows);
-    if(!running.ok){const reversed=validateRunningOrder([...rows].reverse());if(reversed.ok){rows=[...rows].reverse();running=reversed;}else return fail(res,"Running Balance does not reconcile with Debit/Credit rows",400,{errors:running.errors.slice(0,20)});}
+    const missing=fields.filter(f=>f.required&&!cols[f.key]).map(f=>f.label);
+    if(missing.length)return fail(res,`Missing column(s): ${missing.join(", ")}`,400);
 
-    let opening=openingForYear(bank,financialYear); const firstDate=rows[0].date;
-    const beginsOnFyStart=firstDate.getFullYear()===bounds.start.getFullYear()&&firstDate.getMonth()===bounds.start.getMonth()&&firstDate.getDate()===bounds.start.getDate();
+    const normalized=normalizeStatementRows(rawRows,cols);
+    if(normalized.errors.length)return fail(res,"Bank statement has invalid rows",400,{errors:normalized.errors.slice(0,50)});
+
+    let rows=sortStatementRows(normalized.rows);
+    if(!rows.length)return fail(res,"Uploaded bank statement has no transaction rows",400);
+
+    const rowYears=[...new Set(rows.map(r=>financialYearFromDate(r.date)).filter(Boolean))];
+    if(rowYears.length!==1)return fail(
+      res,
+      rowYears.length
+        ? `Statement contains transactions from multiple financial years (${rowYears.join(", ")}). Upload each financial year separately.`
+        : "Could not determine Financial Year from statement dates",
+      400,
+    );
+    const financialYear=rowYears[0];
+    const bounds=financialYearBounds(financialYear);
+    if(!bounds)return fail(res,"Invalid Financial Year derived from statement dates",400);
+    const outside=rows.filter(r=>r.date<bounds.start||r.date>bounds.end);
+    if(outside.length)return fail(res,`Statement contains dates outside ${financialYear}`,400,{rows:outside.slice(0,20).map(x=>x.rowNo)});
+
+    // Running balance is now system-generated. The only required base is the
+    // bank's FY opening balance, which is maintained in Bank Accounts.
+    const opening=openingForYear(bank,financialYear);
     if(!opening.exists){
-      if(!beginsOnFyStart)return fail(res,`Set the ${financialYear} opening balance for this bank account before reviewing a mid-year statement`,409,{statementOpening:running.statementOpening});
-      const signed=running.statementOpening;await upsertOpeningBalance(bank,financialYear,Math.abs(signed),signed<0?"CR":"DR","STATEMENT",req.auth.sub);opening=openingForYear(bank,financialYear);
-    }else if(beginsOnFyStart){
-      const savedSigned=opening.type==="CR"?-Math.abs(opening.amount):Math.abs(opening.amount);
-      if(Math.abs(savedSigned-running.statementOpening)>0.06)return fail(res,`Statement opening ${running.statementOpening.toFixed(2)} does not match saved ${financialYear} opening ${savedSigned.toFixed(2)}`,409,{savedOpening:savedSigned,statementOpening:running.statementOpening});
+      return fail(
+        res,
+        `Set the ${financialYear} opening balance for this bank account once. Running Balance will then be calculated automatically for every upload.`,
+        409,
+        {financialYear},
+      );
     }
+    const fyOpeningSigned=signedOpeningValue(opening);
 
     const {BankStatementImport,BankStatementRow}=financialModels(req.auth.tenantKey,financialYear);
-    // Replace this user's abandoned draft for the same bank/FY. Nothing in a draft has been posted.
-    const oldDrafts=await BankStatementImport.find({tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW",importedBy:req.auth.sub}).select("importId").lean();
-    if(oldDrafts.length){const ids=oldDrafts.map(x=>x.importId);await BankStatementRow.deleteMany({tenantKey:req.auth.tenantKey,financialYear,importId:{$in:ids},transactionId:{$in:[null,""]}});await BankStatementImport.deleteMany({tenantKey:req.auth.tenantKey,financialYear,importId:{$in:ids},status:"DRAFT_REVIEW"});}
 
-    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId}); const importId=makeId("BST");
-    const localMatchByRow=new Map(rows.map(r=>[Number(r.rowNo),matcher.detect(r)]));
-    const aiMatchByRow=await resolveNarrationsWithAi(rows.filter(r=>!localMatchByRow.get(Number(r.rowNo))?.entry),matcher);
-    const preview=[];let unmatchedRows=0,duplicateRows=0,autoMatchedRows=0;
+    // Replace this user's abandoned draft for the same bank/FY. Nothing in a
+    // draft has been posted.
+    const oldDrafts=await BankStatementImport.find({
+      tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,
+      status:"DRAFT_REVIEW",importedBy:req.auth.sub,
+    }).select("importId").lean();
+    if(oldDrafts.length){
+      const ids=oldDrafts.map(x=>x.importId);
+      await BankStatementRow.deleteMany({
+        tenantKey:req.auth.tenantKey,financialYear,importId:{$in:ids},
+        transactionId:{$in:[null,""]},
+      });
+      await BankStatementImport.deleteMany({
+        tenantKey:req.auth.tenantKey,financialYear,importId:{$in:ids},status:"DRAFT_REVIEW",
+      });
+    }
+
+    // Detect duplicates BEFORE calculating balances. Running Balance is no
+    // longer part of a bank-line identity, so changing/recalculating it can
+    // never create false duplicate/mismatch errors.
+    const uniqueRows=[];
+    let duplicateRows=0;
     const seenInFile=new Set();
     for(const r of rows){
-      const sourceFingerprint=statementFingerprint(financialYear,bank.bankAccountId,r);
-      const postedIdentity=postedBankFingerprint(financialYear,bank.bankAccountId,r);
-      const duplicate=seenInFile.has(postedIdentity) || await existingPostedBankRow({
-        BankStatementRow,tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,row:r,
+      const identity=postedBankFingerprint(financialYear,bank.bankAccountId,r);
+      const duplicate=seenInFile.has(identity)||await existingPostedBankRow({
+        BankStatementRow,
+        tenantKey:req.auth.tenantKey,
+        financialYear,
+        bankAccountId:bank.bankAccountId,
+        row:r,
       });
-      seenInFile.add(postedIdentity);
-      if(duplicate){duplicateRows++;preview.push({...r,date:r.date.toISOString(),transactionType:r.credit>0?"RECEIPT":"PAYMENT",classification:"DUPLICATE",duplicate:true,sourceFingerprint,matchedPartyGlobalId:"",matchedPartyName:"Already imported",detectionSource:"DUPLICATE",matchConfidence:100,candidateCount:1});continue;}
-      const found=aiMatchByRow.get(Number(r.rowNo))||localMatchByRow.get(Number(r.rowNo))||matcher.detect(r); const entry=found.entry;
-      const partyId=entry?.ref||""; const partyName=entry?.preferred||"Suspense Account"; const partyCode=entry?.partyAccountCode||"SYS_SUSPENSE";
-      const classification=entry?"AUTO_MATCHED":"SUSPENSE"; if(entry)autoMatchedRows++;else unmatchedRows++;
+      seenInFile.add(identity);
+      if(duplicate){duplicateRows++;continue;}
+      uniqueRows.push(r);
+    }
+    if(!uniqueRows.length){
+      return fail(res,"All rows in this file are already imported",409,{duplicateRows});
+    }
+
+    const calculated=await calculateDraftRunningBalances({
+      tenantKey:req.auth.tenantKey,
+      financialYear,
+      bankAccountId:bank.bankAccountId,
+      openingSigned:fyOpeningSigned,
+      draftRows:uniqueRows,
+    });
+    rows=calculated.rows;
+
+    const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId});
+    const importId=makeId("BST");
+    const localMatchByRow=new Map(rows.map(r=>[Number(r.rowNo),matcher.detect(r)]));
+    const aiMatchByRow=await resolveNarrationsWithAi(
+      rows.filter(r=>!localMatchByRow.get(Number(r.rowNo))?.entry),
+      matcher,
+    );
+
+    const preview=[];
+    let unmatchedRows=0,autoMatchedRows=0;
+    for(const r of rows){
+      const sourceFingerprint=statementFingerprint(financialYear,bank.bankAccountId,r);
+      const found=aiMatchByRow.get(Number(r.rowNo))||localMatchByRow.get(Number(r.rowNo))||matcher.detect(r);
+      const entry=found.entry;
+      const partyId=entry?.ref||"";
+      const partyName=entry?.preferred||"Suspense Account";
+      const partyCode=entry?.partyAccountCode||"SYS_SUSPENSE";
+      const classification=entry?"AUTO_MATCHED":"SUSPENSE";
+      if(entry)autoMatchedRows++;else unmatchedRows++;
       const fingerprint=crypto.createHash("sha256").update(`${importId}|${sourceFingerprint}`).digest("hex");
-      const doc=await BankStatementRow.create({tenantKey:req.auth.tenantKey,financialYear,importId,bankAccountId:bank.bankAccountId,rowNo:r.rowNo,date:r.date,partyName:partyName,remarks:r.remarks,mode:r.mode,debit:r.debit,credit:r.credit,runningBalance:r.runningBalance,fingerprint,sourceFingerprint,matchedPartyGlobalId:partyId,matchedPartyName:partyName,partyAccountCode:partyCode,transactionType:r.credit>0?"RECEIPT":"PAYMENT",transactionId:"",classification,detectionSource:found.source,matchConfidence:found.confidence,candidateCount:found.candidateCount,createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+      const doc=await BankStatementRow.create({
+        tenantKey:req.auth.tenantKey,financialYear,importId,
+        bankAccountId:bank.bankAccountId,rowNo:r.rowNo,date:r.date,
+        partyName,remarks:r.remarks,mode:r.mode,debit:r.debit,credit:r.credit,
+        runningBalance:r.runningBalance,fingerprint,sourceFingerprint,
+        matchedPartyGlobalId:partyId,matchedPartyName:partyName,partyAccountCode:partyCode,
+        transactionType:r.credit>0?"RECEIPT":"PAYMENT",transactionId:"",
+        classification,detectionSource:found.source,matchConfidence:found.confidence,
+        candidateCount:found.candidateCount,createdBy:req.auth.sub,
+        createdByNameSnapshot:req.auth.name||"",
+      });
       preview.push({...doc.toObject(),date:r.date.toISOString(),duplicate:false});
     }
-    const totalDebit=round2(rows.reduce((s,x)=>s+x.debit,0)),totalCredit=round2(rows.reduce((s,x)=>s+x.credit,0)),closingBalance=rows.length?rows[rows.length-1].runningBalance:0;
-    await BankStatementImport.create({tenantKey:req.auth.tenantKey,financialYear,importId,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,accountNumberSnapshot:bank.accountNumber,fileName:req.file.originalname,openingBalance:running.statementOpening,closingBalance,totalDebit,totalCredit,totalRows:rows.length,postedRows:0,unmatchedRows,duplicateRows,errorRows:0,status:"DRAFT_REVIEW",importedBy:req.auth.sub,importedByNameSnapshot:req.auth.name||""});
-    return ok(res,{importId,bankAccountId:bank.bankAccountId,bankName:bank.bankName,financialYear,totalRows:rows.length,reviewRows:preview.filter(x=>!x.duplicate),duplicateRows,autoMatchedRows,unmatchedRows,openingBalance:running.statementOpening,openingBalanceHint:normalized.openingBalanceHint,ignoredOpeningRows:normalized.ignoredOpeningRows,ignoredTemplateRows:normalized.ignoredTemplateRows,closingBalance,totalDebit,totalCredit},`Statement ready for review: ${autoMatchedRows} auto-matched, ${unmatchedRows} suspense, ${duplicateRows} duplicates`);
+
+    const totalDebit=round2(rows.reduce((s,x)=>s+x.debit,0));
+    const totalCredit=round2(rows.reduce((s,x)=>s+x.credit,0));
+    const closingBalance=calculated.closingBalance;
+
+    await BankStatementImport.create({
+      tenantKey:req.auth.tenantKey,financialYear,importId,
+      bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,
+      accountNumberSnapshot:bank.accountNumber,fileName:req.file.originalname,
+      openingBalance:calculated.balanceBeforeFirstDraft,closingBalance,
+      totalDebit,totalCredit,totalRows:rows.length,postedRows:0,unmatchedRows,
+      duplicateRows,errorRows:0,status:"DRAFT_REVIEW",importedBy:req.auth.sub,
+      importedByNameSnapshot:req.auth.name||"",
+    });
+
+    return ok(res,{
+      importId,
+      bankAccountId:bank.bankAccountId,
+      bankName:bank.bankName,
+      financialYear,
+      totalRows:rows.length,
+      reviewRows:preview,
+      duplicateRows,
+      autoMatchedRows,
+      unmatchedRows,
+      fyOpeningBalance:fyOpeningSigned,
+      openingBalance:calculated.balanceBeforeFirstDraft,
+      ignoredOpeningRows:normalized.ignoredOpeningRows,
+      ignoredTemplateRows:normalized.ignoredTemplateRows,
+      closingBalance,totalDebit,totalCredit,
+      runningBalanceCalculated:true,
+    },`Statement ready for review: ${autoMatchedRows} auto-matched, ${unmatchedRows} suspense, ${duplicateRows} duplicates skipped. Running Balance calculated automatically.`);
   }catch(error){return next(error);}
 });
 
@@ -894,82 +1140,164 @@ router.put("/:id/statement-review/:importId", async (req,res,next)=>{
   try{
     const bank=await BankAccount.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});
     if(!bank)return fail(res,"Active bank account not found",404);
+
     const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");
     if(!financialYear)return fail(res,"Select Financial Year",400);
+
     const edits=Array.isArray(req.body.rows)?req.body.rows:[];
     if(!edits.length)return fail(res,"No statement review rows supplied",400);
+
     const {BankStatementImport,BankStatementRow}=financialModels(req.auth.tenantKey,financialYear);
-    const batch=await BankStatementImport.findOne({tenantKey:req.auth.tenantKey,financialYear,importId:req.params.importId,bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW"});
+    const batch=await BankStatementImport.findOne({
+      tenantKey:req.auth.tenantKey,financialYear,importId:req.params.importId,
+      bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW",
+    });
     if(!batch)return fail(res,"Statement review draft not found or already submitted",404);
-    const docs=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({rowNo:1});
+
+    const docs=await BankStatementRow.find({
+      tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,
+      transactionId:{$in:[null,""]},
+    }).sort({rowNo:1});
+
     const editMap=new Map(edits.map(x=>[Number(x.rowNo),x]));
     const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId});
     const validation=[];
     const prepared=[];
+
     for(const doc of docs){
       const edit=editMap.get(Number(doc.rowNo));
-      if(!edit){const requested=clean(doc.matchedPartyGlobalId);prepared.push({doc,date:doc.date,remarks:doc.remarks,mode:doc.mode,debit:Number(doc.debit||0),credit:Number(doc.credit||0),runningBalance:Number(doc.runningBalance||0),requested,originalPartyRef:requested,selected:requested?matcher.byId.get(requested)||null:null});continue;}
-      const has=(key)=>Object.prototype.hasOwnProperty.call(edit,key);
+      const has=(key)=>Boolean(edit)&&Object.prototype.hasOwnProperty.call(edit,key);
       const date=has("date")&&clean(edit.date)?parseStatementDate(edit.date):doc.date;
       const remarks=has("remarks")?clean(edit.remarks):clean(doc.remarks);
       const mode=normalizeStatementMode(has("mode")?edit.mode:doc.mode,remarks);
       const debitRaw=has("debit")&&edit.debit!==""&&edit.debit!==null?Number(edit.debit):Number(doc.debit||0);
       const creditRaw=has("credit")&&edit.credit!==""&&edit.credit!==null?Number(edit.credit):Number(doc.credit||0);
-      const balanceRaw=has("runningBalance")&&edit.runningBalance!==""&&edit.runningBalance!==null?Number(edit.runningBalance):Number(doc.runningBalance);
       const debit=Number.isFinite(debitRaw)?Math.max(0,debitRaw):NaN;
       const credit=Number.isFinite(creditRaw)?Math.max(0,creditRaw):NaN;
-      const runningBalance=Number.isFinite(balanceRaw)?balanceRaw:NaN;
+
       let requested=has("partyGlobalId")?clean(edit.partyGlobalId):clean(doc.matchedPartyGlobalId);
       if(!date)validation.push({row:doc.rowNo,error:"Invalid date"});
       else if(financialYearFromDate(date)!==financialYear)validation.push({row:doc.rowNo,error:`Date must remain inside ${financialYear}`});
-      if(!Number.isFinite(debit)||!Number.isFinite(credit)||(debit>0&&credit>0)||(debit<=0&&credit<=0))validation.push({row:doc.rowNo,error:"Enter either Debit or Credit, not both"});
-      if(!Number.isFinite(runningBalance))validation.push({row:doc.rowNo,error:"Running Balance is required"});
+      if(!Number.isFinite(debit)||!Number.isFinite(credit)||(debit>0&&credit>0)||(debit<=0&&credit<=0)){
+        validation.push({row:doc.rowNo,error:"Enter either Debit or Credit, not both"});
+      }
+
       let selected=null;
       if(requested&&requested!=="SUSPENSE")selected=matcher.byId.get(requested)||null;
       if(requested&&requested!=="SUSPENSE"&&!selected){
         const recovered=matcher.detect({remarks,partyHint:extractPartyHintFromRemarks(remarks)});
-        selected=recovered.entry||null;requested=selected?.ref||"SUSPENSE";
+        selected=recovered.entry||null;
+        requested=selected?.ref||"SUSPENSE";
       }
-      prepared.push({doc,date,remarks,mode,debit:round2(debit),credit:round2(credit),runningBalance:round2(runningBalance),requested,originalPartyRef:clean(doc.matchedPartyGlobalId),selected});
+
+      prepared.push({
+        doc,date,remarks,mode,
+        debit:round2(debit),credit:round2(credit),
+        requested,
+        originalPartyRef:clean(doc.matchedPartyGlobalId),
+        selected,
+      });
+    }
+
+    if(validation.length)return fail(res,"Some edited bank statement rows are invalid",400,{errors:validation.slice(0,50)});
+
+    // Duplicate checking uses transaction identity only. Running Balance is
+    // intentionally excluded because it is derived, not uploaded data.
+    const seen=new Set();
+    for(const item of prepared){
+      const sourceRow={
+        rowNo:item.doc.rowNo,date:item.date,sourcePartyName:"",partyName:"",
+        remarks:item.remarks,mode:item.mode,debit:item.debit,credit:item.credit,
+      };
+      const identity=postedBankFingerprint(financialYear,bank.bankAccountId,sourceRow);
+      if(seen.has(identity)){
+        validation.push({row:item.doc.rowNo,error:"Duplicate transaction inside the uploaded statement"});
+        continue;
+      }
+      seen.add(identity);
+      const duplicate=await existingPostedBankRow({
+        BankStatementRow,tenantKey:req.auth.tenantKey,financialYear,
+        bankAccountId:bank.bankAccountId,row:sourceRow,excludeId:item.doc._id,
+      });
+      if(duplicate)validation.push({row:item.doc.rowNo,error:"This bank transaction is already posted"});
     }
     if(validation.length)return fail(res,"Some edited bank statement rows are invalid",400,{errors:validation.slice(0,50)});
-    const running=validateRunningOrder(prepared.map(x=>({rowNo:x.doc.rowNo,date:x.date,debit:x.debit,credit:x.credit,runningBalance:x.runningBalance})));
-    if(!running.ok)return fail(res,"Edited Running Balance does not reconcile with Debit/Credit rows",400,{errors:running.errors.slice(0,50)});
 
     for(const item of prepared){
-      const {doc,date,remarks,mode,debit,credit,runningBalance}=item;
+      const {doc,date,remarks,mode,debit,credit}=item;
       const selected=item.selected||null;
       const requested=clean(item.requested);
-      const sourceRow={rowNo:doc.rowNo,date,sourcePartyName:"",partyName:"",remarks,mode,debit,credit,runningBalance};
+      const sourceRow={rowNo:doc.rowNo,date,sourcePartyName:"",partyName:"",remarks,mode,debit,credit};
       const editedFingerprint=statementFingerprint(financialYear,bank.bankAccountId,sourceRow);
+
       doc.date=date;
       doc.remarks=remarks;
       doc.mode=mode;
       doc.debit=debit;
       doc.credit=credit;
-      doc.runningBalance=runningBalance;
       doc.transactionType=credit>0?"RECEIPT":"PAYMENT";
       doc.fingerprint=crypto.createHash("sha256").update(`${batch.importId}|${editedFingerprint}`).digest("hex");
+      doc.sourceFingerprint=editedFingerprint;
       doc.matchedPartyGlobalId=selected?.ref||"";
       doc.matchedPartyName=selected?.preferred||"Suspense Account";
       doc.partyName=selected?.preferred||"Suspense Account";
       doc.partyAccountCode=selected?.partyAccountCode||"SYS_SUSPENSE";
       doc.classification=selected?"MANUAL_MATCHED":"SUSPENSE";
-      doc.detectionSource=selected?(requested===clean(item.originalPartyRef)?doc.detectionSource||"REVIEW_SAVED":"MANUAL_REVIEW_EDIT"):"MANUAL_SUSPENSE";
+      doc.detectionSource=selected
+        ? (requested===clean(item.originalPartyRef)?doc.detectionSource||"REVIEW_SAVED":"MANUAL_REVIEW_EDIT")
+        : "MANUAL_SUSPENSE";
       doc.matchConfidence=selected?100:0;
       doc.candidateCount=selected?1:0;
       doc.error="";
       await doc.save();
     }
 
-    const saved=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({rowNo:1}).lean();
-    batch.openingBalance=running.statementOpening;
-    batch.closingBalance=saved.length?Number(saved[saved.length-1].runningBalance||0):0;
+    const opening=openingForYear(bank,financialYear);
+    if(!opening.exists)return fail(res,`Set the ${financialYear} opening balance for this bank account`,409);
+
+    const draftDocs=await BankStatementRow.find({
+      tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,
+      transactionId:{$in:[null,""]},
+    }).lean();
+
+    const calculated=await calculateDraftRunningBalances({
+      tenantKey:req.auth.tenantKey,
+      financialYear,
+      bankAccountId:bank.bankAccountId,
+      openingSigned:signedOpeningValue(opening),
+      draftRows:draftDocs,
+    });
+
+    if(calculated.rows.length){
+      await BankStatementRow.bulkWrite(
+        calculated.rows.map(x=>({
+          updateOne:{filter:{_id:x._id},update:{$set:{runningBalance:Number(x.runningBalance||0)}}},
+        })),
+        {ordered:false},
+      );
+    }
+
+    const saved=await BankStatementRow.find({
+      tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,
+      transactionId:{$in:[null,""]},
+    }).sort({date:1,rowNo:1}).lean();
+
+    batch.openingBalance=calculated.balanceBeforeFirstDraft;
+    batch.closingBalance=saved.length?Number(saved[saved.length-1].runningBalance||0):calculated.balanceBeforeFirstDraft;
     batch.totalDebit=round2(saved.reduce((sum,x)=>sum+Number(x.debit||0),0));
     batch.totalCredit=round2(saved.reduce((sum,x)=>sum+Number(x.credit||0),0));
     batch.unmatchedRows=saved.filter(x=>!clean(x.matchedPartyGlobalId)).length;
     await batch.save();
-    return ok(res,{reviewRows:saved.map(x=>({...x,date:x.date?.toISOString?.()||x.date})),openingBalance:batch.openingBalance,closingBalance:batch.closingBalance,totalDebit:batch.totalDebit,totalCredit:batch.totalCredit,unmatchedRows:batch.unmatchedRows},"Review changes saved");
+
+    return ok(res,{
+      reviewRows:saved.map(x=>({...x,date:x.date?.toISOString?.()||x.date})),
+      openingBalance:batch.openingBalance,
+      closingBalance:batch.closingBalance,
+      totalDebit:batch.totalDebit,
+      totalCredit:batch.totalCredit,
+      unmatchedRows:batch.unmatchedRows,
+      runningBalanceCalculated:true,
+    },"Review changes saved and Running Balance recalculated automatically");
   }catch(error){return next(error);}
 });
 
@@ -981,7 +1309,30 @@ router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
     await Promise.all([Receipt.init(),Payment.init(),BankStatementRow.init()]);
     const batch=await BankStatementImport.findOne({tenantKey:req.auth.tenantKey,financialYear,importId:req.params.importId,bankAccountId:bank.bankAccountId,status:"DRAFT_REVIEW"});
     if(!batch)return fail(res,"Statement review draft not found or already submitted",404);
-    const rows=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({rowNo:1});
+    let rows=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({date:1,rowNo:1});
+    const opening=openingForYear(bank,financialYear);
+    if(!opening.exists)return fail(res,`Set the ${financialYear} opening balance for this bank account`,409);
+
+    // Recalculate immediately before posting too. If another bank transaction
+    // was entered after preview, the submitted statement still receives the
+    // correct balances from the latest bank history.
+    const preSubmitCalculated=await calculateDraftRunningBalances({
+      tenantKey:req.auth.tenantKey,
+      financialYear,
+      bankAccountId:bank.bankAccountId,
+      openingSigned:signedOpeningValue(opening),
+      draftRows:rows.map(x=>x.toObject()),
+    });
+    if(preSubmitCalculated.rows.length){
+      await BankStatementRow.bulkWrite(
+        preSubmitCalculated.rows.map(x=>({
+          updateOne:{filter:{_id:x._id},update:{$set:{runningBalance:Number(x.runningBalance||0)}}},
+        })),
+        {ordered:false},
+      );
+    }
+    rows=await BankStatementRow.find({tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,transactionId:{$in:[null,""]}}).sort({date:1,rowNo:1});
+
     const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId});
     const assignmentMap=new Map((Array.isArray(req.body.assignments)?req.body.assignments:[]).map(x=>[Number(x.rowNo),clean(x.partyGlobalId)]));
     const bankSystemCode=["OD","CC"].includes(upper(bank.accountType))?"SYS_BANK_OD":"SYS_BANK_ACCOUNT";
@@ -1039,8 +1390,37 @@ router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
         if(errors.length<50)errors.push({row:r.rowNo,error:error.message});
       }
     }
-    batch.postedRows=postedRows;batch.unmatchedRows=unmatchedRows;batch.errorRows=errorRows;batch.status=errorRows?"SUBMITTED_WITH_ERRORS":"SUBMITTED";batch.submittedBy=req.auth.sub;batch.submittedByNameSnapshot=req.auth.name||"";batch.submittedAt=new Date();await batch.save();
-    return ok(res,{importId:batch.importId,postedRows,unmatchedRows,errorRows,totalRows:batch.totalRows,duplicateRows:batch.duplicateRows,closingBalance:batch.closingBalance,errors},`Statement submitted: ${postedRows} transactions posted, ${unmatchedRows} to Suspense`);
+    // Rebuild the complete bank running-balance chain after posting. This
+    // repairs later balances too when historical rows are uploaded.
+    const rebuilt=await recalculatePostedBankRunningBalances({
+      tenantKey:req.auth.tenantKey,
+      financialYear,
+      bank,
+    });
+
+    const submittedRows=await BankStatementRow.find({
+      tenantKey:req.auth.tenantKey,financialYear,importId:batch.importId,
+      transactionId:{$nin:[null,""]},
+    }).sort({date:1,rowNo:1}).lean();
+
+    batch.postedRows=postedRows;
+    batch.unmatchedRows=unmatchedRows;
+    batch.errorRows=errorRows;
+    batch.status=errorRows?"SUBMITTED_WITH_ERRORS":"SUBMITTED";
+    batch.submittedBy=req.auth.sub;
+    batch.submittedByNameSnapshot=req.auth.name||"";
+    batch.submittedAt=new Date();
+    if(submittedRows.length)batch.closingBalance=Number(submittedRows[submittedRows.length-1].runningBalance||0);
+    await batch.save();
+
+    return ok(res,{
+      importId:batch.importId,postedRows,unmatchedRows,errorRows,
+      totalRows:batch.totalRows,duplicateRows:batch.duplicateRows,
+      closingBalance:batch.closingBalance,
+      bankClosingBalance:rebuilt.closingBalance,
+      runningBalanceRebuilt:rebuilt.updated,
+      errors,
+    },`Statement submitted: ${postedRows} transactions posted, ${unmatchedRows} to Suspense. Running Balance rebuilt automatically.`);
   }catch(error){return next(error);}
 });
 
@@ -1075,6 +1455,18 @@ router.put("/:id", async (req,res)=>{
   const fy=clean(merged.financialYear); const current=openingBalances.find(x=>x.financialYear===fy)||{amount:Number(merged.openingBalance||0),type:upper(merged.openingBalanceType)==="CR"?"CR":"DR"};
   Object.assign(row,{bankName:bankMaster.bankName,branchName:bankMaster.branchName,branchAddress:bankMaster.bankAddress,city:bankMaster.city,state:bankMaster.state,stdCode:bankMaster.stdCode,phone:bankMaster.phone,contactNo:bankMaster.contactNo,accountHolderName:clean(merged.accountHolderName),accountNumber,accountNumberNormalized:accountNumber,ifsc:bankMaster.ifsc,micr:clean(merged.micr),swiftCode:upper(merged.swiftCode),upiId:clean(merged.upiId),accountType:upper(merged.accountType||"CURRENT"),openingBalance:Number(current.amount||0),openingBalanceType:current.type==="CR"?"CR":"DR",financialYear:fy,openingBalances,isPrimary:Boolean(merged.isPrimary),status:upper(merged.status||"ACTIVE")==="INACTIVE"?"INACTIVE":"ACTIVE",remarks:clean(merged.remarks),updatedBy:req.auth.sub});
   await row.save(); const ledger=await syncBankAccountLedger(row); if(ledger){ledger.status=row.status==="ACTIVE"?"ACTIVE":"INACTIVE";await ledger.save();row.ledgerId=ledger.ledgerId;await row.save();}
+
+  // Opening-balance edits affect every later bank transaction in that FY.
+  for(const openingRow of openingBalances){
+    if(clean(openingRow.financialYear)){
+      await recalculatePostedBankRunningBalances({
+        tenantKey:req.auth.tenantKey,
+        financialYear:clean(openingRow.financialYear),
+        bank:row,
+      });
+    }
+  }
+
   return ok(res,row,"Bank account updated");
 });
 

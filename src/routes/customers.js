@@ -33,6 +33,7 @@ import {
   resolveCustomerSalesperson,
 } from "../services/assignmentHierarchyService.js";
 import { financialModels } from "../services/accountingService.js";
+import { buildCustomerReceivableLedger } from "../services/customerReceivableLedgerService.js";
 import { referencedPartyIds } from "../services/referenceIntegrityService.js";
 import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { resolveCustomerDeliveryMode } from "../services/deliveryLocalityService.js";
@@ -41,6 +42,7 @@ import {
   ensureLegacyCustomerTransporter,
 } from "../services/transporterAssignmentService.js";
 import { isSystemCashRecord } from "../services/systemCashAccountService.js";
+import { matchCustomerTransporters } from "../services/customerTransporterMatchingService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -186,121 +188,87 @@ const servicesDestination = (station, address = {}) => {
   return false;
 };
 async function validateCustomerTransportAssignment({ tenantKey, link }) {
-  // Creditors are purchase-side parties. They never require delivery transporter assignment.
+  // Creditors are purchase-side parties and do not need sales-delivery mapping.
   if (upper(link?.partyType) === "CREDITOR") {
     link.regionType = link.regionType || "LOCAL";
+    link.assignedTransporters = [];
+    link.transporterMatchType = "NONE";
+    link.transporterMappedAt = new Date();
     link.assignedTransport = "";
     link.assignedTransportGlobalId = "";
     link.assignedTransportBookingStationId = "";
     link.assignedTransportDeliveryStationId = "";
     link.serviceArea = "";
-    return { mode: link.regionType, requiresTransport: false, creditor: true };
+    return { mode: link.regionType, requiresTransport: false, creditor: true, items: [] };
   }
-  // Delivery locality is CITY based, not GST/state based. GST state code is used
-  // only for CGST/SGST vs IGST. Same firm city = local delivery; every other
-  // destination city requires a transporter.
-  const locality = await resolveCustomerDeliveryMode({
+
+  const billing =
+    (link?.addresses || []).find((x) => upper(x?.type || "BILLING") === "BILLING") ||
+    (link?.addresses || [])[0] ||
+    {};
+
+  // New rule: customer transporter assignment is NEVER manually selected here.
+  // Exact service-pincode matches win. City matching is used only when there is
+  // no transporter serving the exact pincode. Every match is mapped.
+  const matched = await matchCustomerTransporters({
     tenantKey,
-    customer: link,
+    pincode: billing.pincode,
+    city: billing.city,
   });
-  link.regionType = locality.mode;
-  if (!locality.requiresTransport) {
+
+  link.assignedTransporters = (matched.items || []).map((row) => ({
+    transporterId: cleanText(row.transporterId || row.localTransporterId),
+    globalTransporterId: cleanText(row.globalTransporterId),
+    transporterName: cleanText(row.name),
+    stationId: cleanText(row.stationId),
+    baseStationName: cleanText(row.baseStationName),
+    baseStationPincode: cleanText(row.baseStationPincode),
+    baseStationCity: cleanText(row.baseStationCity),
+    matchType: row.matchType === "CITY" ? "CITY" : "PINCODE",
+    matchedPincode: cleanText(matched.destination?.pincode || billing.pincode),
+    matchedCity: cleanText(matched.destination?.city || billing.city),
+  }));
+  link.transporterMatchType = matched.matchType || "NONE";
+  link.transporterMappedAt = new Date();
+  link.serviceArea = cleanText(matched.destination?.city || billing.city);
+
+  // Keep the old single-transporter fields mirrored to the first automatic
+  // match so old reports/imports continue to work. New screens use the array.
+  const first = link.assignedTransporters[0];
+  if (first) {
+    link.assignedTransport = first.transporterId || "";
+    link.assignedTransportGlobalId = first.globalTransporterId || "";
+    link.assignedTransportBookingStationId = first.stationId || "";
+    link.assignedTransportDeliveryStationId = first.stationId || "";
+  } else {
     link.assignedTransport = "";
     link.assignedTransportGlobalId = "";
     link.assignedTransportBookingStationId = "";
     link.assignedTransportDeliveryStationId = "";
-    link.serviceArea = locality.customerCity;
-    return locality;
   }
-  if (!cleanText(link.assignedTransportGlobalId))
+
+  const locality = await resolveCustomerDeliveryMode({ tenantKey, customer: link });
+  link.regionType = locality.mode;
+
+  // Local customers can be saved without a transporter. Outside-city customers
+  // must first have at least one transporter service area configured in the
+  // Transporter List; there is no manual customer-level override anymore.
+  if (locality.requiresTransport && !link.assignedTransporters.length) {
     throw Object.assign(
       new Error(
-        `Assign a transporter serving ${locality.customerCity} before saving this customer`,
+        `No transporter in Transporter List serves ${billing.pincode || locality.customerCity || "this customer"}. Add the service pincode/city to a transporter first.`,
       ),
       { statusCode: 400 },
     );
-  if (!cleanText(link.assignedTransport))
-    throw Object.assign(
-      new Error(
-        "Selected transporter must be linked to the company transporter master",
-      ),
-      { statusCode: 400 },
-    );
-  if (!cleanText(link.assignedTransportDeliveryStationId))
-    throw Object.assign(
-      new Error(`Select a delivery station serving ${locality.customerCity}`),
-      { statusCode: 400 },
-    );
-  let local = await resolveCompanyTransporter({
-    tenantKey,
-    ref: link.assignedTransport,
-    globalTransporterId: link.assignedTransportGlobalId,
-  });
-  if (!local && link.migration?.legacyId) {
-    const repaired = await ensureLegacyCustomerTransporter({
-      tenantKey,
-      customer: link,
-    });
-    local = repaired.transporter;
   }
-  if (!local)
-    throw Object.assign(
-      new Error(
-        "Selected transporter is not active in the company transporter master",
-      ),
-      { statusCode: 400 },
-    );
-  link.assignedTransport = String(local._id);
-  if (!link.assignedTransportGlobalId && local.globalTransporterId)
-    link.assignedTransportGlobalId = local.globalTransporterId;
-  if (
-    link.migration?.legacyId &&
-    !cleanText(link.assignedTransportDeliveryStationId)
-  ) {
-    link.serviceArea = cleanText(
-      link.serviceArea || local.stations?.[0]?.name || local.name,
-    );
-    return locality;
-  }
-  const delivery = await GlobalTransporterStation.findOne({
-    stationId: link.assignedTransportDeliveryStationId,
-    globalTransporterId: link.assignedTransportGlobalId,
-    status: "ACTIVE",
-    stationType: { $in: ["DELIVERY", "BOTH"] },
-  }).lean();
-  if (!delivery)
-    throw Object.assign(
-      new Error("Selected delivery station is not active for this transporter"),
-      { statusCode: 400 },
-    );
-  const destination = locality.destination || {};
-  if (!servicesDestination(delivery, destination))
-    throw Object.assign(
-      new Error(
-        `Selected delivery station does not serve ${locality.customerCity || destination.pincode || "the customer delivery location"}`,
-      ),
-      { statusCode: 400 },
-    );
-  if (link.assignedTransportBookingStationId) {
-    const booking = await GlobalTransporterStation.findOne({
-      stationId: link.assignedTransportBookingStationId,
-      globalTransporterId: link.assignedTransportGlobalId,
-      status: "ACTIVE",
-      stationType: { $in: ["BOOKING", "BOTH"] },
-    }).lean();
-    if (!booking)
-      throw Object.assign(
-        new Error(
-          "Selected booking station is not active for this transporter",
-        ),
-        { statusCode: 400 },
-      );
-  }
-  link.serviceArea = cleanText(
-    link.serviceArea || delivery.name || delivery.city || locality.customerCity,
-  );
-  return locality;
+
+  return {
+    ...locality,
+    matchType: matched.matchType || "NONE",
+    items: link.assignedTransporters,
+  };
 }
+
 const pinGeo = async (value, fallback = {}) => {
   const pincode = digits(value).slice(0, 6);
   if (pincode.length !== 6)
@@ -814,7 +782,10 @@ async function enrichedItems(filter, { page = 1, limit = 50 } = {}) {
         ],
       }
     : { hiddenId: { $in: [] } };
-  const [globals, transporters, stations, salesUsers] = await Promise.all([
+  const gradeCodes = [
+    ...new Set(items.map((x) => upper(x.gradeCode)).filter(Boolean)),
+  ];
+  const [globals, transporters, stations, salesUsers, gradeMasters] = await Promise.all([
     GlobalCustomer.find(globalFilter)
       .select(
         "hiddenId legalName tradeName registeredAddress gstins pan aadhaarMasked mobiles emails globalHealth gstProfile",
@@ -863,6 +834,14 @@ async function enrichedItems(filter, { page = 1, limit = 50 } = {}) {
     })
       .select("_id name email")
       .lean(),
+    gradeCodes.length
+      ? CustomerGrade.find({
+          tenantKey: filter.tenantKey,
+          code: { $in: gradeCodes },
+        })
+          .select("code name discountPct status")
+          .lean()
+      : [],
   ]);
   const gm = new Map();
   for (const g of globals) {
@@ -876,25 +855,38 @@ async function enrichedItems(filter, { page = 1, limit = 50 } = {}) {
   }
   const sm = new Map(stations.map((st) => [String(st.stationId), st]));
   const um = new Map((salesUsers || []).map((u) => [String(u._id), u]));
+  const gradeMap = new Map(
+    (gradeMasters || []).map((g) => [upper(g.code), g]),
+  );
   return {
-    items: items.map((x) => ({
-      ...x,
-      global: gm.get(String(x.globalCustomerId)) || null,
-      salespersonDetails: um.get(String(x.salespersonId || "")) || null,
-      assignedTransportDetails: x.assignedTransport
-        ? {
-            transporter:
-              tm.get(String(x.assignedTransport)) ||
-              tm.get(String(x.assignedTransport).toLowerCase()) ||
-              null,
-            bookingStation:
-              sm.get(String(x.assignedTransportBookingStationId || "")) || null,
-            deliveryStation:
-              sm.get(String(x.assignedTransportDeliveryStationId || "")) ||
-              null,
-          }
-        : null,
-    })),
+    items: items.map((x) => {
+      const grade = gradeMap.get(upper(x.gradeCode));
+      const liveGradeDiscountPct = grade && upper(grade.status) === "ACTIVE"
+        ? Number(grade.discountPct || 0)
+        : 0;
+      return {
+        ...x,
+        // CUSTOMER GRADES is authoritative. Never expose a stale percentage
+        // cached on CustomerLink after the grade master has been edited.
+        gradeName: grade?.name || "",
+        gradeDiscountPct: liveGradeDiscountPct,
+        global: gm.get(String(x.globalCustomerId)) || null,
+        salespersonDetails: um.get(String(x.salespersonId || "")) || null,
+        assignedTransportDetails: x.assignedTransport
+          ? {
+              transporter:
+                tm.get(String(x.assignedTransport)) ||
+                tm.get(String(x.assignedTransport).toLowerCase()) ||
+                null,
+              bookingStation:
+                sm.get(String(x.assignedTransportBookingStationId || "")) || null,
+              deliveryStation:
+                sm.get(String(x.assignedTransportDeliveryStationId || "")) ||
+                null,
+            }
+          : null,
+      };
+    }),
     total,
   };
 }
@@ -1920,11 +1912,11 @@ router.get("/:globalId/360", async (req, res) => {
   };
   const fy = cleanText(req.query.financialYear);
   if (fy) {
-    const { SalesInvoice, Receipt, LedgerEntry } = financialModels(
+    const { SalesInvoice, Receipt } = financialModels(
       req.auth.tenantKey,
       fy,
     );
-    const [salesAgg, receiptAgg, ledgerAgg, lastInvoice, lastReceipt] =
+    const [salesAgg, receiptAgg, receivableLedger, lastInvoice, lastReceipt] =
       await Promise.all([
         SalesInvoice.aggregate([
           {
@@ -1954,24 +1946,7 @@ router.get("/:globalId/360", async (req, res) => {
           },
           { $group: { _id: null, total: { $sum: "$amount" } } },
         ]),
-        LedgerEntry.aggregate([
-          {
-            $match: {
-              tenantKey: req.auth.tenantKey,
-              financialYear: fy,
-              partyGlobalId: req.params.globalId,
-              accountCode: "SYS_SUNDRY_DEBTORS",
-              status: "POSTED",
-            },
-          },
-          {
-            $group: {
-              _id: null,
-              debit: { $sum: "$debit" },
-              credit: { $sum: "$credit" },
-            },
-          },
-        ]),
+        buildCustomerReceivableLedger({ tenantKey: req.auth.tenantKey, financialYear: fy, customer: link }),
         SalesInvoice.findOne({
           tenantKey: req.auth.tenantKey,
           financialYear: fy,
@@ -1995,8 +1970,7 @@ router.get("/:globalId/360", async (req, res) => {
       sales: Number(salesAgg[0]?.total || 0),
       orders: Number(salesAgg[0]?.count || 0),
       receipts: Number(receiptAgg[0]?.total || 0),
-      outstanding:
-        Number(ledgerAgg[0]?.debit || 0) - Number(ledgerAgg[0]?.credit || 0),
+      outstanding: Number(receivableLedger?.closingSigned || 0),
       lastInvoice,
       lastReceipt,
     };
@@ -2044,7 +2018,6 @@ const saveCustomerListFields = async (req, res) => {
     "openingBalance",
     "salespersonId",
     "password",
-    "assignedTransport",
   ]);
   const keys = Object.keys(changes).filter((k) => allowed.has(k));
   if (!keys.length)

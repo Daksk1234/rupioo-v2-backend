@@ -1,7 +1,7 @@
 import express from "express";
 import mongoose from "mongoose";
 import multer from "multer";
-import { BankAccount, CustomerLink, CustomerVisit, GenericRecord, GlobalCustomer, Lead, Product, SalesCompetitorIntel, SalesCrmActivity, SalespersonTrip, SalesRoutePlan, Target, User, Pincode } from "../models/index.js";
+import { BankAccount, CustomerGrade, CustomerLink, CustomerVisit, FileMeta, GenericRecord, GlobalCustomer, Lead, Product, SalesCompetitorIntel, SalesCrmActivity, SalespersonTrip, SalesRoutePlan, Target, User, Pincode } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { financialModels, postBalancedEntries } from "../services/accountingService.js";
 import { hierarchyVisibilityForUser } from "../services/assignmentHierarchyService.js";
@@ -10,10 +10,22 @@ import { makeId } from "../utils/ids.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
 import { getDocumentTemplate } from "../config/documentForms.js";
 import { extractDocument, enrichExtractedValues } from "../services/documentAiService.js";
-import { saveUploadedFile } from "../services/storageService.js";
+import { readFile, saveUploadedFile } from "../services/storageService.js";
 import { configuredFinancialYear, financialYearFromDate } from "../utils/financialYear.js";
 import orderFlowRoutes from "./orderFlow.js";
 import { enrichSalesInvoicesWithCreditState } from "../services/creditNoteRulesService.js";
+import {
+  getMaxActiveGradeDiscount,
+  gradeBasicFromMrp,
+  historicalAverageRates,
+  mrpBasicExcludingGst,
+  priceFromOldDmsLogic,
+  purchaseRateOf,
+  round2,
+} from "../services/oldDmsPricingService.js";
+import { buildCustomerReceivableLedger } from "../services/customerReceivableLedgerService.js";
+import { createOtp, verifyOtp } from "../services/otpService.js";
+import { finalizeSalespersonReceipt } from "../services/salespersonReceiptWorkflowService.js";
 
 const router = express.Router();
 
@@ -129,13 +141,14 @@ function shapeCustomer(c, global = null, financial = {}) {
     salespersonId: c.salespersonId || "",
     gradeCode: c.gradeCode || "",
     gradeDiscountPct: num(c.gradeDiscountPct),
+    customerRating: num(c.customerRating ?? c.rating),
+    rating: num(c.customerRating ?? c.rating),
     status: c.status,
     financial: {
       sales: money(financial.sales),
       invoiceCount: num(financial.invoiceCount),
       receipts: money(financial.receipts),
       outstanding: money(financial.outstanding),
-      openPromiseAmount: money(financial.openPromiseAmount),
       lastInvoiceAt: financial.lastInvoiceAt || null,
       lastReceiptAt: financial.lastReceiptAt || null,
     },
@@ -149,6 +162,66 @@ function openingSigned(customer, financialYear) {
   return upper(p.openingBalanceType) === "CR" ? -num(p.openingBalance) : num(p.openingBalance);
 }
 
+async function liveGradeForSalesCustomer(tenantKey, customer) {
+  const code = upper(customer?.gradeCode);
+  if (!code) return { code: "", name: "", discountPct: 0 };
+  const grade = await CustomerGrade.findOne({ tenantKey, code, status: "ACTIVE" }).select("code name discountPct").lean();
+  return grade ? { code: grade.code, name: grade.name || "", discountPct: num(grade.discountPct) } : { code, name: "", discountPct: 0 };
+}
+
+async function priceRowsForSalesCustomer({ tenantKey, customer, products, financialYear }) {
+  const grade = await liveGradeForSalesCustomer(tenantKey, customer);
+  const fy = clean(financialYear);
+  const productIds = products.map((p) => String(p._id));
+  const [maxDiscount, history] = await Promise.all([
+    getMaxActiveGradeDiscount(tenantKey),
+    historicalAverageRates({ tenantKey, financialYear: fy, productIds }).catch(() => ({ sales: new Map(), purchases: new Map() })),
+  ]);
+  return products.map((p) => {
+    const id = String(p._id);
+    const saleHistory = history.sales.get(id);
+    const purchaseHistory = history.purchases.get(id);
+    const marketSalePrice = Number(saleHistory?.averageRate || 0);
+    const averagePurchaseRate = Number(purchaseHistory?.averageRate || 0);
+    const fallbackPurchase = purchaseRateOf(p);
+    const purchaseRate = averagePurchaseRate > 0 ? averagePurchaseRate : fallbackPurchase;
+    const landedPrice = Number(p.landedCost || 0) > 0 ? Number(p.landedCost) : Number(purchaseRate || 0);
+    const rawMarketProfitPct = landedPrice > 0 && marketSalePrice > 0 ? ((marketSalePrice - landedPrice) / landedPrice) * 100 : 3;
+    const exactProfitPercentage = Math.max(3, rawMarketProfitPct);
+    const minimumSalePrice = landedPrice > 0 ? round2(landedPrice * (1 + exactProfitPercentage / 100)) : 0;
+    const priced = priceFromOldDmsLogic(
+      { ...p, salePrice: minimumSalePrice, profitPercentage: exactProfitPercentage },
+      maxDiscount,
+      { costOverride: landedPrice, saleRateOverride: minimumSalePrice, profitOverride: exactProfitPercentage },
+    );
+    const gstRate = num(priced.gstRate);
+    const mrp = money(priced.mrp);
+    const mrpBasic = mrp > 0 ? mrpBasicExcludingGst(mrp, gstRate) : money(minimumSalePrice || p.salePrice);
+    const effectiveRate = mrp > 0
+      ? gradeBasicFromMrp(mrp, gstRate, grade.discountPct)
+      : money(mrpBasic * (1 - Math.min(100, Math.max(0, grade.discountPct)) / 100));
+    return {
+      productId:id, sku:p.sku, name:p.name, category:p.category||"", subCategory:p.subCategory||"", hsnCode:p.hsnCode||"", gstRate,
+      unit:p.basicUnit||"PCS", packingUnit:p.packingUnit||"", qtyInBag:num(p.qtyInBag||1),
+      currentStock:Math.max(0,num(p.currentStock)-Math.max(0,num(p.reservedStock))),
+      physicalStock:num(p.currentStock), reservedStock:Math.max(0,num(p.reservedStock)), availableStock:Math.max(0,num(p.currentStock)-Math.max(0,num(p.reservedStock))),
+      mrp, basicRate:money(mrpBasic), discountPct:money(grade.discountPct), landedPrice:money(landedPrice), marketSalePrice:money(marketSalePrice), minimumSalePrice:money(minimumSalePrice), maxGradeDiscountPct:money(maxDiscount),
+      gradeCode:grade.code, gradeName:grade.name, rate:money(effectiveRate), saleIncludingGst:money(effectiveRate*(1+gstRate/100)), pricingFinancialYear:fy, imageFileIds:p.imageFileIds||[],
+    };
+  });
+}
+
+async function keepOnlySalesProductImages(tenantKey, products) {
+  const ids = [...new Set(products.flatMap((p) => p.imageFileIds || []).map(clean).filter(Boolean))];
+  if (!ids.length) return products.map((p) => ({ ...p, imageFileIds: [], images: [] }));
+  const files = await FileMeta.find({ tenantKey, fileId: { $in: ids }, mimeType: { $in: ["image/jpeg", "image/png", "image/webp", "image/avif"] } }).select("fileId originalName mimeType").lean();
+  const allowed = new Map(files.map((f) => [String(f.fileId), f]));
+  return products.map((p) => {
+    const valid = (p.imageFileIds || []).map(clean).filter((id) => allowed.has(id));
+    return { ...p, imageFileIds: valid, images: valid.map((id) => ({ fileId:id, originalName:allowed.get(id)?.originalName||"Product image", mimeType:allowed.get(id)?.mimeType||"image/jpeg", url:`/sales-app/product-images/${encodeURIComponent(id)}` })) };
+  });
+}
+
 async function receivableMap({ tenantKey, financialYear, customerIds }) {
   const ids = [...new Set((customerIds || []).map(clean).filter(Boolean))];
   if (!ids.length) return new Map();
@@ -160,17 +233,6 @@ async function receivableMap({ tenantKey, financialYear, customerIds }) {
   return new Map(rows.map((r) => [String(r._id), num(r.debit) - num(r.credit)]));
 }
 
-async function markBrokenPromises(PromiseToPay, tenantKey, financialYear, customerIds = null) {
-  const filter = {
-    tenantKey,
-    financialYear,
-    status: { $in: ["OPEN", "PARTIAL"] },
-    promiseDate: { $lt: startOfDay(new Date()) },
-    $expr: { $lt: ["$fulfilledAmount", "$amount"] },
-  };
-  if (Array.isArray(customerIds) && customerIds.length) filter.customerGlobalId = { $in: customerIds };
-  await PromiseToPay.updateMany(filter, { $set: { status: "BROKEN", lastActionAt: new Date() } }).catch(() => {});
-}
 
 function allocateReceiptsToInvoices(invoices = [], totalReceipts = 0, creditDays = 0) {
   let available = Math.max(0, num(totalReceipts));
@@ -205,18 +267,20 @@ function allocateReceiptsToInvoices(invoices = [], totalReceipts = 0, creditDays
 
 async function invoiceOutstandingForCustomer({ tenantKey, financialYear, customer, onlyOpen = false }) {
   const models = financialModels(tenantKey, financialYear);
-  const { SalesInvoice, Receipt } = models;
-  const [invoices, receiptAgg] = await Promise.all([
+  const { SalesInvoice } = models;
+  const [invoices, ledger] = await Promise.all([
     SalesInvoice.find({ tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" })
       .select("invoiceNo date grandTotal creditNoteAmount netInvoiceAmount workflowStatus status")
       .sort({ date: 1, createdAt: 1 }).lean(),
-    Receipt.aggregate([
-      { $match: { tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]),
+    buildCustomerReceivableLedger({ tenantKey, financialYear, customer }),
   ]);
   const netInvoices = await enrichSalesInvoicesWithCreditState({ models, tenantKey, financialYear, invoices });
-  const bills = allocateReceiptsToInvoices(netInvoices, receiptAgg[0]?.total || 0, customer.creditDays || customer.approvedTerms?.creditDays || 0);
+  // Due invoices are determined from the customer ledger, not only from Receipt documents.
+  // Sales credit notes are already netted against invoices above, so exclude them here to avoid double allocation.
+  const allocatableCredits = money(ledger.rows
+    .filter((r) => upper(r.transactionType) !== "SALES_CREDIT_NOTE")
+    .reduce((sum, r) => sum + num(r.credit), 0));
+  const bills = allocateReceiptsToInvoices(netInvoices, allocatableCredits, customer.creditDays || customer.approvedTerms?.creditDays || 0);
   return onlyOpen ? bills.filter((x) => x.outstanding > 0) : bills;
 }
 
@@ -380,7 +444,6 @@ async function customerSalesIntelligence({ tenantKey, financialYear, customer, i
 function dynamicCustomerActions({ summary = {}, intelligence = {}, visit = null }) {
   const actions=[]; const overdue=num(summary.overdueAmount), outstanding=num(summary.outstanding), creditLimit=num(summary.creditLimit), available=num(summary.availableCredit);
   if(overdue>0) actions.push({key:"COLLECT",label:"Collect Payment",icon:"cash-plus",priority:130,reason:`₹${money(overdue).toLocaleString("en-IN")} overdue`});
-  if(num(summary.openPromiseAmount)>0) actions.push({key:"PROMISE",label:"Payment Promise",icon:"handshake-outline",priority:120,reason:"Open payment promise"});
   if(intelligence.lifecycle?.status==="LOST") actions.push({key:"VISIT",label:"Recover Customer",icon:"account-reactivate-outline",priority:115,reason:`No order for ${intelligence.lifecycle.daysSinceLast} days`});
   else if(intelligence.lifecycle?.status==="AT_RISK") actions.push({key:"VISIT",label:"Reconnect Customer",icon:"account-alert-outline",priority:108,reason:`Buying cycle is slipping • ${intelligence.lifecycle.daysSinceLast} days since order`});
   if((intelligence.reorder||[]).length) actions.push({key:"ORDER",label:"Reorder Now",icon:"cart-arrow-down",priority:105,reason:`${intelligence.reorder.length} products predicted due`});
@@ -504,81 +567,83 @@ async function cashSummaryForUser({ tenantKey, financialYear, salespersonId, at 
   };
 }
 
-async function fulfillPromisesFromReceipt({ tenantKey, financialYear, customerGlobalId, receiptId, amount }) {
-  const { PromiseToPay } = financialModels(tenantKey, financialYear);
-  let remaining = Math.max(0, num(amount));
-  if (!remaining) return [];
-  await markBrokenPromises(PromiseToPay, tenantKey, financialYear, [customerGlobalId]);
-  const promises = await PromiseToPay.find({ tenantKey, financialYear, customerGlobalId, status: { $in: ["OPEN", "PARTIAL", "BROKEN"] } }).sort({ promiseDate: 1, createdAt: 1 });
-  const updated = [];
-  for (const promise of promises) {
-    if (remaining <= 0) break;
-    const open = Math.max(0, num(promise.amount) - num(promise.fulfilledAmount));
-    if (!open) continue;
-    const applied = Math.min(open, remaining);
-    promise.fulfilledAmount = money(num(promise.fulfilledAmount) + applied);
-    promise.fulfilledByReceiptIds = [...new Set([...(promise.fulfilledByReceiptIds || []), String(receiptId)])];
-    promise.status = promise.fulfilledAmount >= num(promise.amount) ? "FULFILLED" : "PARTIAL";
-    promise.lastActionAt = new Date();
-    await promise.save();
-    updated.push({ promiseNo: promise.promiseNo, applied: money(applied), status: promise.status });
-    remaining = money(remaining - applied);
+
+function collectionRange(period = "UNDEPOSITED", at = new Date(), financialYear = "") {
+  const key = upper(period || "UNDEPOSITED");
+  if (key === "UNDEPOSITED") return null;
+  const now = new Date(at);
+  let from; let to;
+  if (key === "DAY" || key === "TODAY") {
+    from = startOfDay(now); to = endOfDay(now);
+  } else if (key === "MONTH") {
+    from = new Date(now.getFullYear(), now.getMonth(), 1); to = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  } else if (key === "QUARTER") {
+    const fyStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+    const fiscalMonth = (now.getMonth() + 9) % 12;
+    const q = Math.floor(fiscalMonth / 3);
+    const startMonth = (3 + q * 3) % 12;
+    const startYear = startMonth < 3 ? fyStartYear + 1 : fyStartYear;
+    from = new Date(startYear, startMonth, 1);
+    to = new Date(from.getFullYear(), from.getMonth() + 3, 1);
+  } else if (key === "HALF_YEAR" || key === "HALF-YEAR" || key === "HALFYEAR") {
+    const fyStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+    const firstHalf = now.getMonth() >= 3 && now.getMonth() <= 8;
+    from = firstHalf ? new Date(fyStartYear, 3, 1) : new Date(fyStartYear, 9, 1);
+    to = firstHalf ? new Date(fyStartYear, 9, 1) : new Date(fyStartYear + 1, 3, 1);
+  } else {
+    const startYear = Number(String(financialYear || "").slice(0, 4)) || (now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1);
+    from = new Date(startYear, 3, 1); to = new Date(startYear + 1, 3, 1);
   }
-  return updated;
+  return { from, to };
+}
+
+function pendingCashDepositFilter() {
+  return {
+    mode: "CASH",
+    $or: [
+      { cashDepositStatus: { $exists: false } },
+      { cashDepositStatus: { $in: [null, "", "AWAITING_RECEIPT_VERIFICATION", "PENDING_TO_DEPOSIT", "HANDOVER_PENDING"] } },
+    ],
+  };
+}
+
+function cashIssueRows(movements = []) {
+  const byReceipt = new Map();
+  for (const movement of movements || []) {
+    for (const issue of movement.partyIssues || []) {
+      if (["RESOLVED", "RESOLVED_BY_SALESPERSON", "CANCELLED"].includes(upper(issue.status))) continue;
+      const key = clean(issue.receiptId || issue.receiptNo);
+      if (key) byReceipt.set(key, {
+        batchId: String(movement._id), movementNo: movement.movementNo,
+        issueId: issue.issueId, reason: issue.reason, status: issue.status,
+        acknowledgementOtp: issue.acknowledgementOtpCode || "",
+        acknowledgementOtpExpiresAt: issue.acknowledgementOtpExpiresAt || null,
+      });
+    }
+  }
+  return byReceipt;
 }
 
 async function collectionPriorityItems({ tenantKey, financialYear, customers }) {
-  const ids = customers.map((x) => x.globalCustomerId);
-  if (!ids.length) return [];
-  const models = financialModels(tenantKey, financialYear);
-  const { SalesInvoice, Receipt, PromiseToPay } = models;
-  await markBrokenPromises(PromiseToPay, tenantKey, financialYear, ids);
-  const [invoices, receiptAgg, balanceMap, promises] = await Promise.all([
-    SalesInvoice.find({ tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" }).select("customerGlobalId invoiceNo date grandTotal creditNoteAmount netInvoiceAmount").sort({ date: 1 }).lean(),
-    Receipt.aggregate([{ $match: { tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" } }, { $group: { _id: "$customerGlobalId", total: { $sum: "$amount" }, lastReceiptAt: { $max: "$date" } } }]),
-    receivableMap({ tenantKey, financialYear, customerIds: ids }),
-    PromiseToPay.find({ tenantKey, financialYear, customerGlobalId: { $in: ids }, status: { $in: ["OPEN", "PARTIAL", "BROKEN"] } }).lean(),
-  ]);
-  const netInvoices = await enrichSalesInvoicesWithCreditState({ models, tenantKey, financialYear, invoices });
-  const im = new Map();
-  for (const inv of netInvoices) { if (!im.has(inv.customerGlobalId)) im.set(inv.customerGlobalId, []); im.get(inv.customerGlobalId).push(inv); }
-  const rm = new Map(receiptAgg.map((x) => [String(x._id), x]));
-  const pm = new Map();
-  for (const p of promises) { if (!pm.has(p.customerGlobalId)) pm.set(p.customerGlobalId, []); pm.get(p.customerGlobalId).push(p); }
-  const today = startOfDay(new Date());
-  return customers.map((c) => {
-    const r = rm.get(c.globalCustomerId) || {};
-    const bills = allocateReceiptsToInvoices(im.get(c.globalCustomerId) || [], r.total || 0, c.creditDays || 0).filter((x) => x.outstanding > 0);
-    const overdueAmount = money(bills.filter((x) => x.overdueDays > 0).reduce((s, x) => s + x.outstanding, 0));
-    const dueToday = money(bills.filter((x) => x.status === "DUE_TODAY").reduce((s, x) => s + x.outstanding, 0));
-    const customerPromises = pm.get(c.globalCustomerId) || [];
-    const broken = customerPromises.filter((x) => x.status === "BROKEN");
-    const todayPromise = customerPromises.filter((x) => ["OPEN", "PARTIAL"].includes(x.status) && daysBetween(x.promiseDate, today) === 0);
-    const promisedToday = money(todayPromise.reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0));
-    const brokenPromiseAmount = money(broken.reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0));
-    const maxOverdueDays = bills.reduce((m, x) => Math.max(m, x.overdueDays), 0);
-    const aging = { "0_7": 0, "8_15": 0, "16_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0, opening_or_unallocated: 0 };
-    let oldestPendingDays = 0;
-    let invoiceOutstanding = 0;
-    for (const bill of bills) {
-      const pendingDays = Math.max(0, daysBetween(today, bill.date));
-      oldestPendingDays = Math.max(oldestPendingDays, pendingDays);
-      const bucket = pendingAgeBucket(pendingDays);
-      aging[bucket] += num(bill.outstanding);
-      invoiceOutstanding += num(bill.outstanding);
-    }
-    const outstanding = money(num(balanceMap.get(c.globalCustomerId)) + openingSigned(c, financialYear));
-    aging.opening_or_unallocated = money(Math.max(0, outstanding - invoiceOutstanding));
-    for (const key of Object.keys(aging)) aging[key] = money(aging[key]);
-    const score = Math.round((Math.min(50, overdueAmount / 2000) + Math.min(35, maxOverdueDays) + (promisedToday > 0 ? 25 : 0) + (broken.length ? 30 : 0) + (dueToday > 0 ? 12 : 0)) * 10) / 10;
-    return {
-      customer: shapeCustomer(c, null, { outstanding }), outstanding, overdueAmount, dueToday,
-      promisedToday, brokenPromiseAmount, maxOverdueDays, oldestPendingDays, aging, openBills: bills.length,
-      priorityScore: score,
-      priority: broken.length || maxOverdueDays > 30 ? "CRITICAL" : promisedToday > 0 || overdueAmount > 0 ? "HIGH" : dueToday > 0 ? "MEDIUM" : "NORMAL",
-      nextPromise: [...customerPromises].sort((a, b) => new Date(a.promiseDate) - new Date(b.promiseDate))[0] || null,
-    };
-  }).filter((x) => x.outstanding > 0 || x.promisedToday > 0 || x.brokenPromiseAmount > 0).sort((a, b) => b.priorityScore - a.priorityScore);
+  const today=startOfDay(new Date());
+  const rows=await Promise.all(customers.map(async(c)=>{
+    const [ledger,bills]=await Promise.all([
+      buildCustomerReceivableLedger({tenantKey,financialYear,customer:c}),
+      invoiceOutstandingForCustomer({tenantKey,financialYear,customer:c,onlyOpen:true}),
+    ]);
+    const outstanding=money(ledger.closingSigned);
+    const overdueAmount=money(bills.filter((x)=>x.overdueDays>0).reduce((sum,x)=>sum+num(x.outstanding),0));
+    const dueToday=money(bills.filter((x)=>x.status==="DUE_TODAY").reduce((sum,x)=>sum+num(x.outstanding),0));
+    const maxOverdueDays=bills.reduce((m,x)=>Math.max(m,x.overdueDays),0);
+    const aging={"0_7":0,"8_15":0,"16_30":0,"31_60":0,"61_90":0,"90_plus":0,opening_or_unallocated:0};
+    let invoiceOutstanding=0,oldestPendingDays=0;
+    for(const bill of bills){const pendingDays=Math.max(0,daysBetween(today,bill.date));oldestPendingDays=Math.max(oldestPendingDays,pendingDays);aging[pendingAgeBucket(pendingDays)]+=num(bill.outstanding);invoiceOutstanding+=num(bill.outstanding);}
+    aging.opening_or_unallocated=money(Math.max(0,outstanding-invoiceOutstanding));
+    for(const key of Object.keys(aging)) aging[key]=money(aging[key]);
+    const score=Math.round((Math.min(50,overdueAmount/2000)+Math.min(35,maxOverdueDays)+(dueToday>0?12:0))*10)/10;
+    return {customer:shapeCustomer(c,null,{outstanding}),outstanding,overdueAmount,dueToday,maxOverdueDays,oldestPendingDays,aging,openBills:bills.length,priorityScore:score,priority:maxOverdueDays>30?"CRITICAL":overdueAmount>0?"HIGH":dueToday>0?"MEDIUM":"NORMAL"};
+  }));
+  return rows.filter((x)=>x.outstanding>0).sort((a,b)=>b.priorityScore-a.priorityScore);
 }
 
 async function opportunityItemsForUser({ req, financialYear, limit = 50, customers: providedCustomers = null, priority: providedPriority = null }) {
@@ -599,12 +664,12 @@ async function opportunityItemsForUser({ req, financialYear, limit = 50, custome
   const out = [];
   for (const row of priority.slice(0, 25)) {
     const c = row.customer;
-    const amount = row.brokenPromiseAmount || row.promisedToday || row.overdueAmount || row.outstanding;
+    const amount = row.overdueAmount || row.outstanding;
     out.push({
       id: `COL-${c.id}`,
-      type: row.brokenPromiseAmount > 0 ? "BROKEN_PROMISE" : row.promisedToday > 0 ? "PROMISE_TODAY" : "COLLECTION",
+      type: "COLLECTION",
       score: 120 + row.priorityScore,
-      title: row.brokenPromiseAmount > 0 ? "Broken payment promise" : row.promisedToday > 0 ? "Payment promised today" : "Collection opportunity",
+      title: "Collection opportunity",
       subtitle: `${c.name} • ${money(amount).toLocaleString("en-IN")} ${row.maxOverdueDays ? `• ${row.maxOverdueDays}d overdue` : ""}`,
       customerGlobalId: c.id,
       customerName: c.name,
@@ -967,9 +1032,8 @@ router.get("/customers", async (req, res) => {
       CustomerLink.countDocuments(filter),
     ]);
     const ids = customers.map((x) => x.globalCustomerId);
-    const { SalesInvoice, Receipt, PromiseToPay } = financialModels(req.auth.tenantKey, financialYear);
-    await markBrokenPromises(PromiseToPay, req.auth.tenantKey, financialYear, ids);
-    const [gm, sales, receipts, balances, promises] = await Promise.all([
+    const { SalesInvoice, Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const [gm, sales, receipts, ledgers] = await Promise.all([
       globalsFor(ids),
       SalesInvoice.aggregate([
         { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" } },
@@ -979,18 +1043,14 @@ router.get("/customers", async (req, res) => {
         { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" } },
         { $group: { _id: "$customerGlobalId", receipts: { $sum: "$amount" }, lastReceiptAt: { $max: "$date" } } },
       ]),
-      receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: ids }),
-      PromiseToPay.aggregate([
-        { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: { $in: ["OPEN", "PARTIAL", "BROKEN"] } } },
-        { $group: { _id: "$customerGlobalId", openPromiseAmount: { $sum: { $cond: [{ $gt: [{ $subtract: ["$amount", "$fulfilledAmount"] }, 0] }, { $subtract: ["$amount", "$fulfilledAmount"] }, 0] } } } },
-      ]),
+      Promise.all(customers.map((c) => buildCustomerReceivableLedger({ tenantKey:req.auth.tenantKey, financialYear, customer:c }))),
     ]);
     const sm = new Map(sales.map((x) => [String(x._id), x]));
     const rm = new Map(receipts.map((x) => [String(x._id), x]));
-    const pm = new Map(promises.map((x) => [String(x._id), x]));
+    const lm = new Map(customers.map((c,i) => [c.globalCustomerId, ledgers[i]]));
     const items = customers.map((c) => {
-      const s = sm.get(c.globalCustomerId) || {}, r = rm.get(c.globalCustomerId) || {}, p = pm.get(c.globalCustomerId) || {};
-      return shapeCustomer(c, gm.get(c.globalCustomerId), { ...s, ...r, ...p, outstanding: num(balances.get(c.globalCustomerId)) + openingSigned(c, financialYear) });
+      const sr = sm.get(c.globalCustomerId) || {}, rr = rm.get(c.globalCustomerId) || {}, ledger = lm.get(c.globalCustomerId);
+      return shapeCustomer(c, gm.get(c.globalCustomerId), { ...sr, ...rr, outstanding: money(ledger?.closingSigned) });
     });
     return ok(res, { items, meta: pageMeta(page, limit, total), financialYear });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
@@ -1000,55 +1060,28 @@ router.get("/customers/:globalId/360", async (req, res) => {
   try {
     const financialYear = fyOf(req);
     const customer = await requireVisibleCustomer(req, req.params.globalId);
-    const { SalesInvoice, Receipt, SalesOrder, PromiseToPay } = financialModels(req.auth.tenantKey, financialYear);
-    await markBrokenPromises(PromiseToPay, req.auth.tenantKey, financialYear, [customer.globalCustomerId]);
-    const [gm, salesAgg, receiptAgg, balanceMap, recentInvoices, recentReceipts, recentOrders, promises, dueBills, suggestions, recentCrmActivities] = await Promise.all([
+    const { SalesInvoice, Receipt, SalesOrder } = financialModels(req.auth.tenantKey, financialYear);
+    const [gm, salesAgg, receiptAgg, ledger, dueBills, pendingOrderAgg] = await Promise.all([
       globalsFor([customer.globalCustomerId]),
-      SalesInvoice.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" } }, { $group: { _id: null, sales: { $sum: "$grandTotal" }, invoiceCount: { $sum: 1 }, lastInvoiceAt: { $max: "$date" } } }]),
-      Receipt.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" } }, { $group: { _id: null, receipts: { $sum: "$amount" }, receiptCount: { $sum: 1 }, lastReceiptAt: { $max: "$date" } } }]),
-      receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: [customer.globalCustomerId] }),
-      SalesInvoice.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" }).select("invoiceNo date grandTotal workflowStatus items").sort({ date: -1 }).limit(5).lean(),
-      Receipt.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: "POSTED" }).select("receiptNo date amount mode reference").sort({ date: -1 }).limit(5).lean(),
-      SalesOrder.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId }).sort({ date: -1, createdAt: -1 }).limit(5).lean(),
-      PromiseToPay.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: { $ne: "CANCELLED" } }).sort({ promiseDate: 1, createdAt: -1 }).limit(10).lean(),
-      invoiceOutstandingForCustomer({ tenantKey: req.auth.tenantKey, financialYear, customer, onlyOpen: true }),
-      productSuggestions({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, limit: 8 }),
-      SalesCrmActivity.find({ tenantKey: req.auth.tenantKey, customerGlobalId: customer.globalCustomerId, status: "SAVED" }).select("activityId channel transcript structured outcome nextFollowUpAt createdAt salespersonNameSnapshot").sort({ createdAt: -1 }).limit(5).lean(),
+      SalesInvoice.aggregate([{ $match:{ tenantKey:req.auth.tenantKey, financialYear, customerGlobalId:customer.globalCustomerId, status:"POSTED" } }, { $group:{ _id:null, sales:{ $sum:"$grandTotal" }, invoiceCount:{ $sum:1 }, lastInvoiceAt:{ $max:"$date" } } }]),
+      Receipt.aggregate([{ $match:{ tenantKey:req.auth.tenantKey, financialYear, customerGlobalId:customer.globalCustomerId, status:"POSTED" } }, { $group:{ _id:null, receipts:{ $sum:"$amount" }, receiptCount:{ $sum:1 }, lastReceiptAt:{ $max:"$date" } } }]),
+      buildCustomerReceivableLedger({ tenantKey:req.auth.tenantKey, financialYear, customer }),
+      invoiceOutstandingForCustomer({ tenantKey:req.auth.tenantKey, financialYear, customer, onlyOpen:true }),
+      SalesOrder.aggregate([{ $match:{ tenantKey:req.auth.tenantKey, financialYear, customerGlobalId:customer.globalCustomerId, status:{ $in:["SUBMITTED","CREDIT_HOLD","APPROVED","PROCESSING"] } } }, { $group:{ _id:null,total:{ $sum:"$grandTotal" },count:{ $sum:1 } } }]),
     ]);
-    const sales = salesAgg[0] || {}, receipts = receiptAgg[0] || {};
-    const outstanding = money(num(balanceMap.get(customer.globalCustomerId)) + openingSigned(customer, financialYear));
-    const overdueAmount = money(dueBills.filter((x) => x.overdueDays > 0).reduce((s, x) => s + x.outstanding, 0));
-    const dueToday = money(dueBills.filter((x) => x.status === "DUE_TODAY").reduce((s, x) => s + x.outstanding, 0));
-    const openPromiseAmount = money(promises.filter((x) => ["OPEN", "PARTIAL", "BROKEN"].includes(x.status)).reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0));
-    const pendingOrderAgg = await SalesOrder.aggregate([
-      { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: { $in: ["SUBMITTED", "CREDIT_HOLD", "APPROVED", "PROCESSING"] } } },
-      { $group: { _id: null, total: { $sum: "$grandTotal" }, count: { $sum: 1 } } },
-    ]);
-    const pendingOrderExposure = money(pendingOrderAgg[0]?.total || 0);
-    const creditLimit = money(customer.creditLimit || customer.approvedTerms?.creditLimit || 0);
-    const availableCredit = creditLimit > 0 ? money(Math.max(0, creditLimit - Math.max(0, outstanding) - pendingOrderExposure)) : 0;
-    const creditUsedPct = creditLimit > 0 ? Math.round(Math.min(999, (Math.max(0, outstanding) + pendingOrderExposure) / creditLimit * 100) * 10) / 10 : 0;
-    const [intelligence, lastVisit] = await Promise.all([
-      customerSalesIntelligence({ tenantKey: req.auth.tenantKey, financialYear, customer, includeCrossSell: true }),
-      CustomerVisit.findOne({ tenantKey: req.auth.tenantKey, customerGlobalId: customer.globalCustomerId, status: "COMPLETED" }).sort({ startedAt: -1 }).lean(),
-    ]);
-    const actionSummary = { outstanding, overdueAmount, dueToday, creditLimit, availableCredit, pendingOrderExposure, creditUsedPct, openPromiseAmount };
-    const dynamicActions = dynamicCustomerActions({ summary: actionSummary, intelligence, visit: lastVisit });
-    return ok(res, {
-      customer: shapeCustomer(customer, gm.get(customer.globalCustomerId), { ...sales, ...receipts, outstanding, openPromiseAmount }),
-      summary: {
-        sales: money(sales.sales), invoiceCount: num(sales.invoiceCount), receipts: money(receipts.receipts), receiptCount: num(receipts.receiptCount),
-        outstanding, overdueAmount, dueToday, openBills: dueBills.length, creditLimit, availableCredit,
-        pendingOrderExposure, pendingOrderCount: num(pendingOrderAgg[0]?.count), creditUsedPct,
-        openPromiseAmount, lastInvoiceAt: sales.lastInvoiceAt || null, lastReceiptAt: receipts.lastReceiptAt || null,
-      },
-      recentInvoices, recentReceipts, recentOrders, promises, dueBills: dueBills.slice(0, 10), suggestions, recentCrmActivities,
-      intelligence, dynamicActions, lastVisit,
-      financialYear,
+    const sales=salesAgg[0]||{}, receipts=receiptAgg[0]||{};
+    const outstanding=money(ledger.closingSigned);
+    const overdueAmount=money(dueBills.filter((x)=>x.overdueDays>0).reduce((sum,x)=>sum+num(x.outstanding),0));
+    const dueToday=money(dueBills.filter((x)=>x.status==="DUE_TODAY").reduce((sum,x)=>sum+num(x.outstanding),0));
+    const pendingOrderExposure=money(pendingOrderAgg[0]?.total||0);
+    const creditLimit=money(customer.creditLimit||customer.approvedTerms?.creditLimit||0);
+    return ok(res,{
+      customer:shapeCustomer(customer,gm.get(customer.globalCustomerId),{...sales,...receipts,outstanding}),
+      summary:{ sales:money(sales.sales), invoiceCount:num(sales.invoiceCount), receipts:money(receipts.receipts), receiptCount:num(receipts.receiptCount), outstanding, overdueAmount, dueToday, openBills:dueBills.length, creditLimit, pendingOrderExposure, pendingOrderCount:num(pendingOrderAgg[0]?.count), lastInvoiceAt:sales.lastInvoiceAt||null, lastReceiptAt:receipts.lastReceiptAt||null },
+      dueBills:dueBills.slice(0,10), financialYear,
     });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
-
 
 router.get("/customers/:globalId/intelligence", async (req, res) => {
   try {
@@ -1075,80 +1108,90 @@ router.get("/customers/:globalId/invoices", async (req, res) => {
 
 router.get("/customers/:globalId/ledger", async (req, res) => {
   try {
-    const financialYear = fyOf(req); const customer = await requireVisibleCustomer(req, req.params.globalId, { activeOnly: false });
-    const page = Math.max(1, Number(req.query.page || 1)), limit = Math.min(200, Math.max(20, Number(req.query.limit || 100)));
-    const { LedgerEntry } = financialModels(req.auth.tenantKey, financialYear);
-    const all = await LedgerEntry.find({ tenantKey: req.auth.tenantKey, financialYear, partyGlobalId: customer.globalCustomerId, status: "POSTED" })
-      .select("transactionId transactionType date accountCode debit credit narration createdAt").sort({ date: 1, createdAt: 1 }).lean();
-    let running = openingSigned(customer, financialYear);
-    const rows = all.map((row) => {
-      if (row.accountCode === "SYS_SUNDRY_DEBTORS") running += num(row.debit) - num(row.credit);
-      return { ...row, runningBalance: money(running), balanceType: running >= 0 ? "DR" : "CR" };
-    });
-    const desc = [...rows].reverse(); const total = desc.length; const items = desc.slice((page - 1) * limit, page * limit);
-    const totalDebit = all.reduce((s, x) => s + num(x.debit), 0), totalCredit = all.reduce((s, x) => s + num(x.credit), 0);
-    return ok(res, {
-      customer: { id: customer.globalCustomerId, name: customerName(customer) },
+    const financialYear=fyOf(req);
+    const customer=await requireVisibleCustomer(req,req.params.globalId,{activeOnly:false});
+    const page=Math.max(1,Number(req.query.page||1)), limit=Math.min(200,Math.max(20,Number(req.query.limit||100)));
+    const ledger=await buildCustomerReceivableLedger({tenantKey:req.auth.tenantKey,financialYear,customer});
+    const desc=[...ledger.rows].reverse();
+    const total=desc.length;
+    const items=desc.slice((page-1)*limit,page*limit);
+    return ok(res,{
+      customer:{id:customer.globalCustomerId,name:customerName(customer)},
       items,
-      summary: { openingBalance: money(Math.abs(openingSigned(customer, financialYear))), openingBalanceType: openingSigned(customer, financialYear) >= 0 ? "DR" : "CR", totalDebit: money(totalDebit), totalCredit: money(totalCredit), closingBalance: money(Math.abs(running)), closingBalanceType: running >= 0 ? "DR" : "CR" },
-      meta: pageMeta(page, limit, total), financialYear,
+      summary:{
+        openingBalance:money(Math.abs(ledger.openingSigned)), openingBalanceType:ledger.openingSigned<0?"CR":"DR",
+        totalDebit:ledger.totalDebit,totalCredit:ledger.totalCredit,
+        closingBalance:money(Math.abs(ledger.closingSigned)),closingBalanceType:ledger.closingSigned<0?"CR":"DR",outstanding:money(ledger.closingSigned),
+      },
+      meta:pageMeta(page,limit,total),financialYear,
     });
-  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+  } catch(error){ return fail(res,error.message,error.statusCode||500); }
 });
 
 router.get("/customers/:globalId/due-bills", async (req, res) => {
   try {
     const financialYear = fyOf(req); const customer = await requireVisibleCustomer(req, req.params.globalId);
-    const bills = await invoiceOutstandingForCustomer({ tenantKey: req.auth.tenantKey, financialYear, customer, onlyOpen: upper(req.query.all) !== "TRUE" });
-    const outstanding = money(bills.reduce((s, x) => s + x.outstanding, 0));
-    const overdue = money(bills.filter((x) => x.overdueDays > 0).reduce((s, x) => s + x.outstanding, 0));
-    return ok(res, { customer: { id: customer.globalCustomerId, name: customerName(customer), creditDays: num(customer.creditDays), creditLimit: num(customer.creditLimit || customer.approvedTerms?.creditLimit) }, items: bills.sort((a, b) => (b.overdueDays - a.overdueDays) || (new Date(a.dueDate) - new Date(b.dueDate))), summary: { outstanding, overdue, openBills: bills.filter((x) => x.outstanding > 0).length }, financialYear });
+    const [bills,ledger] = await Promise.all([
+      invoiceOutstandingForCustomer({ tenantKey:req.auth.tenantKey, financialYear, customer, onlyOpen:upper(req.query.all)!=="TRUE" }),
+      buildCustomerReceivableLedger({ tenantKey:req.auth.tenantKey, financialYear, customer }),
+    ]);
+    const invoiceOutstanding=money(bills.reduce((sum,x)=>sum+num(x.outstanding),0));
+    const outstanding=money(Math.max(0,ledger.closingSigned));
+    const overdue=money(bills.filter((x)=>x.overdueDays>0).reduce((sum,x)=>sum+num(x.outstanding),0));
+    return ok(res,{customer:{id:customer.globalCustomerId,name:customerName(customer),creditDays:num(customer.creditDays),creditLimit:num(customer.creditLimit||customer.approvedTerms?.creditLimit)},items:bills.sort((a,b)=>(b.overdueDays-a.overdueDays)||(new Date(a.dueDate)-new Date(b.dueDate))),summary:{outstanding,invoiceOutstanding,openingOrUnallocated:money(Math.max(0,outstanding-invoiceOutstanding)),overdue,openBills:bills.filter((x)=>x.outstanding>0).length},financialYear});
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
-router.get("/collection-priority", async (req, res) => {
-  try {
-    const financialYear = fyOf(req); const limit = Math.min(200, Math.max(10, Number(req.query.limit || 75))); const q = clean(req.query.q);
-    const { filter } = await visibleCustomerFilter(req, { status: "ACTIVE" });
-    if (q) { const rx = new RegExp(escapeRx(q), "i"); filter.$or = [{ localName: rx }, { displayIdentifier: rx }, { companyContactNumber: rx }, { ownerMobile: rx }, { "addresses.pincode": rx }]; }
-    const customers = await CustomerLink.find(filter).select("globalCustomerId localName displayIdentifier companyContactNumber ownerMobile contacts addresses creditDays creditLimit accountingProfile salespersonId").lean();
-    const ids = customers.map((x) => x.globalCustomerId); const models = financialModels(req.auth.tenantKey, financialYear); const { SalesInvoice, Receipt, PromiseToPay } = models;
-    await markBrokenPromises(PromiseToPay, req.auth.tenantKey, financialYear, ids);
-    const [invoices, receiptAgg, balanceMap, promises] = await Promise.all([
-      SalesInvoice.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" }).select("customerGlobalId invoiceNo date grandTotal creditNoteAmount netInvoiceAmount").sort({ date: 1 }).lean(),
-      Receipt.aggregate([{ $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: "POSTED" } }, { $group: { _id: "$customerGlobalId", total: { $sum: "$amount" }, lastReceiptAt: { $max: "$date" } } }]),
-      receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: ids }),
-      PromiseToPay.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: { $in: ids }, status: { $in: ["OPEN", "PARTIAL", "BROKEN"] } }).lean(),
-    ]);
-    const netInvoices = await enrichSalesInvoicesWithCreditState({ models, tenantKey: req.auth.tenantKey, financialYear, invoices });
-    const im = new Map(); for (const inv of netInvoices) { if (!im.has(inv.customerGlobalId)) im.set(inv.customerGlobalId, []); im.get(inv.customerGlobalId).push(inv); }
-    const rm = new Map(receiptAgg.map((x) => [String(x._id), x])); const pm = new Map(); for (const p of promises) { if (!pm.has(p.customerGlobalId)) pm.set(p.customerGlobalId, []); pm.get(p.customerGlobalId).push(p); }
-    const today = startOfDay(new Date());
-    const items = customers.map((c) => {
-      const r = rm.get(c.globalCustomerId) || {}; const bills = allocateReceiptsToInvoices(im.get(c.globalCustomerId) || [], r.total || 0, c.creditDays || 0).filter((x) => x.outstanding > 0);
-      const overdueAmount = money(bills.filter((x) => x.overdueDays > 0).reduce((s, x) => s + x.outstanding, 0)); const dueToday = money(bills.filter((x) => x.status === "DUE_TODAY").reduce((s, x) => s + x.outstanding, 0));
-      const customerPromises = pm.get(c.globalCustomerId) || []; const broken = customerPromises.filter((x) => x.status === "BROKEN"); const todayPromise = customerPromises.filter((x) => ["OPEN", "PARTIAL"].includes(x.status) && daysBetween(x.promiseDate, today) === 0);
-      const promisedToday = money(todayPromise.reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0)); const brokenPromiseAmount = money(broken.reduce((s, x) => s + Math.max(0, num(x.amount) - num(x.fulfilledAmount)), 0));
-      const maxOverdueDays = bills.reduce((m, x) => Math.max(m, x.overdueDays), 0); const outstanding = money(num(balanceMap.get(c.globalCustomerId)) + openingSigned(c, financialYear));
-      const score = Math.round((Math.min(50, overdueAmount / 2000) + Math.min(35, maxOverdueDays) + (promisedToday > 0 ? 25 : 0) + (broken.length ? 30 : 0) + (dueToday > 0 ? 12 : 0)) * 10) / 10;
-      return { customer: shapeCustomer(c, null, { outstanding }), outstanding, overdueAmount, dueToday, promisedToday, brokenPromiseAmount, maxOverdueDays, openBills: bills.length, priorityScore: score, priority: broken.length || maxOverdueDays > 30 ? "CRITICAL" : promisedToday > 0 || overdueAmount > 0 ? "HIGH" : dueToday > 0 ? "MEDIUM" : "NORMAL", nextPromise: customerPromises.sort((a, b) => new Date(a.promiseDate) - new Date(b.promiseDate))[0] || null };
-    }).filter((x) => x.outstanding > 0 || x.promisedToday > 0 || x.brokenPromiseAmount > 0).sort((a, b) => b.priorityScore - a.priorityScore).slice(0, limit);
-    return ok(res, { items, financialYear, total: items.length });
-  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
-});
 
 router.get("/products", async (req, res) => {
   try {
+    const financialYear = fyOf(req);
+    const customerId = clean(req.query.customerGlobalId);
+    if (!customerId) return fail(res, "customerGlobalId is required for customer-specific pricing", 400);
+    const customer = await requireVisibleCustomer(req, customerId, { activeOnly: false });
     const q = clean(req.query.q), page = Math.max(1, Number(req.query.page || 1)), limit = Math.min(100, Math.max(10, Number(req.query.limit || 50)));
-    const filter = { tenantKey: req.auth.tenantKey, status: "ACTIVE" }; if (q) { const rx = new RegExp(escapeRx(q), "i"); filter.$or = [{ name: rx }, { sku: rx }, { category: rx }, { hsnCode: rx }]; }
-    const [rows, total] = await Promise.all([Product.find(filter).select("sku name category subCategory hsnCode gstRate basicUnit packingUnit qtyInBag currentStock reservedStock mrp salePrice").sort({ name: 1 }).skip((page - 1) * limit).limit(limit).lean(), Product.countDocuments(filter)]);
-    const items = rows.map((p) => {
-      const physicalStock = num(p.currentStock);
-      const reservedStock = Math.max(0, num(p.reservedStock));
-      const availableStock = Math.max(0, physicalStock - reservedStock);
-      return { productId: String(p._id), sku: p.sku, name: p.name, category: p.category, subCategory: p.subCategory, hsnCode: p.hsnCode, gstRate: num(p.gstRate), unit: p.basicUnit || "PCS", packingUnit: p.packingUnit || "", qtyInBag: num(p.qtyInBag || 1), currentStock: availableStock, availableStock, physicalStock, reservedStock, mrp: num(p.mrp), listRate: num(p.salePrice) };
-    });
-    return ok(res, { items, meta: pageMeta(page, limit, total) });
+    const filter = { tenantKey: req.auth.tenantKey, status: "ACTIVE" };
+    if (q) { const rx = new RegExp(escapeRx(q), "i"); filter.$or = [{ name: rx }, { sku: rx }, { category: rx }, { subCategory: rx }, { hsnCode: rx }]; }
+    if (clean(req.query.category)) filter.category = clean(req.query.category);
+    const [rows, total, categories] = await Promise.all([
+      Product.find(filter).select("sku name category subCategory hsnCode gstRate basicUnit packingUnit qtyInBag currentStock reservedStock mrp salePrice landedCost averagePurchasePrice lastPurchasePrice openingRate minimumProfitPct profitPercentage imageFileIds").sort({ category:1, name:1 }).skip((page-1)*limit).limit(limit).lean(),
+      Product.countDocuments(filter),
+      Product.distinct("category", { tenantKey:req.auth.tenantKey, status:"ACTIVE" }),
+    ]);
+    const pricedRaw = await priceRowsForSalesCustomer({ tenantKey:req.auth.tenantKey, customer, products:rows, financialYear });
+    const items = await keepOnlySalesProductImages(req.auth.tenantKey, pricedRaw);
+    return ok(res, { items, categories:categories.filter(Boolean).sort(), financialYear, meta:pageMeta(page,limit,total) });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cart/reprice", async (req, res) => {
+  try {
+    const financialYear = fyOf(req);
+    const customer = await requireVisibleCustomer(req, req.body.customerGlobalId, { activeOnly:false });
+    const productIds = [...new Set((Array.isArray(req.body.productIds) ? req.body.productIds : []).map(clean).filter(objectIdText))].slice(0, 250);
+    if (!productIds.length) return ok(res, { items:[], financialYear });
+    const products = await Product.find({ tenantKey:req.auth.tenantKey, _id:{ $in:productIds }, status:"ACTIVE" })
+      .select("sku name category subCategory hsnCode gstRate basicUnit packingUnit qtyInBag currentStock reservedStock mrp salePrice landedCost averagePurchasePrice lastPurchasePrice openingRate minimumProfitPct profitPercentage imageFileIds")
+      .lean();
+    const pricedRaw = await priceRowsForSalesCustomer({ tenantKey:req.auth.tenantKey, customer, products, financialYear });
+    const items = await keepOnlySalesProductImages(req.auth.tenantKey, pricedRaw);
+    return ok(res, { items, financialYear });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.get("/product-images/:fileId", async (req, res) => {
+  try {
+    const fileId = clean(req.params.fileId);
+    if (!fileId) return fail(res, "Product image not found", 404);
+    const product = await Product.findOne({ tenantKey:req.auth.tenantKey, status:"ACTIVE", imageFileIds:fileId }).select("_id imageFileIds").lean();
+    if (!product) return fail(res, "Product image not available", 404);
+    const meta = await FileMeta.findOne({ tenantKey:req.auth.tenantKey, fileId, mimeType:{ $in:["image/jpeg","image/png","image/webp","image/avif"] } }).lean();
+    if (!meta) return fail(res, "Product image not found", 404);
+    const result = await readFile(fileId);
+    if (!result?.buffer) return fail(res, "Product image not found", 404);
+    res.setHeader("Content-Type", result.meta?.mimeType || meta.mimeType || "image/jpeg");
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    return res.send(result.buffer);
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
@@ -1184,24 +1227,39 @@ router.post("/orders", async (req, res) => {
   try {
     const financialYear = fyOf(req); const customer = await requireVisibleCustomer(req, req.body.customerGlobalId); const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
     if (!rawItems.length) return fail(res, "Add at least one product to the order", 400);
-    const ids = [...new Set(rawItems.map((x) => clean(x.productId)).filter(objectIdText))]; const products = await Product.find({ tenantKey: req.auth.tenantKey, _id: { $in: ids }, status: "ACTIVE" }).lean(); const pm = new Map(products.map((p) => [String(p._id), p]));
+    const ids = [...new Set(rawItems.map((x) => clean(x.productId)).filter(objectIdText))];
+    const products = await Product.find({ tenantKey: req.auth.tenantKey, _id: { $in: ids }, status: "ACTIVE" }).lean();
+    const pricedProducts = await priceRowsForSalesCustomer({ tenantKey:req.auth.tenantKey, customer, products, financialYear });
+    const pm = new Map(pricedProducts.map((p) => [String(p.productId), p]));
     const items = []; let subtotal = 0, discountTotal = 0, taxTotal = 0, grandTotal = 0;
     for (const row of rawItems) {
-      const p = pm.get(clean(row.productId)); if (!p) return fail(res, `Product ${row.productId || ""} is not available`, 400); const qty = num(row.qty); if (qty <= 0) continue;
-      const listRate = num(p.salePrice); const rate = row.rate === undefined || row.rate === null || row.rate === "" ? listRate : Math.max(0, num(row.rate)); const discountPct = Math.min(100, Math.max(0, num(row.discountPct))); const gross = qty * rate; const discount = gross * discountPct / 100; const taxable = money(gross - discount); const gstRate = num(p.gstRate); const tax = money(taxable * gstRate / 100); const lineTotal = money(taxable + tax);
+      const p = pm.get(clean(row.productId));
+      if (!p) return fail(res, `Product ${row.productId || ""} is not available`, 400);
+      const qty = num(row.qty); if (qty <= 0) continue;
+      // Always re-price on the server from the same current-FY + live-grade rules used by the customer app.
+      const listRate = money(p.basicRate);
+      const discountPct = Math.min(100, Math.max(0, num(p.discountPct)));
+      const rate = money(p.rate);
+      const gross = money(qty * listRate);
+      const discount = money(gross * discountPct / 100);
+      const taxable = money(gross - discount);
+      const gstRate = num(p.gstRate);
+      const tax = money(taxable * gstRate / 100);
+      const lineTotal = money(taxable + tax);
       subtotal += gross; discountTotal += discount; taxTotal += tax; grandTotal += lineTotal;
-      items.push({ productId: String(p._id), sku: p.sku, nameSnapshot: p.name, hsnSnapshot: p.hsnCode, qty, unit: p.basicUnit || "PCS", packingUnit: p.packingUnit || "", qtyInBag: num(p.qtyInBag || 1), listRate, rate, discountPct, taxable, gstRateSnapshot: gstRate, tax, lineTotal });
+      items.push({ productId:p.productId, sku:p.sku, nameSnapshot:p.name, hsnSnapshot:p.hsnCode, qty, unit:p.unit||"PCS", packingUnit:p.packingUnit||"", qtyInBag:num(p.qtyInBag||1), listRate, rate, discountPct, taxable, gstRateSnapshot:gstRate, tax, lineTotal });
     }
+    subtotal=money(subtotal); discountTotal=money(discountTotal); taxTotal=money(taxTotal); grandTotal=money(grandTotal);
     if (!items.length) return fail(res, "Enter quantity for at least one product", 400);
     const { SalesOrder, OrderEvent, OrderNotification } = financialModels(req.auth.tenantKey, financialYear);
-    const [balanceMap, pendingAgg] = await Promise.all([
-      receivableMap({ tenantKey: req.auth.tenantKey, financialYear, customerIds: [customer.globalCustomerId] }),
+    const [receivableLedger, pendingAgg] = await Promise.all([
+      buildCustomerReceivableLedger({ tenantKey:req.auth.tenantKey, financialYear, customer }),
       SalesOrder.aggregate([
         { $match: { tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, status: { $in: ["SUBMITTED", "CREDIT_HOLD", "APPROVED", "PROCESSING"] } } },
         { $group: { _id: null, total: { $sum: "$grandTotal" } } },
       ]),
     ]);
-    const receivableBeforeOrder = money(num(balanceMap.get(customer.globalCustomerId)) + openingSigned(customer, financialYear));
+    const receivableBeforeOrder = money(receivableLedger.closingSigned);
     const pendingOrderExposure = money(pendingAgg[0]?.total || 0);
     const creditLimit = money(customer.creditLimit || customer.approvedTerms?.creditLimit || 0);
     const projectedExposure = money(Math.max(0, receivableBeforeOrder) + pendingOrderExposure + grandTotal);
@@ -1311,9 +1369,20 @@ router.patch("/orders/:id/credit-decision", async (req, res) => {
       ? (order.customerOtpRequired && !order.customerOtpVerifiedAt ? "OTP_PENDING" : "ORDER_PLACED")
       : "REJECTED";
     order.nextAction = action === "APPROVE"
-      ? (order.customerOtpRequired && !order.customerOtpVerifiedAt ? "Customer OTP verification required" : "Verify order")
+      ? (order.customerOtpRequired && !order.customerOtpVerifiedAt ? "Customer OTP verification required" : (order.reservation?.status === "RESERVED" ? "Send to warehouse" : "Verify order"))
       : "Rejected";
     order.lastWorkflowAt = new Date();
+    if (action === "REJECT" && order.reservation?.status === "RESERVED") {
+      for (const item of order.items || []) {
+        const qty = Math.max(0, num(item.reservedQty));
+        if (!qty) continue;
+        await Product.updateOne({ _id: item.productId, tenantKey: req.auth.tenantKey }, { $inc: { reservedStock: -qty } });
+        await Product.updateOne({ _id: item.productId, tenantKey: req.auth.tenantKey, reservedStock: { $lt: 0 } }, { $set: { reservedStock: 0 } });
+        item.reservedQty = 0;
+      }
+      order.reservation = { status: "RELEASED", releasedAt: new Date(), releasedReason: "Credit hold rejected" };
+    }
+
     order.creditControl = {
       ...(order.creditControl?.toObject?.() || order.creditControl || {}),
       decision: action,
@@ -1333,34 +1402,547 @@ router.patch("/orders/:id/credit-decision", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
-router.get("/customers/:globalId/promises", async (req, res) => {
+
+
+// ---------------------------
+// Salesperson receipt OTP workflow
+// ---------------------------
+function receiptForClient(doc) {
+  if (!doc) return doc;
+  const out = typeof doc.toObject === "function" ? doc.toObject() : { ...doc };
+  delete out.customerOtpCode;
+  delete out.cashierOtpCode;
+  return out;
+}
+
+function jsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null || value === "") return [];
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; }
+  catch { return String(value).split(",").map(clean).filter(Boolean); }
+}
+
+const allowedDenominations = new Set([500, 200, 100, 50, 20, 10, 5, 2, 1, 0.5]);
+function parseDenominations(value) {
+  const rows = jsonArray(value).map((row) => {
+    const denomination = num(row?.denomination);
+    const count = Math.max(0, Math.floor(num(row?.count)));
+    return { denomination, count, amount: money(denomination * count) };
+  }).filter((row) => row.count > 0 && allowedDenominations.has(row.denomination));
+  return rows;
+}
+function denominationTotal(rows = []) {
+  return money((rows || []).reduce((sum, row) => sum + num(row.amount || num(row.denomination) * num(row.count)), 0));
+}
+function assertDenominationsMatch(rows, expected, label = "cash") {
+  const total = denominationTotal(rows);
+  if (!rows.length) {
+    const error = new Error(`Enter the ${label} denomination`); error.statusCode = 400; throw error;
+  }
+  if (Math.abs(total - money(expected)) > 0.009) {
+    const error = new Error(`Denomination total ₹${total.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} must match ${label} amount ₹${money(expected).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+    error.statusCode = 409; throw error;
+  }
+  return total;
+}
+
+function isChequeReceipt(receipt) {
+  const type = upper(receipt?.receiptType);
+  const mode = upper(receipt?.mode);
+  return type === "CHEQUE" || ["CHEQUE", "CHECK", "CHQ"].includes(mode);
+}
+
+async function salespersonReceiptById(req, financialYear, receiptId, { includeSecrets = false } = {}) {
+  const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+  const id = clean(receiptId);
+  const filter = { tenantKey: req.auth.tenantKey, financialYear };
+  if (objectIdText(id)) filter.$or = [{ _id: id }, { receiptNo: id }];
+  else filter.receiptNo = id;
+  let query = Receipt.findOne(filter);
+  if (includeSecrets) query = query.select("+customerOtpCode +cashierOtpCode");
+  const receipt = await query;
+  if (!receipt) {
+    const error = new Error("Receipt not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (!isAdminAuth(req.auth) && clean(receipt.collectedBySalespersonId) !== clean(req.auth.sub)) {
+    const error = new Error("This receipt belongs to another salesperson");
+    error.statusCode = 403;
+    throw error;
+  }
+  return receipt;
+}
+
+async function newReceiptOtp({ tenantKey, receipt, type }) {
+  const customer = type === "CUSTOMER";
+  return createOtp({
+    tenantKey,
+    transactionId: String(receipt._id),
+    actionType: customer ? "SALESPERSON_RECEIPT_CUSTOMER_CONFIRM" : "SALESPERSON_RECEIPT_CASHIER_CONFIRM",
+    recipientId: customer ? receipt.customerGlobalId : `CASHIER:${tenantKey}`,
+    ttlSeconds: customer ? 30 * 60 : 24 * 60 * 60,
+    context: {
+      receiptNo: receipt.receiptNo,
+      amount: money(receipt.amount),
+      mode: receipt.mode,
+      receiptType: receipt.receiptType || "",
+      customerGlobalId: receipt.customerGlobalId,
+      salespersonId: receipt.collectedBySalespersonId || "",
+    },
+  });
+}
+
+function receiptOtpTimestampText(value) {
+  const at = new Date(value || Date.now());
+  return {
+    date: at.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "2-digit", year: "numeric" }),
+    time: at.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: true }),
+  };
+}
+
+async function sendReceiptCustomerAcknowledgement({ tenantKey, financialYear, receipt }) {
+  const { OrderNotification } = financialModels(tenantKey, financialYear);
+  const receiptId = String(receipt._id);
+  const existing = await OrderNotification.findOne({
+    tenantKey,
+    financialYear,
+    recipientType: "CUSTOMER",
+    recipientId: receipt.customerGlobalId,
+    "data.notificationType": "RECEIPT_CUSTOMER_CONFIRMATION",
+    "data.receiptId": receiptId,
+  });
+  if (existing) return existing;
+
+  const verifiedAt = receipt.customerOtpVerifiedAt || new Date();
+  const when = receiptOtpTimestampText(verifiedAt);
+  const salespersonName = clean(receipt.collectedBySalespersonNameSnapshot || receipt.createdByNameSnapshot) || "Sales Person";
+  const isCashReceipt = upper(receipt.mode) === "CASH";
+  const body = isCashReceipt
+    ? `Thank you for the payment of ₹${money(receipt.amount).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} dated ${when.date} timed ${when.time} to ${salespersonName}.`
+    : "The status of the payment will be changed as soon as the payment is received!";
+
+  return OrderNotification.create({
+    tenantKey,
+    financialYear,
+    notificationNo: makeId("NTF"),
+    orderId: "",
+    orderNo: "",
+    eventNo: "",
+    recipientType: "CUSTOMER",
+    recipientId: receipt.customerGlobalId,
+    channel: "IN_APP",
+    title: `Receipt ${receipt.receiptNo} created`,
+    body,
+    data: {
+      notificationType: "RECEIPT_CUSTOMER_CONFIRMATION",
+      receiptId,
+      receiptNo: receipt.receiptNo,
+      amount: money(receipt.amount),
+      mode: upper(receipt.mode),
+      receiptType: upper(receipt.receiptType),
+      customerOtpVerifiedAt: verifiedAt,
+      salespersonName,
+    },
+    status: "PENDING",
+  });
+}
+
+async function receiptFormContext({ tenantKey, financialYear, customer }) {
+  const { Receipt } = financialModels(tenantKey, financialYear);
+  const [bills, pendingReceipts, receiptAccounts] = await Promise.all([
+    invoiceOutstandingForCustomer({ tenantKey, financialYear, customer, onlyOpen: true }),
+    Receipt.find({
+      tenantKey,
+      financialYear,
+      customerGlobalId: customer.globalCustomerId,
+      collectionSource: "SALESPERSON_APP",
+      status: { $nin: ["POSTED", "DELETED", "CANCELLED"] },
+      receiptWorkflowStatus: { $nin: ["COMPLETED", "CANCELLED"] },
+    }).select("receiptNo againstInvoices payerAccountNumber date receiptWorkflowStatus").lean(),
+    Receipt.find({
+      tenantKey,
+      financialYear,
+      customerGlobalId: customer.globalCustomerId,
+      payerAccountNumber: { $exists: true, $nin: [null, ""] },
+    }).select("payerAccountNumber date createdAt").sort({ date: -1, createdAt: -1 }).limit(100).lean(),
+  ]);
+
+  const reserved = new Map();
+  const pendingByInvoice = new Map();
+  for (const receipt of pendingReceipts) {
+    for (const row of receipt.againstInvoices || []) {
+      const key = clean(row.invoiceId || row.invoiceNo);
+      const noKey = clean(row.invoiceNo);
+      const amount = money(row.amount);
+      if (key) reserved.set(key, money(num(reserved.get(key)) + amount));
+      if (noKey && noKey !== key) reserved.set(noKey, money(num(reserved.get(noKey)) + amount));
+      if (noKey) {
+        const list = pendingByInvoice.get(noKey) || [];
+        list.push(receipt.receiptNo);
+        pendingByInvoice.set(noKey, list);
+      }
+    }
+  }
+
+  const invoices = [...bills]
+    .sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0))
+    .map((bill) => {
+      const pendingReceiptAmount = Math.min(
+        num(bill.outstanding),
+        Math.max(num(reserved.get(clean(bill._id))), num(reserved.get(clean(bill.invoiceNo)))),
+      );
+      const availableAmount = money(Math.max(0, num(bill.outstanding) - pendingReceiptAmount));
+      return {
+        ...bill,
+        pendingReceiptAmount: money(pendingReceiptAmount),
+        availableAmount,
+        selectable: pendingReceiptAmount <= 0.009 && availableAmount > 0,
+        pendingReceiptNos: pendingByInvoice.get(clean(bill.invoiceNo)) || [],
+      };
+    });
+
+  const accountNumbers = [];
+  const seen = new Set();
+  for (const row of customer.bankDetails || []) {
+    const accountNumber = clean(row.accountNumber);
+    if (accountNumber && !seen.has(accountNumber)) { seen.add(accountNumber); accountNumbers.push(accountNumber); }
+  }
+  for (const row of receiptAccounts) {
+    const accountNumber = clean(row.payerAccountNumber);
+    if (accountNumber && !seen.has(accountNumber)) { seen.add(accountNumber); accountNumbers.push(accountNumber); }
+  }
+
+  const hasUnpaidInvoices = invoices.some((x) => num(x.outstanding) > 0);
+  // ADVANCE stays visible at all times. It becomes usable only when every live
+  // unpaid invoice is already fully covered by a pending receipt. Completed
+  // receipts are already reflected in the live outstanding calculation above.
+  const uncoveredInvoices = invoices.filter((x) => money(num(x.outstanding) - num(x.pendingReceiptAmount)) > 0.009);
+  const canAdvance = uncoveredInvoices.length === 0;
+
+  return {
+    financialYear,
+    invoices,
+    hasUnpaidInvoices,
+    hasPendingReceiptReservation: invoices.some((x) => num(x.pendingReceiptAmount) > 0),
+    canAdvance,
+    advanceBlockedInvoiceNos: uncoveredInvoices.map((x) => x.invoiceNo),
+    advanceBlockedReason: canAdvance
+      ? ""
+      : `Advance can be created only after every unpaid invoice is either covered by a pending receipt or completed. Pending coverage is still required for: ${uncoveredInvoices.map((x) => x.invoiceNo).join(", ")}`,
+    accountNumbers,
+  };
+}
+
+router.get("/customers/:globalId/receipt-form", async (req, res) => {
   try {
-    const financialYear = fyOf(req); const customer = await requireVisibleCustomer(req, req.params.globalId); const { PromiseToPay } = financialModels(req.auth.tenantKey, financialYear); await markBrokenPromises(PromiseToPay, req.auth.tenantKey, financialYear, [customer.globalCustomerId]);
-    const items = await PromiseToPay.find({ tenantKey: req.auth.tenantKey, financialYear, customerGlobalId: customer.globalCustomerId }).sort({ promiseDate: -1, createdAt: -1 }).limit(200).lean(); return ok(res, { items, financialYear });
+    const customer = await requireVisibleCustomer(req, req.params.globalId);
+    const financialYear = fyOf(req);
+    const form = await receiptFormContext({ tenantKey: req.auth.tenantKey, financialYear, customer });
+    return ok(res, {
+      ...form,
+      customer: { id: customer.globalCustomerId, name: customerName(customer) },
+    });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
-router.post("/customers/:globalId/promises", async (req, res) => {
+router.get("/customers/:globalId/receipts", async (req, res) => {
   try {
-    const financialYear = fyOf(req); const customer = await requireVisibleCustomer(req, req.params.globalId); const amount = money(req.body.amount); if (amount <= 0) return fail(res, "Promise amount must be greater than zero", 400); const promiseDate = new Date(req.body.promiseDate); if (Number.isNaN(promiseDate.getTime())) return fail(res, "Promise date is required", 400);
-    const { PromiseToPay } = financialModels(req.auth.tenantKey, financialYear); let promiseNo = makeId("PTP"); while (await PromiseToPay.exists({ tenantKey: req.auth.tenantKey, financialYear, promiseNo })) promiseNo = makeId("PTP");
-    const promise = await PromiseToPay.create({ tenantKey: req.auth.tenantKey, financialYear, promiseNo, customerGlobalId: customer.globalCustomerId, customerNameSnapshot: customerName(customer), salespersonId: clean(customer.salespersonId || req.auth.sub), amount, promiseDate, invoiceNos: Array.isArray(req.body.invoiceNos) ? req.body.invoiceNos.map(clean).filter(Boolean) : [], remarks: clean(req.body.remarks), status: "OPEN", fulfilledAmount: 0, lastActionAt: new Date(), createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "" });
-    return ok(res, promise, "Promise to pay saved", 201);
+    const financialYear = fyOf(req);
+    const customer = await requireVisibleCustomer(req, req.params.globalId);
+    const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const items = await Receipt.find({
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      customerGlobalId: customer.globalCustomerId,
+      status: { $ne: "DELETED" },
+    }).sort({ date: -1, createdAt: -1 }).limit(500).lean();
+    return ok(res, {
+      financialYear,
+      customer: { id: customer.globalCustomerId, name: customerName(customer) },
+      items: items.map(receiptForClient),
+    });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
-router.patch("/promises/:id", async (req, res) => {
+router.post("/customers/:globalId/receipts", upload.single("paymentImage"), async (req, res) => {
+  let receipt = null;
   try {
-    const financialYear = fyOf(req); const { PromiseToPay } = financialModels(req.auth.tenantKey, financialYear); const promise = await PromiseToPay.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear }); if (!promise) return fail(res, "Promise not found", 404); await requireVisibleCustomer(req, promise.customerGlobalId);
-    if (req.body.amount !== undefined) { const v = money(req.body.amount); if (v <= 0) return fail(res, "Promise amount must be greater than zero", 400); promise.amount = v; }
-    if (req.body.promiseDate !== undefined) { const d = new Date(req.body.promiseDate); if (Number.isNaN(d.getTime())) return fail(res, "Invalid promise date", 400); promise.promiseDate = d; }
-    if (req.body.remarks !== undefined) promise.remarks = clean(req.body.remarks);
-    if (req.body.fulfilledAmount !== undefined) promise.fulfilledAmount = Math.max(0, money(req.body.fulfilledAmount));
-    if (req.body.status !== undefined) { const status = upper(req.body.status); if (!["OPEN", "PARTIAL", "FULFILLED", "BROKEN", "CANCELLED"].includes(status)) return fail(res, "Invalid promise status", 400); promise.status = status; }
-    if (promise.fulfilledAmount >= promise.amount && promise.amount > 0) promise.status = "FULFILLED"; else if (promise.fulfilledAmount > 0 && promise.status !== "CANCELLED") promise.status = "PARTIAL"; promise.lastActionAt = new Date(); await promise.save(); return ok(res, promise, "Promise updated");
+    const customer = await requireVisibleCustomer(req, req.params.globalId);
+    const date = req.body.date ? new Date(req.body.date) : new Date();
+    if (Number.isNaN(date.getTime())) return fail(res, "Invalid receipt date", 400);
+    const financialYear = financialYearFromDate(date) || fyOf(req);
+
+    const mode = upper(req.body.paymentMode || req.body.mode || "CASH");
+    if (!["CASH", "BANK"].includes(mode)) return fail(res, "Payment mode must be Cash or Bank", 400);
+    const receiptType = mode === "CASH" ? "CASH" : upper(req.body.receiptType);
+    if (mode === "BANK" && !["CHEQUE", "UPI"].includes(receiptType)) return fail(res, "Bank receipt type must be Cheque or UPI", 400);
+
+    const form = await receiptFormContext({ tenantKey: req.auth.tenantKey, financialYear, customer });
+    const selectedKeys = new Set(jsonArray(req.body.invoiceIds || req.body.againstInvoiceIds).map(clean).filter(Boolean));
+    let allocationType = upper(req.body.allocationType || (form.hasUnpaidInvoices ? "INVOICE" : "ADVANCE"));
+    let againstInvoices = [];
+    let amount = 0;
+
+    if (allocationType === "ADVANCE") {
+      if (!form.canAdvance) return fail(res, form.advanceBlockedReason || "Advance is blocked until every unpaid invoice is pending or completed", 409);
+      amount = money(req.body.amount);
+      if (!(amount > 0)) return fail(res, "Enter a valid advance amount", 400);
+      againstInvoices = [];
+    } else if (allocationType === "INVOICE") {
+      if (!form.hasUnpaidInvoices) return fail(res, "There is no unpaid invoice. Select ADVANCE instead.", 409);
+      if (!selectedKeys.size) return fail(res, "Select at least the oldest unpaid invoice", 400);
+
+      const selectedIndexes = form.invoices
+        .map((bill, index) => selectedKeys.has(clean(bill._id)) || selectedKeys.has(clean(bill.invoiceNo)) ? index : -1)
+        .filter((index) => index >= 0);
+      if (!selectedIndexes.length) return fail(res, "Selected invoice was not found in the customer's live unpaid invoices", 409);
+      const lastIndex = Math.max(...selectedIndexes);
+
+      // A receipt may cover the oldest invoice, or a continuous oldest-first
+      // group. It may never skip an older unpaid invoice to settle a newer one.
+      for (let index = 0; index <= lastIndex; index += 1) {
+        const bill = form.invoices[index];
+        const selected = selectedKeys.has(clean(bill._id)) || selectedKeys.has(clean(bill.invoiceNo));
+        if (!selected) return fail(res, `Invoice ${bill.invoiceNo} is older and must be paid before newer invoices`, 409);
+        if (!bill.selectable) {
+          const pendingNo = bill.pendingReceiptNos?.[0];
+          return fail(res, pendingNo ? `Invoice ${bill.invoiceNo} already has pending receipt ${pendingNo}` : `Invoice ${bill.invoiceNo} already has a pending receipt`, 409);
+        }
+      }
+      for (let index = lastIndex + 1; index < form.invoices.length; index += 1) {
+        const bill = form.invoices[index];
+        if (selectedKeys.has(clean(bill._id)) || selectedKeys.has(clean(bill.invoiceNo))) {
+          return fail(res, "Invoices must be selected continuously from the oldest unpaid invoice", 409);
+        }
+      }
+
+      againstInvoices = form.invoices.slice(0, lastIndex + 1).map((bill) => ({
+        invoiceId: clean(bill._id),
+        invoiceNo: clean(bill.invoiceNo),
+        invoiceDate: bill.date,
+        amount: money(bill.outstanding),
+      }));
+      amount = money(againstInvoices.reduce((sum, row) => sum + num(row.amount), 0));
+    } else {
+      return fail(res, "Allocation type must be INVOICE or ADVANCE", 400);
+    }
+
+    const payerAccountNumber = clean(req.body.payerAccountNumber || req.body.accountNumber);
+    const chequeNumber = clean(req.body.chequeNumber);
+    const upiPaymentText = clean(req.body.upiPaymentText);
+    if (req.file && !/^image\//i.test(clean(req.file.mimetype))) return fail(res, "Payment proof must be an image", 400);
+
+    if (mode === "BANK" && receiptType === "CHEQUE") {
+      if (!payerAccountNumber) return fail(res, "Customer account number is required for cheque receipt", 400);
+      if (!chequeNumber) return fail(res, "Cheque number is required", 400);
+      if (!req.file) return fail(res, "Upload the cheque image", 400);
+    }
+    if (mode === "BANK" && receiptType === "UPI" && !upiPaymentText && !req.file) {
+      return fail(res, "Enter UPI payment text/reference or upload the UPI payment image", 400);
+    }
+
+    const cashDenominations = mode === "CASH" ? parseDenominations(req.body.cashDenominations) : [];
+    if (mode === "CASH") assertDenominationsMatch(cashDenominations, amount, "receipt cash");
+
+    const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    let receiptNo = makeId("RCT");
+    while (await Receipt.exists({ tenantKey: req.auth.tenantKey, financialYear, receiptNo })) receiptNo = makeId("RCT");
+
+    let paymentProofFileId = "";
+    if (req.file) {
+      const meta = await saveUploadedFile({
+        file: req.file,
+        tenantKey: req.auth.tenantKey,
+        module: "sales-app",
+        entityType: "RECEIPT_PAYMENT_PROOF",
+        entityId: receiptNo,
+        uploadedBy: req.auth.sub,
+        access: "PRIVATE",
+      });
+      paymentProofFileId = meta.fileId;
+    }
+
+    receipt = await Receipt.create({
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      receiptNo,
+      sourceKey: `SALESPERSON:${receiptNo}`,
+      date,
+      customerGlobalId: customer.globalCustomerId,
+      partyNameSnapshot: customerName(customer),
+      amount,
+      mode,
+      receiptType,
+      allocationType,
+      againstInvoices,
+      payerAccountNumber: receiptType === "CHEQUE" ? payerAccountNumber : "",
+      paymentProofFileId,
+      paymentProofKind: req.file ? receiptType : "",
+      upiPaymentText: receiptType === "UPI" ? upiPaymentText : "",
+      reference: receiptType === "CHEQUE" ? chequeNumber : receiptType === "UPI" ? upiPaymentText : "",
+      chequeNumber: receiptType === "CHEQUE" ? chequeNumber : "",
+      chequeIssueDate: receiptType === "CHEQUE" ? date : undefined,
+      chequeStatus: receiptType === "CHEQUE" ? "PENDING_VERIFICATION" : undefined,
+      bounceStatus: receiptType === "CHEQUE" ? "PENDING" : "CLEAR",
+      remarks: clean(req.body.remarks),
+      collectedBySalespersonId: req.auth.sub,
+      collectedBySalespersonNameSnapshot: req.auth.name || "",
+      collectionSource: "SALESPERSON_APP",
+      receiptWorkflowStatus: "PENDING_CUSTOMER_OTP",
+      customerOtpStatus: "PENDING",
+      cashierOtpStatus: "NOT_REQUIRED",
+      cashDenominations,
+      cashDepositStatus: mode === "CASH" ? "AWAITING_RECEIPT_VERIFICATION" : "NOT_APPLICABLE",
+      createdBy: req.auth.sub,
+      createdByNameSnapshot: req.auth.name || "",
+      status: "PENDING_VERIFICATION",
+    });
+
+    if (receiptType === "CHEQUE" && payerAccountNumber) {
+      const customerDoc = await CustomerLink.findOne({ tenantKey: req.auth.tenantKey, globalCustomerId: customer.globalCustomerId });
+      if (customerDoc) {
+        const exists = (customerDoc.bankDetails || []).some((row) => clean(row.accountNumber) === payerAccountNumber);
+        if (!exists) {
+          customerDoc.bankDetails = [...(customerDoc.bankDetails || []), { accountNumber: payerAccountNumber }];
+          await customerDoc.save();
+        }
+      }
+    }
+
+    const otp = await newReceiptOtp({ tenantKey: req.auth.tenantKey, receipt, type: "CUSTOMER" });
+    receipt.customerOtpId = otp.otpId;
+    receipt.customerOtpCode = otp.code;
+    receipt.customerOtpExpiresAt = otp.expiresAt;
+    await receipt.save();
+    return ok(res, { receipt: receiptForClient(receipt) }, "Receipt saved; verify customer OTP", 201);
+  } catch (error) {
+    if (receipt?._id && receipt.status !== "POSTED") await receipt.deleteOne().catch(() => {});
+    return fail(res, error.message, error.statusCode || 500);
+  }
+});
+
+router.post("/receipts/:receiptId/customer-otp/resend", async (req, res) => {
+  try {
+    const financialYear = clean(req.body.financialYear || req.query.financialYear) || fyOf(req);
+    const receipt = await salespersonReceiptById(req, financialYear, req.params.receiptId, { includeSecrets: true });
+    if (receipt.customerOtpStatus === "VERIFIED") return fail(res, "Customer OTP is already verified", 409);
+    const otp = await newReceiptOtp({ tenantKey: req.auth.tenantKey, receipt, type: "CUSTOMER" });
+    receipt.customerOtpId = otp.otpId;
+    receipt.customerOtpCode = otp.code;
+    receipt.customerOtpExpiresAt = otp.expiresAt;
+    receipt.customerOtpStatus = "PENDING";
+    receipt.receiptWorkflowStatus = "PENDING_CUSTOMER_OTP";
+    await receipt.save();
+    return ok(res, { receipt: receiptForClient(receipt) }, "New customer OTP generated");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
+router.post("/receipts/:receiptId/customer-otp/verify", async (req, res) => {
+  try {
+    const financialYear = clean(req.body.financialYear || req.query.financialYear) || fyOf(req);
+    const receipt = await salespersonReceiptById(req, financialYear, req.params.receiptId, { includeSecrets: true });
+    if (receipt.customerOtpStatus !== "VERIFIED") {
+      const code = clean(req.body.code);
+      if (!code) return fail(res, "Enter customer OTP", 400);
+      const result = await verifyOtp({ otpId: receipt.customerOtpId, code });
+      if (!result.ok) return fail(res, result.reason, 400);
+      if (String(result.challenge.transactionId) !== String(receipt._id) || String(result.challenge.recipientId) !== String(receipt.customerGlobalId)) {
+        return fail(res, "OTP does not belong to this receipt", 403);
+      }
+      receipt.customerOtpStatus = "VERIFIED";
+      receipt.customerOtpVerifiedAt = new Date();
+      receipt.customerOtpCode = undefined;
+    }
+    // Persist customer verification before queuing the acknowledgement so the
+    // exact OTP-verification timestamp is used in the cash confirmation text.
+    await receipt.save();
+    const customerMessage = await sendReceiptCustomerAcknowledgement({
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      receipt,
+    });
+    // Customer OTP completes the receipt. The later physical cash handover to
+    // cashier is a separate custody workflow with its own batch OTP.
+    receipt.cashierOtpStatus = "NOT_REQUIRED";
+    receipt.cashierOtpCode = undefined;
+    receipt.cashierOtpId = undefined;
+    receipt.cashierOtpExpiresAt = undefined;
+    receipt.receiptWorkflowStatus = "VERIFIED_PENDING_POSTING";
+    await receipt.save();
+    const posted = await finalizeSalespersonReceipt({
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      receipt,
+      actorId: req.auth.sub,
+      actorName: req.auth.name || "",
+    });
+    const customer = await requireVisibleCustomer(req, posted.customerGlobalId);
+    const ledger = await buildCustomerReceivableLedger({ tenantKey: req.auth.tenantKey, financialYear, customer });
+    const cash = upper(posted.mode) === "CASH"
+      ? await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: posted.collectedBySalespersonId || req.auth.sub })
+      : null;
+    return ok(res, {
+      receipt: receiptForClient(posted),
+      customerMessage: { title: customerMessage.title, body: customerMessage.body },
+      partyName: posted.partyNameSnapshot || customerName(customer),
+      outstanding: money(ledger.closingSigned),
+      cashInHand: cash?.cashInHand ?? null,
+    }, `Successfully created the receipt for ${posted.partyNameSnapshot || "customer"}`);
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/receipts/:receiptId/cashier-otp/resend", async (req, res) => {
+  try {
+    const financialYear = clean(req.body.financialYear || req.query.financialYear) || fyOf(req);
+    const receipt = await salespersonReceiptById(req, financialYear, req.params.receiptId, { includeSecrets: true });
+    if (receipt.customerOtpStatus !== "VERIFIED") return fail(res, "Verify customer OTP first", 409);
+    if (receipt.cashierOtpStatus === "VERIFIED" && receipt.status === "POSTED") return fail(res, "Receipt is already completed", 409);
+    const otp = await newReceiptOtp({ tenantKey: req.auth.tenantKey, receipt, type: "CASHIER" });
+    receipt.cashierOtpId = otp.otpId;
+    receipt.cashierOtpCode = otp.code;
+    receipt.cashierOtpExpiresAt = otp.expiresAt;
+    receipt.cashierOtpStatus = "PENDING";
+    receipt.receiptWorkflowStatus = "PENDING_CASHIER_OTP";
+    await receipt.save();
+    return ok(res, { receipt: receiptForClient(receipt) }, "New cashier OTP generated");
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/receipts/:receiptId/cashier-otp/verify", async (req, res) => {
+  try {
+    const financialYear = clean(req.body.financialYear || req.query.financialYear) || fyOf(req);
+    const receipt = await salespersonReceiptById(req, financialYear, req.params.receiptId, { includeSecrets: true });
+    if (receipt.customerOtpStatus !== "VERIFIED") return fail(res, "Customer OTP must be verified first", 409);
+    if (receipt.cashierOtpStatus !== "VERIFIED") {
+      const code = clean(req.body.code);
+      if (!code) return fail(res, "Enter cashier OTP", 400);
+      const result = await verifyOtp({ otpId: receipt.cashierOtpId, code });
+      if (!result.ok) return fail(res, result.reason, 400);
+      if (String(result.challenge.transactionId) !== String(receipt._id)) return fail(res, "OTP does not belong to this receipt", 403);
+      receipt.cashierOtpStatus = "VERIFIED";
+      receipt.cashierOtpVerifiedAt = new Date();
+      receipt.cashierOtpVerifiedBy = req.auth.sub;
+      receipt.cashierOtpVerifiedByNameSnapshot = req.auth.name || "";
+      receipt.cashierOtpCode = undefined;
+      receipt.receiptWorkflowStatus = "VERIFIED_PENDING_POSTING";
+      await receipt.save();
+    }
+    const posted = await finalizeSalespersonReceipt({
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      receipt,
+      actorId: req.auth.sub,
+      actorName: req.auth.name || "",
+    });
+    const customer = await requireVisibleCustomer(req, posted.customerGlobalId);
+    const ledger = await buildCustomerReceivableLedger({ tenantKey: req.auth.tenantKey, financialYear, customer });
+    const cash = upper(posted.mode) === "CASH"
+      ? await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: posted.collectedBySalespersonId || req.auth.sub })
+      : null;
+    return ok(res, { receipt: receiptForClient(posted), outstanding: money(ledger.closingSigned), cashInHand: cash?.cashInHand ?? null }, "Receipt fully verified and posted");
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
 
 // ---------------------------
 // V2 Sales Person cash system
@@ -1401,83 +1983,149 @@ router.get("/banks", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
-router.post("/customers/:globalId/cash-collection", async (req, res) => {
-  let receipt = null, movement = null, ledgerPosted = false;
+router.post("/customers/:globalId/cash-collection", async (_req, res) => {
+  return fail(res, "Direct cash posting is disabled. Create the receipt and complete customer OTP verification.", 410);
+});
+
+router.get("/cash/collections", async (req, res) => {
   try {
     const financialYear = fyOf(req);
-    const customer = await requireVisibleCustomer(req, req.params.globalId);
-    const amount = money(req.body.amount);
-    if (amount <= 0) return fail(res, "Cash collection amount must be greater than zero", 400);
-    const date = req.body.date ? new Date(req.body.date) : new Date();
-    if (Number.isNaN(date.getTime())) return fail(res, "Invalid collection date", 400);
-    const tenantKey = req.auth.tenantKey;
-    const { Receipt, SalespersonCashMovement } = financialModels(tenantKey, financialYear);
-    let receiptNo = clean(req.body.receiptNo) || makeId("RCT");
-    while (await Receipt.exists({ tenantKey, financialYear, receiptNo })) receiptNo = makeId("RCT");
-    let movementNo = makeId("CASH");
-    while (await SalespersonCashMovement.exists({ tenantKey, financialYear, movementNo })) movementNo = makeId("CASH");
-    receipt = await Receipt.create({
-      tenantKey, financialYear, receiptNo, date,
-      customerGlobalId: customer.globalCustomerId,
-      partyNameSnapshot: customerName(customer),
-      amount, mode: "CASH", reference: clean(req.body.reference), remarks: clean(req.body.remarks),
-      bounceStatus: "CLEAR",
-      collectedBySalespersonId: req.auth.sub,
-      collectionSource: "SALESPERSON_APP",
-      createdBy: req.auth.sub,
-      createdByNameSnapshot: req.auth.name || "",
-      status: "PENDING_POSTING",
-    });
-    movement = await SalespersonCashMovement.create({
-      tenantKey, financialYear, movementNo, salespersonId: req.auth.sub,
-      salespersonNameSnapshot: req.auth.name || "", date, dayKey: localDateKey(date),
-      type: "COLLECTION", direction: "IN", amount,
-      customerGlobalId: customer.globalCustomerId, customerNameSnapshot: customerName(customer),
-      receiptId: String(receipt._id), receiptNo, reference: clean(req.body.reference), remarks: clean(req.body.remarks),
-      status: "PENDING", createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "",
-    });
-    await postBalancedEntries({
-      tenantKey, financialYear, transactionId: receiptNo, transactionType: "RECEIPT", date,
-      partyGlobalId: customer.globalCustomerId,
-      narration: clean(req.body.remarks) || `Cash collection ${receiptNo}`,
-      entries: [
-        { accountCode: "SYS_CASH", debit: amount },
-        { accountCode: "SYS_SUNDRY_DEBTORS", credit: amount },
-      ],
-    });
-    ledgerPosted = true;
-    receipt.status = "POSTED";
-    receipt.cashCustodyMovementId = String(movement._id);
-    await receipt.save();
-    movement.status = "POSTED";
-    movement.accountingTransactionId = receiptNo;
-    await movement.save();
-    const promiseApplications = await fulfillPromisesFromReceipt({
-      tenantKey, financialYear, customerGlobalId: customer.globalCustomerId, receiptId: receipt._id, amount,
-    });
-    const balanceMap = await receivableMap({ tenantKey, financialYear, customerIds: [customer.globalCustomerId] });
-    const outstanding = money(num(balanceMap.get(customer.globalCustomerId)) + openingSigned(customer, financialYear));
-    const cash = await cashSummaryForUser({ tenantKey, financialYear, salespersonId: req.auth.sub });
-    return ok(res, { receipt: receipt.toObject(), movement: movement.toObject(), outstanding, cashInHand: cash.cashInHand, promiseApplications }, "Cash collection posted", 201);
-  } catch (error) {
-    if (!ledgerPosted) {
-      if (receipt?._id && receipt.status === "PENDING_POSTING") await receipt.deleteOne().catch(() => {});
-      if (movement?._id && movement.status === "PENDING") await movement.deleteOne().catch(() => {});
-    } else {
-      // Once accounting is posted, never remove the audit documents. Best-effort align their status instead.
-      if (receipt?._id && receipt.status !== "POSTED") {
-        receipt.status = "POSTED";
-        if (movement?._id) receipt.cashCustodyMovementId = String(movement._id);
-        await receipt.save().catch(() => {});
-      }
-      if (movement?._id && movement.status !== "POSTED") {
-        movement.status = "POSTED";
-        movement.accountingTransactionId = receipt?.receiptNo || movement.accountingTransactionId || "";
-        await movement.save().catch(() => {});
+    const period = upper(req.query.period || "UNDEPOSITED");
+    const at = req.query.date ? new Date(req.query.date) : new Date();
+    if (Number.isNaN(at.getTime())) return fail(res, "Invalid date", 400);
+    const { Receipt, SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+
+    // Compatibility for receipts created under the earlier receipt-level cashier
+    // OTP flow: customer-verified cash must immediately become Pending to Deposit.
+    const legacyVerified = await Receipt.find({
+      tenantKey: req.auth.tenantKey, financialYear, mode: "CASH", collectionSource: "SALESPERSON_APP",
+      customerOtpStatus: "VERIFIED", status: { $nin: ["POSTED", "DELETED"] },
+      $and: [collectionOwnerFilter(req.auth.sub)],
+    }).limit(100);
+    for (const legacy of legacyVerified) {
+      try {
+        legacy.cashierOtpStatus = "NOT_REQUIRED";
+        legacy.receiptWorkflowStatus = "VERIFIED_PENDING_POSTING";
+        await legacy.save();
+        await finalizeSalespersonReceipt({ tenantKey: req.auth.tenantKey, financialYear, receipt: legacy, actorId: req.auth.sub, actorName: req.auth.name || "" });
+      } catch (compatError) {
+        console.warn("Unable to auto-complete legacy customer-verified cash receipt", legacy.receiptNo, compatError?.message || compatError);
       }
     }
-    return fail(res, error.message, error.statusCode || 500);
-  }
+    const filter = {
+      tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", collectionSource: "SALESPERSON_APP",
+      $and: [collectionOwnerFilter(req.auth.sub)],
+    };
+    if (period === "UNDEPOSITED") filter.$and.push(pendingCashDepositFilter());
+    else {
+      const range = collectionRange(period, at, financialYear);
+      if (range) filter.date = { $gte: range.from, $lt: range.to };
+    }
+    const receipts = await Receipt.find(filter).sort({ date: -1, createdAt: -1 }).limit(1000).lean();
+    const activeHandovers = await SalespersonCashMovement.find({
+      tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, type: "HANDOVER",
+      status: { $in: ["PENDING", "APPROVED"] },
+      "partyIssues.0": { $exists: true },
+    }).select("movementNo partyIssues").lean();
+    const issues = cashIssueRows(activeHandovers);
+    const items = receipts.map((r) => {
+      const issue = issues.get(String(r._id)) || issues.get(clean(r.receiptNo)) || null;
+      return {
+        _id: String(r._id), receiptNo: r.receiptNo, date: r.date,
+        customerGlobalId: r.customerGlobalId, partyName: r.partyNameSnapshot || "",
+        mode: upper(r.mode), receiptType: upper(r.receiptType), amount: money(r.amount),
+        cashDepositStatus: upper(r.mode) === "CASH" ? (upper(r.cashDepositStatus) || "PENDING_TO_DEPOSIT") : "NOT_APPLICABLE",
+        cashDepositBatchId: r.cashDepositBatchId || "", cashDepositedAt: r.cashDepositedAt || null, issue,
+      };
+    });
+    const totals = items.reduce((acc, r) => {
+      const amount = num(r.amount);
+      if (r.mode === "CASH") acc.cash += amount;
+      else acc.bank += amount;
+      if (r.receiptType === "CHEQUE") acc.cheque += amount;
+      if (r.receiptType === "UPI") acc.upi += amount;
+      acc.grand += amount;
+      return acc;
+    }, { cash: 0, bank: 0, cheque: 0, upi: 0, grand: 0 });
+    Object.keys(totals).forEach((k) => { totals[k] = money(totals[k]); });
+    return ok(res, { financialYear, period, items, totals });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.get("/cash/deposit-preview", async (req, res) => {
+  try {
+    const financialYear = fyOf(req);
+    const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const receipts = await Receipt.find({
+      tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", mode: "CASH", collectionSource: "SALESPERSON_APP",
+      $and: [
+        collectionOwnerFilter(req.auth.sub),
+        { $or: [
+          { cashDepositStatus: { $exists: false } },
+          { cashDepositStatus: { $in: [null, "", "PENDING_TO_DEPOSIT"] } },
+        ] },
+      ],
+    }).sort({ date: 1, createdAt: 1 }).lean();
+    const items = receipts.map((r) => ({
+      _id: String(r._id), receiptNo: r.receiptNo, date: r.date, customerGlobalId: r.customerGlobalId,
+      partyName: r.partyNameSnapshot || "", amount: money(r.amount), cashDenominations: r.cashDenominations || [],
+    }));
+    const totalCash = money(items.reduce((sum, x) => sum + num(x.amount), 0));
+    const partyMap = new Map();
+    for (const row of items) {
+      const key = clean(row.customerGlobalId || row.partyName);
+      const existing = partyMap.get(key) || { customerGlobalId: row.customerGlobalId, partyName: row.partyName, amount: 0, receiptNos: [] };
+      existing.amount = money(existing.amount + num(row.amount)); existing.receiptNos.push(row.receiptNo); partyMap.set(key, existing);
+    }
+    return ok(res, { financialYear, items, parties: [...partyMap.values()], totalCash });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.get("/cash/issues", async (req, res) => {
+  try {
+    const financialYear = fyOf(req);
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const movements = await SalespersonCashMovement.find({
+      tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, type: "HANDOVER", "partyIssues.0": { $exists: true },
+    }).sort({ createdAt: -1 }).lean();
+    const items = [];
+    for (const movement of movements) for (const issue of movement.partyIssues || []) {
+      if (["RESOLVED", "CANCELLED"].includes(upper(issue.status))) continue;
+      items.push({
+        batchId: String(movement._id), movementNo: movement.movementNo, issueId: issue.issueId,
+        receiptId: issue.receiptId, receiptNo: issue.receiptNo, customerGlobalId: issue.customerGlobalId,
+        partyName: issue.partyNameSnapshot, amount: money(issue.amount), reason: issue.reason, status: issue.status,
+        acknowledgementOtp: issue.acknowledgementOtpCode || "", acknowledgementOtpExpiresAt: issue.acknowledgementOtpExpiresAt || null,
+        raisedAt: issue.raisedAt || null,
+      });
+    }
+    return ok(res, { financialYear, items });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cash/handovers/:movementId/issues/:issueId/resolve", async (req, res) => {
+  try {
+    const financialYear = fyOf(req);
+    const { SalespersonCashMovement, OrderNotification } = financialModels(req.auth.tenantKey, financialYear);
+    const movement = await SalespersonCashMovement.findOne({ _id: req.params.movementId, tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, type: "HANDOVER" });
+    if (!movement) return fail(res, "Cash handover not found", 404);
+    const issue = (movement.partyIssues || []).find((x) => clean(x.issueId) === clean(req.params.issueId));
+    if (!issue) return fail(res, "Cash issue not found", 404);
+    if (upper(issue.status) !== "ACKNOWLEDGED") return fail(res, "The cashier must first verify the salesperson issue OTP before this issue can be cleared", 409);
+    if (!clean(req.body.remarks)) return fail(res, "Enter how the cash issue was cleared", 400);
+    issue.status = "RESOLVED"; issue.resolvedAt = new Date(); issue.resolvedBy = req.auth.sub; issue.resolutionRemark = clean(req.body.remarks);
+    const hasOpen = (movement.partyIssues || []).some((x) => !["RESOLVED", "CANCELLED"].includes(upper(x.status)));
+    if (!hasOpen && movement.handoverOtpStatus === "VERIFIED") movement.handoverWorkflowStatus = "READY_FOR_CASHIER_COUNT";
+    await movement.save();
+    if (issue.customerGlobalId) await OrderNotification.create({
+      tenantKey: req.auth.tenantKey, financialYear, notificationNo: makeId("NTF"), recipientType: "CUSTOMER", recipientId: issue.customerGlobalId,
+      channel: "IN_APP", title: `Cash collection issue cleared • ${issue.receiptNo || "Receipt"}`,
+      body: `The cash collection issue for ${issue.receiptNo || "your receipt"} has been cleared by ${req.auth.name || "the sales person"}.`,
+      data: { notificationType: "CASH_COLLECTION_ISSUE", issueId: issue.issueId, receiptNo: issue.receiptNo, status: "RESOLVED", resolutionRemark: issue.resolutionRemark },
+      status: "PENDING",
+    });
+    return ok(res, { movementNo: movement.movementNo, issueId: issue.issueId, status: issue.status }, "Issue marked as cleared");
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
 router.get("/cash/summary", async (req, res) => {
@@ -1489,12 +2137,17 @@ router.get("/cash/summary", async (req, res) => {
       cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, at }),
       collectionTargetForUser({ tenantKey: req.auth.tenantKey, financialYear, userId: req.auth.sub, at }),
     ]);
-    const { SalespersonCashMovement, SalespersonDayClosing } = financialModels(req.auth.tenantKey, financialYear);
-    const [recent, closing] = await Promise.all([
+    const { SalespersonCashMovement, SalespersonDayClosing, Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const dayStart = startOfDay(at), dayEnd = endOfDay(at);
+    const [recent, closing, collectedToday] = await Promise.all([
       SalespersonCashMovement.find({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub }).sort({ date: -1, createdAt: -1 }).limit(25).lean(),
       SalespersonDayClosing.findOne({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, dayKey: localDateKey(at) }).lean(),
+      Receipt.aggregate([
+        { $match: { tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", collectionSource: "SALESPERSON_APP", date: { $gte: dayStart, $lt: dayEnd }, ...collectionOwnerFilter(req.auth.sub) } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]),
     ]);
-    return ok(res, { ...summary, collectionTarget: target, recentMovements: recent, dayClosing: closing || null, financialYear });
+    return ok(res, { ...summary, collectionTodayTotal: money(collectedToday?.[0]?.total || 0), collectionTarget: target, recentMovements: recent, dayClosing: closing || null, financialYear });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
@@ -1515,25 +2168,106 @@ router.get("/cash/movements", async (req, res) => {
 
 router.post("/cash/handover", async (req, res) => {
   try {
-    const financialYear = fyOf(req), amount = money(req.body.amount);
-    if (amount <= 0) return fail(res, "Handover amount must be greater than zero", 400);
-    const summary = await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub });
-    const available = money(Math.max(0, summary.cashInHand - summary.pendingTotal));
-    if (amount > available) return fail(res, `Only ₹${available.toLocaleString("en-IN")} is available for a new handover/deposit request`, 409, { cashInHand: summary.cashInHand, pendingTotal: summary.pendingTotal, available });
+    const financialYear = fyOf(req);
     const recipientUserId = clean(req.body.recipientUserId);
     if (!objectIdText(recipientUserId)) return fail(res, "Select a valid V2 cashier / receiver", 400);
     const receiver = await User.findOne({ _id: recipientUserId, tenantKey: req.auth.tenantKey, status: "ACTIVE" }).select("name role").lean();
     if (!receiver) return fail(res, "Selected cashier / receiver is not active", 400);
-    const recipientName = clean(receiver.name) || clean(req.body.recipientName) || "Receiver";
-    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
-    let movementNo = makeId("HND"); while (await SalespersonCashMovement.exists({ tenantKey: req.auth.tenantKey, financialYear, movementNo })) movementNo = makeId("HND");
+
+    const { Receipt, SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const requestedIds = new Set(jsonArray(req.body.receiptIds).map(clean).filter(Boolean));
+    const receiptFilter = {
+      tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", mode: "CASH", collectionSource: "SALESPERSON_APP",
+      $and: [
+        collectionOwnerFilter(req.auth.sub),
+        { $or: [
+          { cashDepositStatus: { $exists: false } },
+          { cashDepositStatus: { $in: [null, "", "PENDING_TO_DEPOSIT"] } },
+        ] },
+      ],
+    };
+    if (requestedIds.size) {
+      const objectIds = [...requestedIds].filter(objectIdText);
+      receiptFilter.$and.push({ $or: [
+        ...(objectIds.length ? [{ _id: { $in: objectIds } }] : []),
+        { receiptNo: { $in: [...requestedIds] } },
+      ] });
+    }
+    const receipts = await Receipt.find(receiptFilter).sort({ date: 1, createdAt: 1 });
+    if (!receipts.length) return fail(res, "There is no undeposited verified cash receipt to forward", 409);
+
+    const amount = money(receipts.reduce((sum, r) => sum + num(r.amount), 0));
+    const denominations = parseDenominations(req.body.denominations);
+    assertDenominationsMatch(denominations, amount, "cash handover");
+
+    const summary = await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub });
+    const available = money(Math.max(0, summary.cashInHand - summary.pendingTotal));
+    if (amount > available + 0.009) return fail(res, `Only ₹${available.toLocaleString("en-IN")} is available for a new handover`, 409, { cashInHand: summary.cashInHand, pendingTotal: summary.pendingTotal, available });
+
+    let movementNo = makeId("HND");
+    while (await SalespersonCashMovement.exists({ tenantKey: req.auth.tenantKey, financialYear, movementNo })) movementNo = makeId("HND");
     const movement = await SalespersonCashMovement.create({
-      tenantKey: req.auth.tenantKey, financialYear, movementNo, salespersonId: req.auth.sub, salespersonNameSnapshot: req.auth.name || "",
+      tenantKey: req.auth.tenantKey, financialYear, movementNo,
+      salespersonId: req.auth.sub, salespersonNameSnapshot: req.auth.name || "",
       date: new Date(), dayKey: localDateKey(), type: "HANDOVER", direction: "OUT", amount,
-      recipientUserId, recipientName, reference: clean(req.body.reference), remarks: clean(req.body.remarks),
+      recipientUserId, recipientName: clean(receiver.name) || "Cashier",
+      reference: clean(req.body.reference), remarks: clean(req.body.remarks), denominations,
+      receiptBreakdown: receipts.map((r) => ({
+        receiptId: String(r._id), receiptNo: r.receiptNo, customerGlobalId: r.customerGlobalId,
+        customerNameSnapshot: r.partyNameSnapshot || "", amount: money(r.amount),
+        receiptDenominations: r.cashDenominations || [],
+      })),
+      handoverWorkflowStatus: "PENDING_SALESPERSON_OTP",
+      handoverOtpStatus: "PENDING",
       status: "PENDING", createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "",
     });
-    return ok(res, movement, "Cash handover submitted for verification", 201);
+
+    const otp = await createOtp({
+      tenantKey: req.auth.tenantKey, transactionId: String(movement._id),
+      actionType: "CASH_HANDOVER_CASHIER_TO_SALESPERSON", recipientId: req.auth.sub,
+      context: { movementNo, amount, cashierId: recipientUserId, cashierName: movement.recipientName },
+    });
+    movement.handoverOtpId = otp.otpId;
+    movement.handoverOtpCode = otp.code;
+    movement.handoverOtpExpiresAt = otp.expiresAt;
+    await movement.save();
+
+    await Receipt.updateMany(
+      { _id: { $in: receipts.map((r) => r._id) } },
+      { $set: { cashDepositStatus: "HANDOVER_PENDING", cashDepositBatchId: String(movement._id) } },
+    );
+
+    return ok(res, {
+      movement: {
+        _id: String(movement._id), movementNo: movement.movementNo, amount: movement.amount,
+        recipientName: movement.recipientName, handoverWorkflowStatus: movement.handoverWorkflowStatus,
+        handoverOtpStatus: movement.handoverOtpStatus, handoverOtpExpiresAt: movement.handoverOtpExpiresAt,
+      },
+    }, "Cash forwarded to cashier; enter the OTP shown on the cashier page", 201);
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cash/handovers/:movementId/otp/verify", async (req, res) => {
+  try {
+    const financialYear = fyOf(req);
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const movement = await SalespersonCashMovement.findOne({
+      _id: req.params.movementId, tenantKey: req.auth.tenantKey, financialYear,
+      salespersonId: req.auth.sub, type: "HANDOVER", status: "PENDING",
+    });
+    if (!movement) return fail(res, "Pending cash handover not found", 404);
+    if (movement.handoverOtpStatus === "VERIFIED") return ok(res, { movementNo: movement.movementNo, status: movement.handoverWorkflowStatus }, "Handover OTP is already verified");
+    const code = clean(req.body.code);
+    if (!code) return fail(res, "Enter the cashier handover OTP", 400);
+    const result = await verifyOtp({ otpId: movement.handoverOtpId, code });
+    if (!result.ok) return fail(res, result.reason, 400);
+    if (String(result.challenge.transactionId) !== String(movement._id) || String(result.challenge.recipientId) !== String(req.auth.sub)) return fail(res, "OTP does not belong to this cash handover", 409);
+    movement.handoverOtpStatus = "VERIFIED";
+    movement.handoverOtpVerifiedAt = new Date();
+    movement.handoverWorkflowStatus = (movement.partyIssues || []).some((x) => !["RESOLVED", "CANCELLED"].includes(upper(x.status))) ? "ISSUE_OPEN" : "READY_FOR_CASHIER_COUNT";
+    movement.handoverOtpCode = undefined;
+    await movement.save();
+    return ok(res, { movementNo: movement.movementNo, status: movement.handoverWorkflowStatus }, "Cash handover confirmed; cashier can now count and receive the notes");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
@@ -1562,11 +2296,17 @@ router.post("/cash/bank-deposit", async (req, res) => {
 
 router.patch("/cash/movements/:id/cancel", async (req, res) => {
   try {
-    const financialYear = fyOf(req); const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const financialYear = fyOf(req); const { SalespersonCashMovement, Receipt } = financialModels(req.auth.tenantKey, financialYear);
     const movement = await SalespersonCashMovement.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub, type: { $in: ["HANDOVER", "BANK_DEPOSIT"] } });
     if (!movement) return fail(res, "Cash movement not found", 404);
     if (movement.status !== "PENDING") return fail(res, "Only pending handover/deposit requests can be cancelled", 409);
-    movement.status = "CANCELLED"; movement.remarks = [movement.remarks, clean(req.body.remarks)].filter(Boolean).join(" | "); await movement.save();
+    movement.status = "CANCELLED"; movement.handoverWorkflowStatus = movement.type === "HANDOVER" ? "CANCELLED" : movement.handoverWorkflowStatus; movement.remarks = [movement.remarks, clean(req.body.remarks)].filter(Boolean).join(" | "); await movement.save();
+    if (movement.type === "HANDOVER" && (movement.receiptBreakdown || []).length) {
+      await Receipt.updateMany(
+        { _id: { $in: movement.receiptBreakdown.map((x) => x.receiptId).filter(Boolean) }, cashDepositBatchId: String(movement._id) },
+        { $set: { cashDepositStatus: "PENDING_TO_DEPOSIT", cashDepositBatchId: "" } },
+      );
+    }
     return ok(res, movement, "Request cancelled");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
@@ -1576,6 +2316,10 @@ router.patch("/cash/movements/:id/verify", async (req, res) => {
     const financialYear = fyOf(req); const { SalespersonCashMovement, LedgerEntry } = financialModels(req.auth.tenantKey, financialYear);
     const movement = await SalespersonCashMovement.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear, type: { $in: ["HANDOVER", "BANK_DEPOSIT"] } });
     if (!movement) return fail(res, "Cash movement not found", 404);
+    const handoverWorkflow = upper(movement.handoverWorkflowStatus);
+    if (movement.type === "HANDOVER" && handoverWorkflow && handoverWorkflow !== "LEGACY") {
+      return fail(res, "This cash handover uses the cashier count workflow and must be received from the DMS Cashier page", 409);
+    }
     const receiverMatch = clean(movement.recipientUserId) && clean(movement.recipientUserId) === clean(req.auth.sub);
     if (!isAdminAuth(req.auth) && !receiverMatch) return fail(res, "Only the assigned receiver or an administrator can verify this movement", 403);
     if (movement.status !== "PENDING") return ok(res, movement, `Movement is already ${movement.status}`);
@@ -2346,9 +3090,7 @@ router.get("/home", async (req, res) => {
     const salesRemaining = money(Math.max(0, salesTarget - salesMonth));
     const salesAchievementPct = salesTarget > 0 ? Math.round(Math.min(999, salesMonth / salesTarget * 100) * 10) / 10 : 0;
     const overdue = money(priority.reduce((s, x) => s + num(x.overdueAmount), 0));
-    const promisedToday = money(priority.reduce((s, x) => s + num(x.promisedToday), 0));
     const outstanding = money(priority.reduce((s, x) => s + Math.max(0, num(x.outstanding)), 0));
-    const brokenPromises = priority.filter((x) => x.brokenPromiseAmount > 0).length;
 
     const salesByMonth = new Map(fySalesRows.map((x) => [`${x._id.year}-${String(x._id.month).padStart(2,"0")}`, x]));
     const receiptByMonth = new Map(fyCollectionRows.map((x) => [`${x._id.year}-${String(x._id.month).padStart(2,"0")}`, x]));
@@ -2381,8 +3123,7 @@ router.get("/home", async (req, res) => {
     const push = (section) => { if (section && (!section.items || section.items.length) && (!section.cards || section.cards.length)) sections.push(section); };
 
     const urgentCards = [];
-    if (brokenPromises) urgentCards.push({ id:"broken-promises", icon:"handshake-outline", label:"Broken Promises", value:brokenPromises, format:"NUMBER", sub:`${priority.filter(x=>x.brokenPromiseAmount>0).length} party(s) need recovery`, tone:"CRITICAL", size:"HALF", action:homeActionNested("Customers","CollectionPriority",{financialYear}) });
-    if (overdue > 0) urgentCards.push({ id:"overdue", icon:"alert-circle-outline", label:"Overdue", value:overdue, format:"MONEY", sub:`${priority.filter(x=>x.overdueAmount>0).length} party(s)`, tone:"HIGH", size:"HALF", action:homeActionNested("Customers","CollectionPriority",{financialYear}) });
+    if (overdue > 0) urgentCards.push({ id:"overdue", icon:"alert-circle-outline", label:"Overdue", value:overdue, format:"MONEY", sub:`${priority.filter(x=>x.overdueAmount>0).length} party(s)`, tone:"HIGH", size:"HALF", action:homeActionRoute("Customers") });
     if (market.nearestLead) urgentCards.push({ id:"nearest-lead", icon:"map-marker-star-outline", label:"Nearest Lead", value:market.nearestLead.companyName || market.nearestLead.contactPerson || "Lead", format:"TEXT", sub:`${market.nearestLead.distanceKm.toFixed(1)} km • ${market.nearestLead.pincode || "No pincode"}`, tone:"TEAL", size:"FULL", action:homeActionNested("Leads","LeadList",{initialTab:"leads",initialPincode:market.nearestLead.pincode||"",initialSearch:market.nearestLead.companyName||market.nearestLead.mobile||"",focusLeadId:String(market.nearestLead._id)}) });
     if (routePlan && ["READY","IN_PROGRESS"].includes(upper(routePlan.status))) urgentCards.push({ id:"route", icon:"map-marker-path", label:routePlan.status === "IN_PROGRESS" ? "Route In Progress" : "Route Ready", value:`${routePlan.completedStops||0}/${routePlan.stops?.length||0}`, format:"TEXT", sub:nextStop?`Next: ${nextStop.customerNameSnapshot}`:`${routeProgress}% completed`, tone:"GOOD", size:"FULL", action:homeActionRoute("PriorityRoute") });
     push({ id:"act-now", kind:"METRIC_GRID", title:"Act Now", priority:110, cards:urgentCards });
@@ -2390,7 +3131,6 @@ router.get("/home", async (req, res) => {
     push({ id:"today", kind:"METRIC_GRID", title:"Today", priority:95, cards:[
       { id:"orders",icon:"cart-check",label:"Orders Booked",value:todayOrderSales,format:"MONEY",sub:`${todayOrders} order(s)`,tone:todayOrders?"GOOD":"MUTED",size:"HALF",action:homeActionRoute("Customers") },
       { id:"collections",icon:"cash-check",label:"Collected",value:todayCollections,format:"MONEY",sub:`${todayReceiptCount} receipt(s)`,tone:todayCollections?"GOOD":"MUTED",size:"HALF",action:homeActionRoute("Cash") },
-      ...(promisedToday>0?[{ id:"promised",icon:"hand-coin-outline",label:"Promised Today",value:promisedToday,format:"MONEY",sub:"Follow up before day end",tone:"HIGH",size:"HALF",action:homeActionNested("Customers","CollectionPriority",{financialYear}) }]:[]),
       { id:"cash",icon:"wallet-outline",label:"Cash With Me",value:cash.cashInHand,format:"MONEY",sub:num(cash.cashInHand)>0?"Physical cash responsibility":"No cash pending",tone:num(cash.cashInHand)>0?"TEAL":"MUTED",size:"HALF",action:homeActionRoute("Cash") },
     ]});
 
@@ -2437,7 +3177,7 @@ router.get("/home", async (req, res) => {
     })).filter((x)=>x.action)});
 
     const quick = [
-      overdue>0?{id:"collection",icon:"account-cash-outline",label:"Collection Priority",tone:"HIGH",action:homeActionNested("Customers","CollectionPriority",{financialYear})}:null,
+      overdue>0?{id:"collection",icon:"account-cash-outline",label:"Due Customers",tone:"HIGH",action:homeActionRoute("Customers")}:null,
       market.totalOpenLeads>0?{id:"lead-areas",icon:"map-marker-radius-outline",label:"Leads by Pincode",tone:"TEAL",action:homeActionNested("Leads","LeadList",{initialTab:"leads",initialMarketMode:"AREA"})}:null,
       {id:"analytics",icon:"chart-bar",label:"Sales vs Collection",tone:"TEAL",action:homeActionRoute("SalesCollectionAnalytics")},
       {id:"route",icon:"map-marker-path",label:routePlan?"Today's Route":"Build Daily Route",tone:routePlan?"GOOD":"TEAL",action:homeActionRoute("PriorityRoute")},
@@ -2456,9 +3196,9 @@ router.get("/home", async (req, res) => {
       hero:{eyebrow:`${greeting.toUpperCase()} • DYNAMIC SALES HOME`,title:heroTitle,subtitle:heroSubtitle,tone:heroSource?.priority||"TEAL",action:heroAction,confidence:heroSource?.confidence||null},
       dynamicLayout:{version:2,sections},
       // Backward-compatible values are retained for older app builds.
-      today:{orderSales:todayOrderSales,orders:todayOrders,collections:todayCollections,receipts:todayReceiptCount,promisedToday,cashInHand:cash.cashInHand},
+      today:{orderSales:todayOrderSales,orders:todayOrders,collections:todayCollections,receipts:todayReceiptCount,cashInHand:cash.cashInHand},
       month:{sales:salesMonth,invoices:invoicesMonth,salesTarget,salesRemaining,salesAchievementPct,collectionTarget},
-      receivables:{outstanding,overdue,priorityCustomers:priority.length,brokenPromises},
+      receivables:{outstanding,overdue,priorityCustomers:priority.length},
       cash,
       market,
       route:{plan:routePlan||null,progressPct:routeProgress,nextStop:nextStop||null},

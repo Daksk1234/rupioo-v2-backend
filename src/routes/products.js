@@ -1,11 +1,13 @@
 import express from "express";
 import multer from "multer";
-import { Product, Unit, CompanyUnit, GenericRecord } from "../models/index.js";
+import path from "path";
+import { Product, Unit, CompanyUnit, GenericRecord, FileMeta } from "../models/index.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { requireAuth } from "../middleware/auth.js";
 import { profitMetrics } from "../services/pricingService.js";
 import { referencedProductIds } from "../services/referenceIntegrityService.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
+import { saveUploadedFile } from "../services/storageService.js";
 import {
   readRows,
   resolveColumns,
@@ -33,6 +35,84 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 },
 });
+
+const PRODUCT_MEDIA_MAX_BYTES = 2 * 1024 * 1024;
+const PRODUCT_MEDIA_MIME_EXTENSIONS = new Map([
+  ["image/jpeg", new Set([".jpg", ".jpeg"])],
+  ["image/png", new Set([".png"])],
+  ["image/webp", new Set([".webp"])],
+  ["image/avif", new Set([".avif"])],
+  ["image/svg+xml", new Set([".svg"])],
+  ["application/pdf", new Set([".pdf"])],
+]);
+
+const productMediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: PRODUCT_MEDIA_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file?.mimetype || "").toLowerCase();
+    const ext = path.extname(String(file?.originalname || "")).toLowerCase();
+    const extensionAllowed = Array.from(PRODUCT_MEDIA_MIME_EXTENSIONS.values()).some(
+      (extensions) => extensions.has(ext),
+    );
+    const mimeAllowed =
+      !mime ||
+      mime === "application/octet-stream" ||
+      PRODUCT_MEDIA_MIME_EXTENSIONS.has(mime);
+    if (!extensionAllowed || !mimeAllowed) {
+      return cb(
+        new Error(
+          "Product files must be JPG, JPEG, PNG, WEBP, AVIF, SVG or PDF",
+        ),
+      );
+    }
+    return cb(null, true);
+  },
+});
+
+const productMediaBufferMatchesExtension = (file) => {
+  const ext = path.extname(String(file?.originalname || "")).toLowerCase();
+  const buffer = file?.buffer;
+  if (!Buffer.isBuffer(buffer) || !buffer.length) return false;
+
+  if (ext === ".jpg" || ext === ".jpeg") {
+    return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  }
+  if (ext === ".png") {
+    return buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  }
+  if (ext === ".webp") {
+    return buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP";
+  }
+  if (ext === ".avif") {
+    const head = buffer.subarray(0, Math.min(buffer.length, 64)).toString("latin1");
+    return head.includes("ftypavif") || head.includes("ftypavis");
+  }
+  if (ext === ".pdf") {
+    return buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+  }
+  if (ext === ".svg") {
+    const text = buffer.subarray(0, Math.min(buffer.length, 16384)).toString("utf8");
+    const normalized = text.replace(/^\uFEFF/, "").trimStart();
+    const looksLikeSvg = /^(?:<\?xml[^>]*>\s*)?(?:<!--[^]*?-->\s*)?<svg\b/i.test(normalized);
+    const unsafe = /<script\b|\son(?:load|error|click|mouseover)\s*=|javascript\s*:/i.test(text);
+    return looksLikeSvg && !unsafe;
+  }
+  return false;
+};
+
+const receiveProductMedia = (req, res, next) =>
+  productMediaUpload.array("files")(req, res, (error) => {
+    if (!error) return next();
+    if (error?.code === "LIMIT_FILE_SIZE") {
+      return fail(res, "Each product image/file must be 2 MB or smaller", 400);
+    }
+    return fail(
+      res,
+      error?.message || "Unable to upload product images/files",
+      400,
+    );
+  });
 
 const upper = (value) => cleanText(value).toUpperCase();
 const userIdFromAuth = (auth = {}) =>
@@ -197,6 +277,9 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const body = { ...req.body, tenantKey: req.auth.tenantKey };
+    // Product media is attached only through the dedicated media endpoints.
+    // This prevents a normal JSON create request from linking arbitrary file IDs.
+    delete body.imageFileIds;
     if (!isAdminAuth(req.auth)) {
       delete body.minimumProfitPct;
       delete body.pricingScheme;
@@ -836,6 +919,134 @@ router.post("/bulk-delete", async (req, res) => {
   );
 });
 
+router.get("/:id/images", async (req, res) => {
+  try {
+    const product = await Product.findOne({
+      _id: req.params.id,
+      tenantKey: req.auth.tenantKey,
+    })
+      .select("_id name imageFileIds")
+      .lean();
+    if (!product) return fail(res, "Product not found", 404);
+
+    const ids = Array.isArray(product.imageFileIds)
+      ? product.imageFileIds.map((value) => String(value || "").trim()).filter(Boolean)
+      : [];
+    if (!ids.length) return ok(res, { items: [] });
+
+    const files = await FileMeta.find({
+      tenantKey: req.auth.tenantKey,
+      fileId: { $in: ids },
+    })
+      .select("fileId originalName mimeType size createdAt")
+      .lean();
+    const byId = new Map(files.map((file) => [String(file.fileId), file]));
+
+    return ok(res, {
+      items: ids
+        .map((fileId) => byId.get(fileId))
+        .filter(Boolean)
+        .map((file) => ({
+          fileId: file.fileId,
+          originalName: file.originalName || "Product file",
+          mimeType: file.mimeType || "application/octet-stream",
+          size: Number(file.size || 0),
+          createdAt: file.createdAt,
+        })),
+    });
+  } catch (error) {
+    return fail(res, error.message || "Unable to load product images/files", 400);
+  }
+});
+
+router.post("/:id/images", receiveProductMedia, async (req, res) => {
+  try {
+    const product = await Product.findOne({
+      _id: req.params.id,
+      tenantKey: req.auth.tenantKey,
+    });
+    if (!product) return fail(res, "Product not found", 404);
+
+    const incoming = Array.isArray(req.files) ? req.files : [];
+    if (!incoming.length) {
+      return fail(res, "Select at least one product image/file", 400);
+    }
+
+    const uploaded = [];
+    for (const file of incoming) {
+      if (!productMediaBufferMatchesExtension(file)) {
+        return fail(
+          res,
+          `${file.originalname || "Product file"} does not contain a valid supported file`,
+          400,
+        );
+      }
+      const meta = await saveUploadedFile({
+        file,
+        tenantKey: req.auth.tenantKey,
+        module: "DMS",
+        entityType: "PRODUCT_IMAGE",
+        entityId: String(product._id),
+        uploadedBy: req.auth.sub,
+        access: "PRIVATE",
+      });
+      uploaded.push(meta);
+    }
+
+    product.imageFileIds = Array.from(
+      new Set([
+        ...(Array.isArray(product.imageFileIds) ? product.imageFileIds : []),
+        ...uploaded.map((file) => file.fileId),
+      ].map((value) => String(value || "").trim()).filter(Boolean)),
+    );
+    await product.save();
+
+    return ok(
+      res,
+      {
+        product: product.toObject(),
+        items: uploaded.map((file) => ({
+          fileId: file.fileId,
+          originalName: file.originalName || "Product file",
+          mimeType: file.mimeType || "application/octet-stream",
+          size: Number(file.size || 0),
+          createdAt: file.createdAt,
+        })),
+      },
+      `${uploaded.length} product file${uploaded.length === 1 ? "" : "s"} uploaded`,
+      201,
+    );
+  } catch (error) {
+    return fail(res, error.message || "Unable to save product images/files", 400);
+  }
+});
+
+router.delete("/:id/images/:fileId", async (req, res) => {
+  try {
+    const product = await Product.findOne({
+      _id: req.params.id,
+      tenantKey: req.auth.tenantKey,
+    });
+    if (!product) return fail(res, "Product not found", 404);
+
+    const target = String(req.params.fileId || "").trim();
+    const current = Array.isArray(product.imageFileIds) ? product.imageFileIds : [];
+    if (!current.some((fileId) => String(fileId) === target)) {
+      return fail(res, "Product image/file not found", 404);
+    }
+
+    product.imageFileIds = current.filter((fileId) => String(fileId) !== target);
+    await product.save();
+    return ok(
+      res,
+      { product: product.toObject(), removedFileId: target },
+      "Product image/file removed",
+    );
+  } catch (error) {
+    return fail(res, error.message || "Unable to remove product image/file", 400);
+  }
+});
+
 router.put("/:id", async (req, res) => {
   try {
     const existing = await Product.findOne({
@@ -851,6 +1062,9 @@ router.put("/:id", async (req, res) => {
     delete changes.tenantKey;
     delete changes.createdAt;
     delete changes.updatedAt;
+    // Keep existing product media unless it is explicitly changed through the
+    // dedicated product-image endpoints below.
+    delete changes.imageFileIds;
     if (!isAdminAuth(req.auth)) {
       delete changes.minimumProfitPct;
       delete changes.pricingScheme;

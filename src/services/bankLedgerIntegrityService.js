@@ -11,7 +11,7 @@ export const bankStatementIdentity = (bank, row) => JSON.stringify([
   clean(bank), new Date(row.date).toISOString().slice(0, 10),
   clean(row.remarks).toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim(),
   Number(row.debit || 0).toFixed(2), Number(row.credit || 0).toFixed(2),
-  Number(row.runningBalance || 0).toFixed(2),
+  Number(row.rowNo || 0),
 ]);
 export const bankLineIdentity = (row) => JSON.stringify([
   canonicalBankType(row.transactionType), clean(row.transactionId), clean(row.partyGlobalId),
@@ -31,7 +31,7 @@ export async function inspectBankLedgerRows({ tenantKey, financialYear, rows }) 
     receiptIds.length ? Receipt.find({ tenantKey, financialYear, receiptNo: { $in: receiptIds } }).sort({createdAt:1,_id:1}).lean() : [],
     paymentIds.length ? Payment.find({ tenantKey, financialYear, paymentNo: { $in: paymentIds } }).sort({createdAt:1,_id:1}).lean() : [],
     BankStatementRow.find({ tenantKey, financialYear, transactionId: { $in: [...receiptIds, ...paymentIds] } })
-      .select("transactionId bankAccountId importId date remarks debit credit runningBalance")
+      .select("transactionId bankAccountId importId rowNo date remarks debit credit runningBalance")
       .sort({ createdAt: 1, _id: 1 }).lean(),
   ]);
   const receiptMap=new Map(),paymentMap=new Map();

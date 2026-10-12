@@ -104,6 +104,7 @@ function receiptState(value) {
 }
 
 function chequeLifecycleState(receipt) {
+  if (upper(receipt.collectionSource) === "SALESPERSON_APP" && upper(receipt.status) !== "POSTED") return "PENDING";
   const explicit = upper(receipt.chequeStatus);
   if (["BOUNCED", "BOUNCE", "RETURNED", "DISHONOURED", "DISHONORED"].includes(explicit)) return "BOUNCED";
   if (["CLEARED", "CLEAR"].includes(explicit)) return "CLEARED";
@@ -124,14 +125,15 @@ export async function buildReceiptBounce({ tenantKey, financialYear }) {
   const meta = await financeMeta(tenantKey, financialYear);
   const { Receipt } = financialModels(tenantKey, meta.financialYear);
   const docs = await Receipt.find({ tenantKey, financialYear: meta.financialYear, status: { $ne: "DELETED" } })
-    .select("receiptNo date customerGlobalId partyNameSnapshot amount mode reference bankAccountId bankNameSnapshot statementImportId bounceStatus status remarks chequeNumber chequeIssueDate chequeDepositDate chequeClearanceDate chequeBounceDate chequeStatus updatedAt")
+    .select("receiptNo date customerGlobalId partyNameSnapshot amount mode receiptType allocationType againstInvoices payerAccountNumber paymentProofFileId upiPaymentText reference bankAccountId bankNameSnapshot statementImportId bounceStatus status remarks chequeNumber chequeIssueDate chequeDepositDate chequeClearanceDate chequeBounceDate chequeStatus collectionSource receiptWorkflowStatus customerOtpStatus cashierOtpStatus collectedBySalespersonNameSnapshot createdByNameSnapshot cashierOtpExpiresAt updatedAt")
     .sort({ date: -1, createdAt: -1 }).lean();
 
   // This report is specifically for cheque lifecycle tracking. Non-cheque
   // receipts (cash/NEFT/UPI etc.) stay in the normal Receipt reports.
   const chequeDocs = docs.filter((r) => {
     const mode = upper(r.mode);
-    return Boolean(clean(r.chequeNumber)) || /CHEQUE|CHECK|CHQ/.test(mode);
+    const receiptType = upper(r.receiptType);
+    return receiptType === "CHEQUE" || Boolean(clean(r.chequeNumber)) || /CHEQUE|CHECK|CHQ/.test(mode);
   });
 
   const bankIds = [...new Set(chequeDocs.map((r) => clean(r.bankAccountId)).filter(Boolean))];
@@ -154,16 +156,27 @@ export async function buildReceiptBounce({ tenantKey, financialYear }) {
       partyId: clean(r.customerGlobalId),
       partyName: clean(r.partyNameSnapshot) || "PARTY",
       amount: money(r.amount),
-      mode: upper(r.mode) || "CHEQUE",
+      mode: upper(r.mode) || "BANK",
+      receiptType: upper(r.receiptType) || "CHEQUE",
       chequeNumber: clean(r.chequeNumber || r.reference),
+      payerAccountNumber: clean(r.payerAccountNumber),
+      paymentProofFileId: clean(r.paymentProofFileId),
+      allocationType: clean(r.allocationType),
+      againstInvoices: r.againstInvoices || [],
       issueDate,
       depositDate,
       clearanceDate,
       bounceDate,
       bankAccountId: clean(r.bankAccountId),
       bank: clean(r.bankNameSnapshot || bank?.bankName),
-      accountNumber: clean(bank?.accountNumber),
+      accountNumber: clean(r.payerAccountNumber || bank?.accountNumber),
       status: lifecycle,
+      workflowStatus: clean(r.receiptWorkflowStatus),
+      customerOtpStatus: clean(r.customerOtpStatus) || "NOT_REQUIRED",
+      cashierOtpStatus: clean(r.cashierOtpStatus) || "NOT_REQUIRED",
+      cashierOtpExpiresAt: r.cashierOtpExpiresAt || null,
+      madeBy: clean(r.collectedBySalespersonNameSnapshot || r.createdByNameSnapshot),
+      collectionSource: clean(r.collectionSource),
       remarks: clean(r.remarks),
     };
   });
@@ -176,6 +189,7 @@ export async function buildReceiptBounce({ tenantKey, financialYear }) {
     accountNumber: r.accountNumber,
   }])).values()].sort((a, b) => a.name.localeCompare(b.name));
 
+  const pendingRows = rows.filter((r) => r.status === "PENDING");
   const issuedRows = rows.filter((r) => r.status === "ISSUED" || r.status === "DEPOSITED");
   const clearedRows = rows.filter((r) => r.status === "CLEARED");
   const bouncedRows = rows.filter((r) => r.status === "BOUNCED");
@@ -187,6 +201,8 @@ export async function buildReceiptBounce({ tenantKey, financialYear }) {
     totals: {
       cheques: rows.length,
       amount: money(rows.reduce((s, r) => s + r.amount, 0)),
+      pending: money(pendingRows.reduce((s, r) => s + r.amount, 0)),
+      pendingCount: pendingRows.length,
       issued: money(issuedRows.reduce((s, r) => s + r.amount, 0)),
       issuedCount: issuedRows.length,
       cleared: money(clearedRows.reduce((s, r) => s + r.amount, 0)),

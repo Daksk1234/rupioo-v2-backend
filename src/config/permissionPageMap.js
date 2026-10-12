@@ -69,6 +69,7 @@ export const PAGE_PERMISSION_MAP = {
   "/dms/stock-ageing": p("dms.stock_reports.dead_stock_report", "dms.stock.dead_party"),
 
   "/dms/receipts": p("dms.transaction.receipt"),
+  "/dms/cashier": p("dms.transaction.receipt", "dms.transaction.cashbook", "dms.transaction.cashaccount"),
   "/dms/payments": p("dms.transaction.payment"),
   "/dms/banking": p("dms.finance_reports.bank_statement", "dms.transaction.cashbook", "dms.transaction.cashaccount"),
   "/dms/bank-accounts": p("dms.finance_reports.bank_statement"),

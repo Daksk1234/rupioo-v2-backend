@@ -1,7 +1,7 @@
 import express from "express";
-import { CustomerLink, Product, Transporter, User, GlobalTransporterStation, Pincode } from "../models/index.js";
+import { CustomerLink, Product, Transporter, User, GlobalTransporterStation, Pincode, GenericRecord } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
-import { financialModels, postBalancedEntries } from "../services/accountingService.js";
+import { financialModels, postBalancedEntries, reversePostedTransaction } from "../services/accountingService.js";
 import { createOtp, verifyOtp } from "../services/otpService.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
@@ -406,6 +406,8 @@ router.get("/orders", async (req, res) => {
     if (req.query.workflowStatus) filter.workflowStatus = upper(req.query.workflowStatus);
     if (req.query.salespersonId) filter.salespersonId = clean(req.query.salespersonId);
     if (req.query.customerGlobalId) filter.customerGlobalId = clean(req.query.customerGlobalId);
+    // Warehouse-role users only see orders containing products routed to their warehouse.
+    if (req.auth?.dataScope === "WAREHOUSE" && req.auth?.warehouseId) filter["items.warehouseId"] = clean(req.auth.warehouseId);
     const search = clean(req.query.search);
     if (search) filter.$or = [{ orderNo: { $regex: search, $options: "i" } }, { customerNameSnapshot: { $regex: search, $options: "i" } }];
     const [items, total] = await Promise.all([
@@ -426,11 +428,110 @@ router.get("/orders/:id", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
+router.get("/orders/:id/warehouse-preview", async (req, res) => {
+  try {
+    const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
+    const order = await requireOrder(req, req.params.id, models);
+    if (["DELIVERED", "CLOSED", "CANCELLED", "REJECTED"].includes(upper(order.workflowStatus))) return fail(res, "This order cannot be released to warehouse", 409);
+    if (order.invoice?.invoiceId || (order.invoices || []).some((x) => x?.invoiceId)) return fail(res, "This order is already invoiced", 409);
+
+    const [warehouseRows, productRows] = await Promise.all([
+      GenericRecord.find({ tenantKey: req.auth.tenantKey, app: "dms", resource: "warehouses", status: "ACTIVE" })
+        .select("_id title reference name value")
+        .sort({ title: 1, reference: 1 })
+        .lean(),
+      Product.find({ tenantKey: req.auth.tenantKey, _id: { $in: (order.items || []).map((x) => x.productId) } })
+        .select("_id warehouseId")
+        .lean(),
+    ]);
+    const productWarehouse = new Map(productRows.map((x) => [String(x._id), clean(x.warehouseId)]));
+    const whMap = new Map(warehouseRows.map((w) => [String(w._id), clean(w.title || w.reference || w.name || w.value || "Warehouse")]));
+    const items = (order.items || []).map((x) => {
+      const defaultWarehouseId = clean(x.warehouseId) || productWarehouse.get(String(x.productId)) || clean(order.warehouseId);
+      return {
+        productId: x.productId,
+        productName: x.nameSnapshot || x.sku || "Product",
+        productHsn: x.hsnSnapshot || "",
+        qty: num(x.qty),
+        basicRate: money(x.rate),
+        warehouseId: defaultWarehouseId,
+        warehouseName: clean(x.warehouseNameSnapshot) || whMap.get(defaultWarehouseId) || "",
+      };
+    });
+    return ok(res, {
+      financialYear,
+      orderId: String(order._id),
+      orderNo: order.orderNo,
+      customerGlobalId: order.customerGlobalId,
+      partyName: order.customerNameSnapshot || "Customer",
+      // The statutory invoice number is allocated only when Order Desk posts the invoice.
+      // Showing AUTO here avoids reserving/reusing an invoice number before posting.
+      invoiceNo: order.invoice?.invoiceNo || "AUTO ON GENERATE",
+      date: order.date || order.createdAt,
+      items,
+      warehouses: warehouseRows.map((w) => ({ _id: String(w._id), name: clean(w.title || w.reference || w.name || w.value || "Warehouse") })),
+    });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/orders/:id/release-to-warehouse", async (req, res) => {
+  try {
+    const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
+    const order = await requireOrder(req, req.params.id, models);
+    const status = upper(order.workflowStatus || "ORDER_PLACED");
+    if (["CREDIT_HOLD", "OTP_PENDING"].includes(status)) return fail(res, `Order cannot be sent to warehouse while ${status.replaceAll("_", " ")}`, 409);
+    if (["INVOICED", "INVOICED_PARTIAL", "DELIVERED", "CLOSED", "CANCELLED", "REJECTED"].includes(status)) return fail(res, `Order cannot be sent to warehouse from ${status}`, 409);
+    if (order.customerOtpRequired && !order.customerOtpVerifiedAt) return fail(res, "Customer OTP verification is pending", 409);
+
+    const supplied = new Map((Array.isArray(req.body.items) ? req.body.items : []).map((x) => [clean(x.productId), clean(x.warehouseId)]));
+    const warehouseIds = [...new Set((order.items || []).map((x) => supplied.get(clean(x.productId))).filter(Boolean))];
+    if ((order.items || []).some((x) => !supplied.get(clean(x.productId)))) return fail(res, "Select a warehouse for every product", 400);
+    const warehouses = await GenericRecord.find({ _id: { $in: warehouseIds }, tenantKey: req.auth.tenantKey, app: "dms", resource: "warehouses", status: "ACTIVE" })
+      .select("_id title reference name value")
+      .lean();
+    if (warehouses.length !== warehouseIds.length) return fail(res, "One or more selected warehouses are not active", 400);
+    const whMap = new Map(warehouses.map((w) => [String(w._id), clean(w.title || w.reference || w.name || w.value || "Warehouse")]));
+
+    // Customer App orders may already be atomically reserved at order placement.
+    // Legacy/DMS orders are reserved here before warehouse routing.
+    if (upper(order.reservation?.status) !== "RESERVED") await reserveOrderStock(order, req.auth.tenantKey);
+    if (upper(order.workflowStatus) === "ORDER_PLACED") await transitionOrder({ req, models, order, toStatus: "VERIFIED", note: "Order verified for warehouse release" });
+    if (upper(order.workflowStatus) === "VERIFIED") await transitionOrder({ req, models, order, toStatus: "STOCK_RESERVED", note: "Stock reserved for warehouse release", type: "STOCK_RESERVED" });
+    if (upper(order.workflowStatus) !== "STOCK_RESERVED" && upper(order.workflowStatus) !== "SENT_TO_WAREHOUSE") return fail(res, `Order cannot be released to warehouse from ${order.workflowStatus}`, 409);
+
+    const assignedIds = [];
+    for (const item of order.items || []) {
+      const warehouseId = supplied.get(clean(item.productId));
+      item.warehouseId = warehouseId;
+      item.warehouseNameSnapshot = whMap.get(warehouseId) || "Warehouse";
+      item.warehouseStatus = "SENT_TO_WAREHOUSE";
+      assignedIds.push(warehouseId);
+    }
+    const uniqueAssigned = [...new Set(assignedIds)];
+    order.warehouseId = uniqueAssigned.length === 1 ? uniqueAssigned[0] : "";
+    order.warehouseNameSnapshot = uniqueAssigned.length === 1 ? whMap.get(uniqueAssigned[0]) : "MULTIPLE WAREHOUSES";
+    await order.save();
+
+    if (upper(order.workflowStatus) !== "SENT_TO_WAREHOUSE") {
+      await transitionOrder({
+        req, models, order, toStatus: "SENT_TO_WAREHOUSE",
+        note: uniqueAssigned.length === 1 ? `Order sent to ${whMap.get(uniqueAssigned[0])}` : `Order split across ${uniqueAssigned.length} warehouses`,
+        type: "WAREHOUSE_RELEASED",
+        meta: { warehouses: uniqueAssigned.map((id) => ({ warehouseId: id, warehouseName: whMap.get(id) })) },
+      });
+    }
+    return ok(res, shapeOrder(order), "Order sent to warehouse");
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
 router.delete("/orders/:id", async (req, res) => {
   try {
     const financialYear = await getFy(req);
     const models = financialModels(req.auth.tenantKey, financialYear);
     const order = await requireOrder(req, req.params.id, models);
+    const terminal = upper(order.workflowStatus);
+    if (["DELIVERED", "CLOSED"].includes(terminal)) return fail(res, "A delivered/completed order cannot be deleted", 409);
+    if (order.invoice?.invoiceId || (order.invoices || []).some((x) => x?.invoiceId)) return fail(res, "This order already has a posted invoice. Cancel/reverse the invoice instead of deleting the order.", 409);
     const orderId = String(order._id);
     const orderNo = order.orderNo;
 
@@ -535,6 +636,56 @@ router.post("/orders/:id/transition", async (req, res) => {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear), order = await requireOrder(req, req.params.id, models);
     const to = upper(req.body.toStatus);
     if (!to) return fail(res, "toStatus is required", 400);
+    if (to === "CANCELLED") {
+      if (["DELIVERED", "CLOSED"].includes(upper(order.workflowStatus))) return fail(res, "A delivered/completed order cannot be cancelled", 409);
+
+      // If Order Desk has already posted an invoice but it has NOT been delivered,
+      // cancel it safely: reverse accounting + stock, retain the invoice as a
+      // CANCELLED audit document, then cancel the order. A delivered invoice/order
+      // is never reversible from this action.
+      const linkedIds = [...new Set([
+        clean(order.invoice?.invoiceId),
+        ...(order.invoices || []).map((x) => clean(x?.invoiceId)),
+      ].filter(Boolean))];
+      if (linkedIds.length) {
+        const linkedInvoices = await models.SalesInvoice.find({ _id: { $in: linkedIds }, tenantKey: req.auth.tenantKey, financialYear });
+        for (const invoice of linkedInvoices) {
+          if (upper(invoice.workflowStatus) === "DELIVERED" || invoice.delivery?.deliveredAt) return fail(res, `Invoice ${invoice.invoiceNo} is already delivered; the order cannot be cancelled`, 409);
+          const issuedNote = await models.CreditNote.exists({
+            tenantKey: req.auth.tenantKey,
+            financialYear,
+            status: "ISSUED",
+            $or: [{ invoiceId: String(invoice._id) }, { referenceDocumentId: String(invoice._id) }],
+          });
+          if (issuedNote) return fail(res, `Invoice ${invoice.invoiceNo} has an issued credit note and cannot be cancelled from the order`, 409);
+        }
+        for (const invoice of linkedInvoices) {
+          if (upper(invoice.status) !== "CANCELLED") {
+            await reversePostedTransaction({ tenantKey: req.auth.tenantKey, financialYear, transactionId: invoice.invoiceNo, reason: `Order ${order.orderNo} cancelled` });
+            for (const item of invoice.items || []) {
+              const qty = Math.max(0, num(item.qty));
+              if (!qty) continue;
+              await Product.updateOne({ _id: item.productId, tenantKey: req.auth.tenantKey }, { $inc: { currentStock: qty } });
+              await models.StockMovement.create({
+                tenantKey: req.auth.tenantKey,
+                financialYear,
+                date: new Date(),
+                productId: String(item.productId),
+                warehouseId: clean((order.items || []).find((x) => String(x.productId) === String(item.productId))?.warehouseId) || clean(invoice.warehouseId),
+                type: "ORDER_CANCEL_REVERSAL",
+                qtyIn: qty,
+                qtyOut: 0,
+                landedCost: num(item.landedCostSnapshot),
+                referenceId: invoice.invoiceNo,
+              });
+            }
+            invoice.status = "CANCELLED";
+            invoice.workflowStatus = "CANCELLED";
+            await invoice.save();
+          }
+        }
+      }
+    }
     if (["CANCELLED", "REJECTED"].includes(to)) await releaseOrderReservation(order, req.auth.tenantKey, clean(req.body.remarks) || to);
     await transitionOrder({ req, models, order, toStatus: to, note: clean(req.body.remarks) });
     return ok(res, shapeOrder(order), `Order moved to ${to}`);
@@ -557,25 +708,78 @@ router.post("/orders/:id/packing/start", async (req, res) => {
 router.post("/orders/:id/packing/complete", async (req, res) => {
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear), order = await requireOrder(req, req.params.id, models);
-    if (upper(order.workflowStatus) !== "PACKING") return fail(res, `Order must be in PACKING status`, 409);
-    const supplied = new Map((Array.isArray(req.body.items) ? req.body.items : []).map((x) => [clean(x.productId), x]));
-    let totalPacked = 0;
+
+    // A warehouse should only need one action: MARK PACKED. If packing was not
+    // explicitly started first, advance the order into PACKING automatically.
+    if (upper(order.workflowStatus) === "SENT_TO_WAREHOUSE") {
+      await transitionOrder({ req, models, order, toStatus: "PICKING", note: "Warehouse picking started" });
+    }
+    if (upper(order.workflowStatus) === "PICKING") {
+      await transitionOrder({ req, models, order, toStatus: "PACKING", note: "Warehouse packing started" });
+    }
+    if (upper(order.workflowStatus) !== "PACKING") return fail(res, `Order must be in warehouse packing status`, 409);
+
+    const rows = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!rows.length) return fail(res, "At least one packed product is required", 400);
+    const supplied = new Map(rows.map((x) => [clean(x.productId), x]));
+    const scopedWarehouseId = req.auth?.dataScope === "WAREHOUSE"
+      ? clean(req.auth?.warehouseId)
+      : clean(req.body.warehouseId);
+    const now = new Date();
+    let changedPacked = 0;
+
     for (const item of order.items || []) {
       const row = supplied.get(clean(item.productId));
-      const packed = row == null ? num(item.packedQty) : clamp(row.packedQty, num(item.invoicedQty), num(item.qty));
+      if (!row) continue; // Products routed to another warehouse stay untouched.
+      if (scopedWarehouseId && clean(item.warehouseId) !== scopedWarehouseId) {
+        return fail(res, `${item.nameSnapshot || item.sku} is assigned to another warehouse`, 403);
+      }
+      if (!clean(item.warehouseId)) return fail(res, `${item.nameSnapshot || item.sku} has no warehouse assignment`, 409);
+
+      const packed = clamp(row.packedQty, num(item.invoicedQty), num(item.qty));
       if (packed > num(item.reservedQty)) return fail(res, `${item.nameSnapshot || item.sku}: packed quantity cannot exceed reserved quantity`, 409);
       item.packedQty = packed;
       item.shortageReason = clean(row?.shortageReason);
-      totalPacked += packed;
+      item.warehouseStatus = "PACKED";
+      item.warehousePackedAt = now;
+      item.warehousePackedBy = req.auth.sub;
+      item.warehousePackedByNameSnapshot = req.auth.name || "";
+      changedPacked += packed;
     }
-    if (totalPacked <= 0) return fail(res, "At least one product must have a packed quantity", 400);
-    order.packing.packageCount = Math.max(0, num(req.body.packageCount));
-    order.packing.actualWeight = Math.max(0, num(req.body.actualWeight));
-    order.packing.remarks = clean(req.body.remarks);
-    order.packing.packedAt = new Date(); order.packing.packedBy = req.auth.sub; order.packing.packedByNameSnapshot = req.auth.name || "";
+    if (changedPacked <= 0) return fail(res, "At least one product must have a packed quantity", 400);
+
+    order.packing.packageCount = Math.max(0, num(req.body.packageCount ?? order.packing?.packageCount));
+    order.packing.actualWeight = Math.max(0, num(req.body.actualWeight ?? order.packing?.actualWeight));
+    order.packing.remarks = clean(req.body.remarks) || clean(order.packing?.remarks);
+    order.packing.startedAt = order.packing.startedAt || now;
+    order.packing.packedBy = req.auth.sub;
+    order.packing.packedByNameSnapshot = req.auth.name || "";
+
+    // Multi-warehouse orders stay in PACKING until every routed product is marked
+    // PACKED. The last warehouse to finish automatically sends it to Order Desk.
+    const allWarehousePacked = (order.items || []).length > 0 && (order.items || []).every((item) =>
+      clean(item.warehouseId) && upper(item.warehouseStatus) === "PACKED"
+    );
+    if (allWarehousePacked) order.packing.packedAt = now;
     await order.save();
-    await transitionOrder({ req, models, order, toStatus: "PACKED", note: `Packing completed • ${money(totalPacked)} units • ${order.packing.packageCount || 0} package(s)`, type: "PACKING_COMPLETED", meta: { packageCount: order.packing.packageCount, actualWeight: order.packing.actualWeight } });
-    return ok(res, shapeOrder(order), "Packing completed with actual quantities");
+
+    if (allWarehousePacked) {
+      const totalPacked = (order.items || []).reduce((sum, item) => sum + num(item.packedQty), 0);
+      await transitionOrder({
+        req, models, order, toStatus: "PACKED",
+        note: `All warehouses completed packing • ${money(totalPacked)} units • ${order.packing.packageCount || 0} package(s)`,
+        type: "PACKING_COMPLETED",
+        meta: { packageCount: order.packing.packageCount, actualWeight: order.packing.actualWeight },
+      });
+      await transitionOrder({
+        req, models, order, toStatus: "SENT_TO_ORDER_DESK",
+        note: "Packing completed and order sent to Order Desk for invoice generation",
+        type: "SENT_TO_ORDER_DESK",
+      });
+      return ok(res, shapeOrder(order), "Packing completed and sent to Order Desk");
+    }
+
+    return ok(res, shapeOrder(order), "Warehouse packing saved; waiting for the remaining warehouse(s)");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 

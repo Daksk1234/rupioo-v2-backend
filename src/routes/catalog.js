@@ -1,6 +1,6 @@
 import express from "express";
 import multer from "multer";
-import { CompanyUnit, ProductCategory, CustomerGrade, PriceList, PriceListItem, Product, Unit } from "../models/index.js";
+import { CompanyUnit, ProductCategory, CustomerGrade, CustomerLink, PriceList, PriceListItem, Product, Unit } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { readRows, resolveColumns, valueFor, cleanText } from "../utils/bulkSpreadsheet.js";
@@ -10,7 +10,10 @@ import {
   actualProfitPct,
   costBaseOf,
   getMaxActiveGradeDiscount,
+  gradeBasicFromMrp,
+  gradeSaleIncludingGstFromMrp,
   historicalAverageRates,
+  mrpBasicExcludingGst,
   priceFromOldDmsLogic,
   purchaseRateOf,
   profitColor,
@@ -24,7 +27,32 @@ router.use((req,res,next)=>{if(req.auth?.role==="MASTER"||(req.auth?.apps||[]).i
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:30*1024*1024}});
 const upper=v=>cleanText(v).toUpperCase();
 const currentFinancialYear=()=>{const now=new Date(),y=now.getMonth()>=3?now.getFullYear():now.getFullYear()-1;return `${y}-${String((y+1)%100).padStart(2,"0")}`;};
-const repriceIfGradeChanged=async(resource,tenantKey)=>{if(resource==="grades")await recalculateAllProductsForGrades(tenantKey);};
+const syncCustomerGradeDiscounts = async (tenantKey) => {
+  const grades = await CustomerGrade.find({ tenantKey })
+    .select("code discountPct status")
+    .lean();
+  if (!grades.length) return;
+  await CustomerLink.bulkWrite(
+    grades.map((grade) => ({
+      updateMany: {
+        filter: { tenantKey, gradeCode: upper(grade.code) },
+        update: {
+          $set: {
+            gradeDiscountPct:
+              upper(grade.status) === "ACTIVE" ? Number(grade.discountPct || 0) : 0,
+          },
+        },
+      },
+    })),
+    { ordered: false },
+  );
+};
+const repriceIfGradeChanged=async(resource,tenantKey)=>{
+  if(resource==="grades"){
+    await syncCustomerGradeDiscounts(tenantKey);
+    await recalculateAllProductsForGrades(tenantKey);
+  }
+};
 const cfg={
   units:{Model:CompanyUnit,fields:["code","name","uqc","decimals","status"],required:["code","name"],search:["code","name","uqc"]},
   grades:{Model:CustomerGrade,fields:["code","name","discountPct","description","status"],required:["code","name"],search:["code","name","description"]},
@@ -100,10 +128,14 @@ router.get("/old-dms-price-list/products", async (req, res) => {
     { hsnCode: new RegExp(q, "i") },
   ];
 
-  const [maxDiscount, products, total] = await Promise.all([
+  const [maxDiscount, products, total, activeGrades] = await Promise.all([
     getMaxActiveGradeDiscount(req.auth.tenantKey),
     Product.find(filter).sort({ name: 1 }).skip((page - 1) * limit).limit(limit).lean(),
     Product.countDocuments(filter),
+    CustomerGrade.find({ tenantKey: req.auth.tenantKey, status: "ACTIVE" })
+      .sort({ discountPct: 1, code: 1 })
+      .select("code name discountPct")
+      .lean(),
   ]);
 
   const packingCodes = Array.from(new Set(products.map((product) => upper(product.packingUnit)).filter(Boolean)));
@@ -132,52 +164,101 @@ router.get("/old-dms-price-list/products", async (req, res) => {
     const id = String(product._id);
     const saleHistory = history.sales.get(id);
     const purchaseHistory = history.purchases.get(id);
-    const averageSaleRate = Number(saleHistory?.averageRate || 0);
+
+    // MARKET SALE PRICE:
+    // Simple arithmetic mean of this product's effective selling rate across
+    // posted Sales Invoice lines in the selected financial year.
+    const marketSalePrice = Number(saleHistory?.averageRate || 0);
+
+    // Keep the existing Average Purchase value exactly as before. It remains a
+    // separate Price List column and is not used as Market Sale Price.
     const averagePurchaseRate = Number(purchaseHistory?.averageRate || 0);
     const fallbackPurchase = purchaseRateOf(product);
     const purchaseRate = averagePurchaseRate > 0 ? averagePurchaseRate : fallbackPurchase;
-    const configuredProfit = Math.max(3, Number(product.profitPercentage || product.minimumProfitPct || 3));
-    // IMPORTANT: Profit is applied to the SALE RATE, not to Average Purchase.
-    // Formula requested for the price list:
-    // Sales Rate Including Profit = Sale Rate + (Sale Rate * Profit % / 100).
-    const baseSaleRate = averageSaleRate > 0 ? averageSaleRate : Number(product.salePrice || 0);
-    const saleRateIncludingProfit = baseSaleRate > 0
-      ? round2(baseSaleRate + (baseSaleRate * configuredProfit / 100))
+
+    // LANDED PRICE is the basis for automatic profit calculation. Use the
+    // product's stored landedCost first. Older products that do not yet have a
+    // landedCost fall back to the existing purchase-rate value.
+    const landedPrice = Number(product.landedCost || 0) > 0
+      ? Number(product.landedCost)
+      : Number(purchaseRate || 0);
+
+    // PROFIT %:
+    // ((Market Sale Price - Landed Price) / Landed Price) * 100
+    // Minimum allowed automatic profit = 3%.
+    // Keep the exact percentage for pricing and truncate only the displayed
+    // percentage to 2 decimals so 1400 vs 1200 displays as 16.66%.
+    const rawMarketProfitPct = landedPrice > 0 && marketSalePrice > 0
+      ? ((marketSalePrice - landedPrice) / landedPrice) * 100
+      : 3;
+    const exactProfitPercentage = Math.max(3, rawMarketProfitPct);
+    const profitPercentage = Math.floor((exactProfitPercentage + Number.EPSILON) * 100) / 100;
+
+    // MINIMUM SALE PRICE:
+    // Landed Price + the automatically calculated profit percentage.
+    // Use the exact (unrounded) percentage internally so the example
+    // Market=1400 and Landed=1200 produces exactly 1400.00.
+    const minimumSalePrice = landedPrice > 0
+      ? round2(landedPrice * (1 + exactProfitPercentage / 100))
       : 0;
-    const actualProfit = purchaseRate > 0 && saleRateIncludingProfit > 0
-      ? actualProfitPct({ cost: purchaseRate, saleRate: saleRateIncludingProfit })
+
+    const actualProfit = landedPrice > 0 && minimumSalePrice > 0
+      ? actualProfitPct({ cost: landedPrice, saleRate: minimumSalePrice })
       : 0;
+
+    // Existing MRP / grade logic remains unchanged; Minimum Sale Price now
+    // becomes its sale-rate input.
     const priced = priceFromOldDmsLogic(
-      { ...product, salePrice: saleRateIncludingProfit, profitPercentage: configuredProfit },
+      { ...product, salePrice: minimumSalePrice, profitPercentage: exactProfitPercentage },
       maxDiscount,
       {
-        costOverride: purchaseRate,
-        saleRateOverride: saleRateIncludingProfit,
-        profitOverride: configuredProfit,
+        costOverride: landedPrice,
+        saleRateOverride: minimumSalePrice,
+        profitOverride: exactProfitPercentage,
       },
     );
 
     return {
       ...product,
       packingUnitName: product.packingUnit ? packingUnitNames.get(upper(product.packingUnit)) || product.packingUnit : "",
+
+      // Existing fields retained for backward compatibility.
       purchaseRate,
-      priceCostBase: purchaseRate,
+      priceCostBase: landedPrice,
       averagePurchaseRate: round2(purchaseRate),
-      averageSaleRate: round2(baseSaleRate),
-      saleRateIncludingProfit: round2(saleRateIncludingProfit),
+      averageSaleRate: round2(marketSalePrice),
+      saleRateIncludingProfit: round2(minimumSalePrice),
+
+      // New names used by the Price List page.
+      landedPrice: round2(landedPrice),
+      marketSalePrice: round2(marketSalePrice),
+      minimumSalePrice: round2(minimumSalePrice),
+
       purchaseObservations: Number(purchaseHistory?.observations || 0),
       saleObservations: Number(saleHistory?.observations || 0),
-      profitPercentage: round2(configuredProfit),
+      profitPercentage: round2(profitPercentage),
       actualProfitPercentage: round2(actualProfit),
-      salePrice: round2(baseSaleRate),
+
+      // Keep salePrice aligned with the new Minimum Sale Price for consumers of
+      // this Price List endpoint. MRP remains the authoritative grade-price base.
+      salePrice: round2(minimumSalePrice),
+
       maxGradeDiscountPct: priced.maxGradeDiscountPct,
       gradeLoading: priced.gradeLoading,
       gstRate: priced.gstRate,
       mrp: priced.mrp,
-      lossStatus: saleRateIncludingProfit > 0 && purchaseRate > 0 && saleRateIncludingProfit < purchaseRate,
-      belowMinimum: configuredProfit < 3,
-      profitColorCode: profitColor(configuredProfit),
-      pricingSource: averageSaleRate > 0 || averagePurchaseRate > 0 ? "HISTORICAL_AVERAGE" : "PRODUCT_MASTER",
+      mrpBasicExGst: mrpBasicExcludingGst(priced.mrp, priced.gstRate),
+      gradePrices: activeGrades.map((grade) => ({
+        code: grade.code,
+        name: grade.name,
+        discountPct: Number(grade.discountPct || 0),
+        basicRate: gradeBasicFromMrp(priced.mrp, priced.gstRate, grade.discountPct),
+        saleIncludingGst: gradeSaleIncludingGstFromMrp(priced.mrp, grade.discountPct),
+      })),
+      lossStatus: minimumSalePrice > 0 && landedPrice > 0 && minimumSalePrice < landedPrice,
+      belowMinimum: profitPercentage < 3,
+      profitColorCode: profitColor(profitPercentage),
+      pricingSource: marketSalePrice > 0 ? "SALES_INVOICE_AVERAGE" : "PRODUCT_MASTER",
     };
   });
 
@@ -188,11 +269,16 @@ router.get("/old-dms-price-list/products", async (req, res) => {
   return ok(res, {
     items: safeItems,
     maxDiscount,
+    grades: activeGrades.map((grade) => ({
+      code: grade.code,
+      name: grade.name,
+      discountPct: Number(grade.discountPct || 0),
+    })),
     financialYear,
     meta: pageMeta(page, limit, total),
     ...(admin ? {
-      formula: "Sales Rate Including Profit = Sale Rate + (Sale Rate × Profit %). Minimum Profit % is 3%.",
-      averageMethod: "Average Purchase is the simple arithmetic mean of posted purchase invoice line effective rates for the selected FY.",
+      formula: "Profit % = max(3%, ((Market Sale Price - Landed Price) ÷ Landed Price) × 100). Minimum Sale Price = Landed Price × (1 + Profit %). MRP is reverse-loaded for the highest active grade and customer grade pricing continues from MRP.",
+      averageMethod: "Market Sale Price is the simple arithmetic mean of posted Sales Invoice line effective rates for the selected FY. Average Purchase remains the simple arithmetic mean of posted Purchase Invoice line effective rates.",
     } : {}),
   });
 });
@@ -312,7 +398,12 @@ router.get("/price-lists/:code/products",async(req,res)=>{
   const priceList=await PriceList.findOne({tenantKey:req.auth.tenantKey,code:upper(req.params.code),status:"ACTIVE"}).lean();if(!priceList)return fail(res,"Price list not found",404);
   const page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=cleanText(req.query.q),f={tenantKey:req.auth.tenantKey,status:"ACTIVE"};if(q)f.$or=[{sku:new RegExp(q,"i")},{name:new RegExp(q,"i")},{category:new RegExp(q,"i")}];
   const[products,total]=await Promise.all([Product.find(f).sort({name:1}).skip((page-1)*limit).limit(limit).lean(),Product.countDocuments(f)]);const overrides=await PriceListItem.find({tenantKey:req.auth.tenantKey,priceListCode:priceList.code,productId:{$in:products.map(p=>String(p._id))}}).lean();const om=new Map(overrides.map(o=>[o.productId,o]));
-  const items=products.map(p=>{const o=om.get(String(p._id));const discount=Number(o?.overrideDiscountPct??priceList.defaultDiscountPct??0);const autoPrice=Math.floor((Number(p.mrp||0)/(1+discount/100))*100)/100;return {...p,priceListCode:priceList.code,gradeCode:priceList.gradeCode,discountPct:discount,price:Number(o?.overridePrice??autoPrice),manualOverride:o?.overridePrice!=null};});
+  const items=products.map(p=>{
+    const o=om.get(String(p._id));
+    const discount=Number(o?.overrideDiscountPct??priceList.defaultDiscountPct??0);
+    const autoPrice=gradeBasicFromMrp(Number(p.mrp||0),Number(p.gstRate||0),discount);
+    return {...p,priceListCode:priceList.code,gradeCode:priceList.gradeCode,discountPct:discount,price:Number(o?.overridePrice??autoPrice),manualOverride:o?.overridePrice!=null};
+  });
   ok(res,{priceList,items,meta:pageMeta(page,limit,total)});
 });
 router.put("/price-lists/:code/products/:productId",async(req,res)=>{const code=upper(req.params.code);const doc=await PriceListItem.findOneAndUpdate({tenantKey:req.auth.tenantKey,priceListCode:code,productId:req.params.productId},{$set:{overridePrice:req.body.overridePrice===""?undefined:Number(req.body.overridePrice),overrideDiscountPct:req.body.overrideDiscountPct===""?undefined:Number(req.body.overrideDiscountPct)}},{new:true,upsert:true,setDefaultsOnInsert:true});ok(res,doc,"Price override saved")});

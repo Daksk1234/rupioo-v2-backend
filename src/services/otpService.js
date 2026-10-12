@@ -3,12 +3,12 @@ import { OtpChallenge } from "../models/index.js";
 import { env } from "../config/env.js";
 import { makeId } from "../utils/ids.js";
 
-export async function createOtp({ tenantKey, transactionId, actionType, recipientId, context = {} }) {
+export async function createOtp({ tenantKey, transactionId, actionType, recipientId, context = {}, ttlSeconds = null }) {
   const code = String(Math.floor(100000 + Math.random() * 900000));
   const codeHash = await bcrypt.hash(code, 10);
   const challenge = await OtpChallenge.create({
     otpId: makeId("OTP"), tenantKey, transactionId, actionType, recipientId, codeHash,
-    expiresAt: new Date(Date.now() + env.otpTtlSeconds * 1000), context
+    expiresAt: new Date(Date.now() + Math.max(60, Number(ttlSeconds || env.otpTtlSeconds || 300)) * 1000), context
   });
   return { otpId: challenge.otpId, code, expiresAt: challenge.expiresAt };
 }

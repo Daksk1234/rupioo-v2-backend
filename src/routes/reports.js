@@ -100,7 +100,9 @@ const friendlyVoucherType = (value) => {
     JOURNAL: "Journal",
     CONTRA: "Contra",
     CREDIT_NOTE: "Credit Note",
+    SALES_CREDIT_NOTE: "Credit Note",
     DEBIT_NOTE: "Debit Note",
+    PURCHASE_DEBIT_NOTE: "Debit Note",
   };
   return map[raw] || raw.replaceAll("_", " ").replace(/\b\w/g, (m) => m.toUpperCase());
 };
@@ -168,14 +170,12 @@ async function resolveLedgerEntity({ tenantKey, entityType, entityId }) {
   };
 }
 
-const PARTY_CONTROL_ACCOUNTS = ["SYS_SUNDRY_DEBTORS", "SYS_SUNDRY_CREDITORS"];
-
 function ledgerEntryFilter(entity, tenantKey, financialYear) {
   const base = { tenantKey, financialYear: normalizeFY(financialYear), status: "POSTED" };
   if (entity.entityType === "PARTY") {
-    // A single business party can be both a customer and a supplier.  Always read
-    // both personal control accounts and let DR/CR produce one net party balance.
-    return { ...base, partyGlobalId: entity.entityId, accountCode: { $in: PARTY_CONTROL_ACCOUNTS } };
+    // A party ledger represents ONE control account. Customer receivables must not
+    // be netted with supplier/payable transactions for the same global party.
+    return { ...base, partyGlobalId: entity.entityId, accountCode: entity.accountCode || "SYS_SUNDRY_DEBTORS" };
   }
   return { ...base, ledgerId: entity.ledgerId };
 }
@@ -184,7 +184,7 @@ const partyTxnKey = (type, id) => `${cleanText(type).toUpperCase()}|${cleanText(
 
 async function partySourceRowsWithLegacyFallback({ tenantKey, entity, financialYear }) {
   const fy = normalizeFY(financialYear);
-  const { LedgerEntry, SalesInvoice, PurchaseInvoice, Receipt, Payment } = financialModels(tenantKey, fy);
+  const { LedgerEntry, SalesInvoice, PurchaseInvoice, Receipt, Payment, CreditNote } = financialModels(tenantKey, fy);
   const rawJournal = await LedgerEntry.find(ledgerEntryFilter(entity, tenantKey, fy)).sort({ date: 1, createdAt: 1 }).lean();
   const { rows: journalRows } = await inspectBankLedgerRows({ tenantKey, financialYear: fy, rows: rawJournal });
   // BANK_STATEMENT_RECEIPT is the same voucher as the corresponding RECEIPT.
@@ -194,15 +194,14 @@ async function partySourceRowsWithLegacyFallback({ tenantKey, entity, financialY
   // Previous-DMS/migrated records may have the business document but no V2
   // LedgerEntry.  Add only documents whose party control entry is missing.
   // Existing V2 journal rows win, so there is no double counting.
-  const [sales, purchases, receipts, payments] = await Promise.all([
-    SalesInvoice.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED" })
-      .select("_id invoiceNo date grandTotal remarks createdAt").lean(),
-    PurchaseInvoice.find({ tenantKey, financialYear: fy, supplierGlobalId: entity.entityId, status: "POSTED" })
-      .select("_id invoiceNo date grandTotal remarks createdAt").lean(),
-    Receipt.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED" })
-      .select("_id receiptNo date amount remarks createdAt statementImportId").lean(),
-    Payment.find({ tenantKey, financialYear: fy, partyGlobalId: entity.entityId, status: "POSTED" })
-      .select("_id paymentNo date amount remarks createdAt statementImportId").lean(),
+  const debtor = entity.accountCode === "SYS_SUNDRY_DEBTORS";
+  const creditor = entity.accountCode === "SYS_SUNDRY_CREDITORS";
+  const [sales, purchases, receipts, payments, notes] = await Promise.all([
+    debtor ? SalesInvoice.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED" }).select("_id invoiceNo date grandTotal remarks createdAt").lean() : Promise.resolve([]),
+    creditor ? PurchaseInvoice.find({ tenantKey, financialYear: fy, supplierGlobalId: entity.entityId, status: "POSTED" }).select("_id invoiceNo date grandTotal remarks createdAt").lean() : Promise.resolve([]),
+    debtor ? Receipt.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED" }).select("_id receiptNo date amount remarks createdAt statementImportId").lean() : Promise.resolve([]),
+    creditor ? Payment.find({ tenantKey, financialYear: fy, partyGlobalId: entity.entityId, status: "POSTED" }).select("_id paymentNo date amount remarks createdAt statementImportId").lean() : Promise.resolve([]),
+    CreditNote.find({ tenantKey, financialYear: fy, status: "ISSUED", $or:[{partyGlobalId:entity.entityId},{customerGlobalId:entity.entityId}] }).select("_id creditNoteNo documentNo documentType date grandTotal reason remarks createdAt partyGlobalId customerGlobalId").lean(),
   ]);
 
   // A bank-imported receipt/payment without its statement row is not an
@@ -265,6 +264,19 @@ async function partySourceRowsWithLegacyFallback({ tenantKey, entity, financialY
       accountCode: "SYS_SUNDRY_CREDITORS", debit: Number(row.amount || 0), credit: 0,
       narration: cleanText(row.remarks) || `Payment ${cleanText(row.paymentNo)}`, status: "POSTED", legacyFallback: true,
     });
+  }
+
+  for (const row of notes) {
+    const docType = cleanText(row.documentType || "CREDIT_NOTE").toUpperCase();
+    const no = cleanText(row.documentNo || row.creditNoteNo);
+    if (!no) continue;
+    if (debtor && docType === "CREDIT_NOTE") {
+      const key = partyTxnKey("SALES_CREDIT_NOTE", no); if (fallbackSeen.has(key)) continue; fallbackSeen.add(key);
+      fallback.push({ _id:`LEGACY-CN-${row._id}`,tenantKey,financialYear:fy,date:row.date,createdAt:row.createdAt,transactionType:"SALES_CREDIT_NOTE",transactionId:no,partyGlobalId:entity.entityId,accountCode:"SYS_SUNDRY_DEBTORS",debit:0,credit:Number(row.grandTotal||0),narration:cleanText(row.remarks||row.reason)||`Credit Note ${no}`,status:"POSTED",legacyFallback:true });
+    } else if (creditor && docType === "DEBIT_NOTE") {
+      const key = partyTxnKey("PURCHASE_DEBIT_NOTE", no); if (fallbackSeen.has(key)) continue; fallbackSeen.add(key);
+      fallback.push({ _id:`LEGACY-DN-${row._id}`,tenantKey,financialYear:fy,date:row.date,createdAt:row.createdAt,transactionType:"PURCHASE_DEBIT_NOTE",transactionId:no,partyGlobalId:entity.entityId,accountCode:"SYS_SUNDRY_CREDITORS",debit:Number(row.grandTotal||0),credit:0,narration:cleanText(row.remarks||row.reason)||`Debit Note ${no}`,status:"POSTED",legacyFallback:true });
+    }
   }
 
   return [...journalRows, ...fallback].sort((a, b) => {

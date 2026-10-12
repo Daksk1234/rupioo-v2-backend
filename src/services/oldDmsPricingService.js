@@ -3,6 +3,30 @@ import { financialModels } from "./accountingService.js";
 
 export const round2 = (value) => Number((Number(value) || 0).toFixed(2));
 
+export function mrpBasicExcludingGst(mrp = 0, gstRate = 0) {
+  const gross = Math.max(0, Number(mrp || 0));
+  const gst = Math.max(0, Number(gstRate || 0));
+  if (!(gross > 0)) return 0;
+  return round2(gross / (1 + gst / 100));
+}
+
+export function gradeBasicFromMrp(mrp = 0, gstRate = 0, gradeDiscountPct = 0) {
+  const gross = Math.max(0, Number(mrp || 0));
+  const gst = Math.max(0, Number(gstRate || 0));
+  const discount = Math.min(100, Math.max(0, Number(gradeDiscountPct || 0)));
+  if (!(gross > 0)) return 0;
+  // Calculate from the unrounded ex-GST MRP and round only the final customer
+  // basic rate. This keeps the grade percentage mathematically exact.
+  const exGstMrp = gross / (1 + gst / 100);
+  return round2(exGstMrp * (1 - discount / 100));
+}
+
+export function gradeSaleIncludingGstFromMrp(mrp = 0, gradeDiscountPct = 0) {
+  const gross = Math.max(0, Number(mrp || 0));
+  const discount = Math.min(100, Math.max(0, Number(gradeDiscountPct || 0)));
+  return round2(gross * (1 - discount / 100));
+}
+
 export function purchaseRateOf(product = {}) {
   const avg = Number(product.averagePurchasePrice || 0);
   const last = Number(product.lastPurchasePrice || 0);
@@ -44,9 +68,14 @@ export function priceFromOldDmsLogic(product = {}, maxDiscount = 0, options = {}
     saleRate = round2(cost * (1 + profitPct / 100));
   }
 
-  const gradeDiscountPct = Number(maxDiscount || 0);
-  const gradeLoading = round2((saleRate * gradeDiscountPct) / 100);
-  const taxableMrpBase = round2(saleRate + gradeLoading);
+  const gradeDiscountPct = Math.min(100, Math.max(0, Number(maxDiscount || 0)));
+  // The highest grade must be able to reverse the MRP loading exactly.
+  // If customerBasic = MRP(ex-GST) × (1 - grade%), then MRP(ex-GST) must be
+  // targetSaleRate / (1 - highestGrade%).  The previous +grade% loading did
+  // not reverse correctly (for example +15% followed by -15% leaves 97.75%).
+  const gradeFactor = Math.max(0.000001, 1 - gradeDiscountPct / 100);
+  const taxableMrpBase = round2(saleRate / gradeFactor);
+  const gradeLoading = round2(taxableMrpBase - saleRate);
   const gstRate = Number(product.gstRate || 0);
   const tax = round2((taxableMrpBase * gstRate) / 100);
   const mrp = round2(taxableMrpBase + tax);
@@ -140,12 +169,23 @@ export async function recalculateAllProductsForGrades(tenantKey) {
     const minimumProfit = Math.max(3, Number(product.minimumProfitPct || 3));
     const stored = Number(product.profitPercentage || 0);
     const profitPercentage = Number.isFinite(stored) && stored !== 0 ? stored : minimumProfit;
-    const saleRate = Number(product.salePrice || 0) > 0
+    // Product.salePrice remains the BASE sale rate. Recalculation must not
+    // overwrite it with the profit-loaded rate, otherwise every grade change
+    // compounds profit again the next time the price list is calculated.
+    const baseSaleRate = Number(product.salePrice || 0) > 0
       ? Number(product.salePrice)
-      : round2(cost * (1 + Math.max(minimumProfit, profitPercentage) / 100));
+      : Number(cost || 0);
+    const saleRateIncludingProfit = baseSaleRate > 0
+      ? round2(baseSaleRate * (1 + profitPercentage / 100))
+      : 0;
     const priced = priceFromOldDmsLogic(
-      { ...product, salePrice: saleRate, profitPercentage },
+      { ...product, salePrice: saleRateIncludingProfit, profitPercentage },
       maxDiscount,
+      {
+        costOverride: cost,
+        saleRateOverride: saleRateIncludingProfit,
+        profitOverride: profitPercentage,
+      },
     );
     return {
       updateOne: {
@@ -153,7 +193,6 @@ export async function recalculateAllProductsForGrades(tenantKey) {
         update: {
           $set: {
             profitPercentage: priced.profitPercentage,
-            salePrice: priced.saleRate,
             mrp: priced.mrp,
             maxGradeDiscountPct: priced.maxGradeDiscountPct,
             profitColorCode: profitColor(priced.profitPercentage),

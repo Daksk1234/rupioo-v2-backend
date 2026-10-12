@@ -40,6 +40,8 @@ import storageRoutes from "./routes/storage.js";
 import mailRoutes from "./routes/mail.route.js";
 import salesAppRoutes from "./routes/salesApp.js";
 import orderFlowRoutes from "./routes/orderFlow.js";
+import customerAppRoutes from "./routes/customerApp.js";
+import customerAppAdminRoutes from "./routes/customerAppAdmin.js";
 import purchaseAiRoutes, { vendorRouter as purchaseAiVendorRoutes, startPurchaseAiAutomation } from "./routes/purchaseAi.js";
 
 await connectDb();
@@ -92,6 +94,11 @@ app.use("/api/mail", mailRoutes);
 app.use("/mail", mailRoutes);
 // Storage OAuth callbacks and Superadmin/Master storage setup use their own auth guard.
 app.use("/api/storage", storageRoutes);
+
+// Customer App uses its own global-customer JWT and supplier membership guard.
+// Mount before the company-user permission middleware so customer tokens are not
+// interpreted as DMS employee sessions.
+app.use("/api/customer-app", customerAppRoutes);
 
 // IMPORTANT: Order Flow is mounted BEFORE the generic /api permission middleware
 // and BEFORE the broad /api/sales-app router. This guarantees that requests like
@@ -161,6 +168,7 @@ app.use("/api/transactions", salesWithProductRoutes);
 app.use("/api/transactions", transactionRoutes);
 app.use("/api/purchase-ai", purchaseAiRoutes);
 app.use("/api/sales-app", salesAppRoutes);
+app.use("/api/customer-app-admin", customerAppAdminRoutes);
 app.use("/api/modules", genericRoutes);
 
 

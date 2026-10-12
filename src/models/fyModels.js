@@ -50,7 +50,7 @@ export function fyModels(db) {
       irn: { type: String, default: "" }, ackNo: { type: String, default: "" }, ackDate: Date, signedQrPayload: { type: String, default: "" }
     },
     transportAssignment: {
-      mode: { type:String, default:"LOCAL" }, firmCitySnapshot:String, customerCitySnapshot:String, transporterId:String, globalTransporterId:String, transporterNameSnapshot:String,
+      mode: { type:String, default:"LOCAL" }, matchType:String, firmCitySnapshot:String, customerCitySnapshot:String, transporterId:String, globalTransporterId:String, transporterNameSnapshot:String,
       bookingStationId:String, bookingStationNameSnapshot:String, bookingStationAddressSnapshot:String, bookingStationCitySnapshot:String, bookingStationPincodeSnapshot:String,
       deliveryStationId:String, deliveryStationNameSnapshot:String, deliveryStationAddressSnapshot:String, deliveryStationCitySnapshot:String, deliveryStationPincodeSnapshot:String, serviceAreaSnapshot:String
     },
@@ -116,7 +116,21 @@ export function fyModels(db) {
     customerGlobalId: { type: String, index: true },
     partyNameSnapshot:String,
     amount: Number,
+    // Top-level collection channel used by the salesperson receipt flow.
+    // Legacy rows may still store CHEQUE directly in mode; new rows use CASH/BANK.
     mode: String,
+    receiptType: { type: String, index: true }, // CASH / CHEQUE / UPI
+    allocationType: { type: String, default: "INVOICE", index: true }, // INVOICE / ADVANCE
+    againstInvoices: [{
+      invoiceId: String,
+      invoiceNo: String,
+      invoiceDate: Date,
+      amount: Number,
+    }],
+    payerAccountNumber: String,
+    paymentProofFileId: { type: String, index: true },
+    paymentProofKind: String,
+    upiPaymentText: String,
     reference: String,
     remarks:String,
     bankAccountId:{type:String,index:true},
@@ -136,14 +150,48 @@ export function fyModels(db) {
     // Sales Person app ownership. Legacy receipts remain valid because these
     // fields are optional and attribution falls back to createdBy where needed.
     collectedBySalespersonId: { type: String, index: true },
+    collectedBySalespersonNameSnapshot: String,
     collectionSource: { type: String, default: "DMS", index: true },
     cashCustodyMovementId: { type: String, index: true },
+
+    // Salesperson receipt verification workflow. No salesperson-created receipt
+    // is allowed into the ledger until BOTH the customer OTP and cashier OTP are
+    // verified. OTP codes are hidden from normal queries and are exposed only by
+    // the dedicated customer/DMS OTP endpoints.
+    receiptWorkflowStatus: { type: String, default: "DMS_DIRECT", index: true },
+    customerOtpId: String,
+    customerOtpCode: { type: String, select: false },
+    customerOtpExpiresAt: Date,
+    customerOtpStatus: { type: String, default: "NOT_REQUIRED", index: true },
+    customerOtpVerifiedAt: Date,
+    cashierOtpId: String,
+    cashierOtpCode: { type: String, select: false },
+    cashierOtpExpiresAt: Date,
+    cashierOtpStatus: { type: String, default: "NOT_REQUIRED", index: true },
+    cashierOtpVerifiedAt: Date,
+    cashierOtpVerifiedBy: String,
+    cashierOtpVerifiedByNameSnapshot: String,
+    ledgerPostedAt: Date,
+
+    // Physical-cash details captured from the Sales Person app. These fields are
+    // intentionally independent from accounting posting: the receipt can already
+    // be posted to the customer ledger while the notes are still physically with
+    // the salesperson and therefore still PENDING_TO_DEPOSIT.
+    cashDenominations: [{ denomination: Number, count: Number, amount: Number }],
+    cashDepositStatus: { type: String, default: "NOT_APPLICABLE", index: true },
+    cashDepositBatchId: { type: String, index: true },
+    cashDepositedAt: Date,
+    cashDepositedBy: String,
+    cashDepositedByNameSnapshot: String,
+
     createdBy:String,
     createdByNameSnapshot:String,
-    status: { type: String, default: "POSTED" }
+    status: { type: String, default: "POSTED", index: true }
   }, { timestamps: true });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, collectedBySalespersonId: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, status: 1, bounceStatus: 1, date: -1 });
+  receiptSchema.index({ tenantKey: 1, financialYear: 1, collectionSource: 1, receiptWorkflowStatus: 1, date: -1 });
+  receiptSchema.index({ tenantKey: 1, financialYear: 1, customerOtpStatus: 1, cashierOtpStatus: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, chequeStatus: 1, chequeIssueDate: -1 });
   receiptSchema.index({tenantKey:1,financialYear:1,sourceKey:1},{unique:true,partialFilterExpression:{sourceKey:{$type:"string"}}});
 
@@ -186,11 +234,20 @@ export function fyModels(db) {
     returnedQty: { type: Number, default: 0 },
     cancelledQty: { type: Number, default: 0 },
     shortageReason: String,
+    // Product-level warehouse routing. One order may be split across several warehouses.
+    warehouseId: { type: String, index: true },
+    warehouseNameSnapshot: String,
+    warehouseStatus: { type: String, default: "" },
+    warehousePackedAt: Date,
+    warehousePackedBy: String,
+    warehousePackedByNameSnapshot: String,
   }, { _id: false });
 
   const salesOrderSchema = new Schema({
     tenantKey: { type: String, index: true }, financialYear: { type: String, index: true }, orderNo: { type: String, index: true }, date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true }, customerNameSnapshot: String, salespersonId: { type: String, index: true },
+    // Legacy/single-warehouse snapshot plus product-level routing in items[].
+    warehouseId: { type: String, index: true }, warehouseNameSnapshot: String,
     source: { type: String, enum: ["MANUAL", "REPEAT", "SUGGESTED"], default: "MANUAL", index: true },
     repeatFromOrderNo: String, repeatFromInvoiceNo: String, items: [salesOrderItemSchema],
     subtotal: Number, discountTotal: Number, taxTotal: Number, grandTotal: Number, remarks: String,
@@ -366,7 +423,7 @@ export function fyModels(db) {
     dayKey: { type: String, index: true },
     type: {
       type: String,
-      enum: ["COLLECTION", "HANDOVER", "BANK_DEPOSIT", "SHORTAGE", "EXCESS", "ADJUSTMENT_IN", "ADJUSTMENT_OUT"],
+      enum: ["COLLECTION", "HANDOVER", "BANK_DEPOSIT", "SHORTAGE", "EXCESS", "ADJUSTMENT_IN", "ADJUSTMENT_OUT", "CASHIER_CLOSE"],
       required: true,
       index: true,
     },
@@ -383,6 +440,39 @@ export function fyModels(db) {
     reference: String,
     proofReference: String,
     remarks: String,
+
+    // Cash handover batch. One HANDOVER may contain many party-wise receipts.
+    // We store the batch in the existing cash-movement collection so deployments
+    // close to the Mongo collection limit do not need another FY collection.
+    denominations: [{ denomination: Number, count: Number, amount: Number }],
+    receiptBreakdown: [{
+      receiptId: String, receiptNo: String, customerGlobalId: String,
+      customerNameSnapshot: String, amount: Number,
+      receiptDenominations: [{ denomination: Number, count: Number, amount: Number }],
+    }],
+    handoverWorkflowStatus: { type: String, default: "LEGACY", index: true },
+    handoverOtpId: String,
+    handoverOtpCode: { type: String, select: false },
+    handoverOtpExpiresAt: Date,
+    handoverOtpStatus: { type: String, default: "NOT_REQUIRED", index: true },
+    handoverOtpVerifiedAt: Date,
+    cashierReceivedAt: Date,
+    cashierReceivedBy: String,
+    cashierReceivedByNameSnapshot: String,
+    cashierCloseId: { type: String, index: true },
+    partyIssues: [{
+      issueId: String, receiptId: String, receiptNo: String, customerGlobalId: String,
+      partyNameSnapshot: String, amount: Number, reason: String,
+      status: { type: String, default: "PENDING_SALESPERSON_ACK" },
+      acknowledgementOtpId: String, acknowledgementOtpCode: String, acknowledgementOtpExpiresAt: Date,
+      acknowledgedAt: Date, acknowledgedBy: String, resolvedAt: Date, resolvedBy: String, resolutionRemark: String,
+      raisedAt: Date, raisedBy: String, raisedByNameSnapshot: String,
+    }],
+    closeExpectedAmount: Number,
+    closeDeclaredAmount: Number,
+    closeVariance: Number,
+    closeDate: Date,
+
     sourceDayClosingId: String,
     status: { type: String, enum: ["PENDING", "APPROVED", "REJECTED", "POSTED", "CANCELLED"], default: "PENDING", index: true },
     verifiedBy: String,

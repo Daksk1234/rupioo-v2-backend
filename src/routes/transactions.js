@@ -5,6 +5,7 @@ import path from "path";
 import {
   Product,
   CustomerLink,
+  CustomerGrade,
   GlobalCustomer,
   CompanyProfile,
   CompanyUnit,
@@ -20,6 +21,7 @@ import { ok, fail, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import {
   costBaseOf,
+  gradeBasicFromMrp,
   historicalAverageRates,
   purchaseRateOf,
 } from "../services/oldDmsPricingService.js";
@@ -67,6 +69,11 @@ import {
   nextDocumentNoteNumber,
 } from "../services/documentNumberService.js";
 import { enrichSalesInvoicesWithCreditState } from "../services/creditNoteRulesService.js";
+import { createOtp, verifyOtp } from "../services/otpService.js";
+import {
+  matchCustomerTransporters,
+  matchInvoiceCityTransporters,
+} from "../services/customerTransporterMatchingService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -124,6 +131,18 @@ const upload = multer({
 });
 
 const upper = (v) => cleanText(v).toUpperCase();
+const num = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
+const money2 = (v) => Math.round((num(v) + Number.EPSILON) * 100) / 100;
+const cashierDenominations = new Set([500, 200, 100, 50, 20, 10, 5, 2, 1, 0.5]);
+const parseCashDenominations = (value) => {
+  let rows = value;
+  if (!Array.isArray(rows)) { try { rows = JSON.parse(value || "[]"); } catch { rows = []; } }
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const denomination = num(row?.denomination); const count = Math.max(0, Math.floor(num(row?.count)));
+    return { denomination, count, amount: money2(denomination * count) };
+  }).filter((row) => row.count > 0 && cashierDenominations.has(row.denomination));
+};
+const denominationTotal2 = (rows = []) => money2((rows || []).reduce((sum, row) => sum + num(row.amount || num(row.denomination) * num(row.count)), 0));
 const isObjectIdText = (value) => /^[0-9a-fA-F]{24}$/.test(cleanText(value));
 const requireObjectIdParam = (req, res, next) =>
   isObjectIdText(req.params.id) ? next() : next("route");
@@ -145,80 +164,130 @@ const salesInvoiceForAuth = (invoice, auth) => {
   return row;
 };
 
-async function customerTransportSnapshot({ tenantKey, customer }) {
+async function customerTransportSnapshot({
+  tenantKey,
+  customer,
+  selectedTransporterId = "",
+  invoiceCityOnly = false,
+}) {
   const locality = await resolveCustomerDeliveryMode({ tenantKey, customer });
-  if (!locality.requiresTransport)
-    return {
-      mode: "LOCAL",
-      firmCitySnapshot: locality.firmCity,
-      customerCitySnapshot: locality.customerCity,
-      serviceAreaSnapshot: cleanText(
-        customer?.serviceArea || locality.customerCity || "",
-      ),
-    };
-  const globalId = cleanText(customer?.assignedTransportGlobalId),
-    localId = cleanText(customer?.assignedTransport),
-    deliveryId = cleanText(customer?.assignedTransportDeliveryStationId),
-    bookingId = cleanText(customer?.assignedTransportBookingStationId);
-  if (!globalId || !localId || !deliveryId)
+  const billing =
+    (customer?.addresses || []).find(
+      (x) => upper(x?.type || "BILLING") === "BILLING",
+    ) ||
+    (customer?.addresses || [])[0] ||
+    {};
+
+  const matched = invoiceCityOnly
+    ? await matchInvoiceCityTransporters({
+        tenantKey,
+        pincode: billing.pincode,
+        city: billing.city,
+      })
+    : await matchCustomerTransporters({
+        tenantKey,
+        pincode: billing.pincode,
+        city: billing.city,
+      });
+  const options = matched.items || [];
+
+  if (!options.length) {
+    if (!locality.requiresTransport) {
+      return {
+        mode: "LOCAL",
+        firmCitySnapshot: locality.firmCity,
+        customerCitySnapshot: locality.customerCity,
+        serviceAreaSnapshot: cleanText(
+          customer?.serviceArea || locality.customerCity || "",
+        ),
+      };
+    }
     throw Object.assign(
       new Error(
-        `${customer?.localName || "Customer"} is outside ${locality.firmCity} and has no complete transporter assignment. Edit Customer and assign a transporter/delivery station first.`,
+        `${customer?.localName || "Customer"} has no transporter serving ${billing.pincode || locality.customerCity || "the delivery location"}. Add the pincode/city in Transporter List first.`,
       ),
       { statusCode: 409 },
     );
-  const [transporter, delivery, booking] = await Promise.all([
-    Transporter.findOne({
-      _id: localId,
-      tenantKey,
-      globalTransporterId: globalId,
-      status: { $ne: "INACTIVE" },
-    }).lean(),
-    GlobalTransporterStation.findOne({
-      stationId: deliveryId,
-      globalTransporterId: globalId,
-      status: "ACTIVE",
-      stationType: { $in: ["DELIVERY", "BOTH"] },
-    }).lean(),
-    bookingId
-      ? GlobalTransporterStation.findOne({
-          stationId: bookingId,
-          globalTransporterId: globalId,
-          status: "ACTIVE",
-          stationType: { $in: ["BOOKING", "BOTH"] },
-        }).lean()
-      : Promise.resolve(null),
-  ]);
-  if (!transporter || !delivery)
+  }
+
+  const wanted = cleanText(selectedTransporterId);
+  let selected = null;
+  if (wanted) {
+    selected = options.find(
+      (row) =>
+        cleanText(row.transporterId) === wanted ||
+        cleanText(row.localTransporterId) === wanted,
+    );
+    if (!selected) {
+      throw Object.assign(
+        new Error(
+          "Selected transporter is not mapped to this customer pincode/city. Refresh the invoice and select an available transporter.",
+        ),
+        { statusCode: 400 },
+      );
+    }
+  } else if (options.length === 1) {
+    selected = options[0];
+  } else {
     throw Object.assign(
       new Error(
-        `${customer?.localName || "Customer"} transporter assignment is no longer active. Reassign it in Customer Master.`,
+        `${customer?.localName || "Customer"} has ${options.length} mapped transporters. Select one transporter in the Sales Invoice.`,
       ),
+      { statusCode: 400 },
+    );
+  }
+
+  const transporter = await Transporter.findOne({
+    _id: selected.transporterId,
+    tenantKey,
+    status: { $ne: "INACTIVE" },
+  }).lean();
+  if (!transporter) {
+    throw Object.assign(
+      new Error("Selected transporter is no longer active in Transporter List"),
       { statusCode: 409 },
     );
+  }
+
+  const baseStation = selected.stationId
+    ? await GlobalTransporterStation.findOne({
+        stationId: selected.stationId,
+        globalTransporterId: selected.globalTransporterId,
+        status: "ACTIVE",
+      }).lean()
+    : null;
+
   return {
-    mode: "OUTSIDE",
+    mode: locality.requiresTransport ? "OUTSIDE" : "LOCAL",
     firmCitySnapshot: locality.firmCity,
     customerCitySnapshot: locality.customerCity,
     transporterId: String(transporter._id),
-    globalTransporterId: globalId,
+    matchType: cleanText(selected.matchType || matched.matchType || "CITY"),
+    globalTransporterId: cleanText(transporter.globalTransporterId),
     transporterNameSnapshot: cleanText(transporter.name),
-    bookingStationId: booking?.stationId || "",
-    bookingStationNameSnapshot: booking?.name || "",
-    bookingStationAddressSnapshot: booking?.address || "",
-    bookingStationCitySnapshot: booking?.city || "",
-    bookingStationPincodeSnapshot: booking?.pincode || "",
-    deliveryStationId: delivery.stationId,
-    deliveryStationNameSnapshot: delivery.name || "",
-    deliveryStationAddressSnapshot: delivery.address || "",
-    deliveryStationCitySnapshot: delivery.city || "",
-    deliveryStationPincodeSnapshot: delivery.pincode || "",
-    serviceAreaSnapshot: cleanText(
-      customer?.serviceArea ||
-        delivery.name ||
-        delivery.city ||
-        locality.customerCity,
+    bookingStationId: baseStation?.stationId || selected.stationId || "",
+    bookingStationNameSnapshot:
+      baseStation?.name || selected.baseStationName || "",
+    bookingStationAddressSnapshot: baseStation?.address || "",
+    bookingStationCitySnapshot:
+      baseStation?.city || selected.baseStationCity || "",
+    bookingStationPincodeSnapshot:
+      baseStation?.pincode || selected.baseStationPincode || "",
+    deliveryStationId: "",
+    deliveryStationNameSnapshot: cleanText(
+      billing.area || billing.city || "Customer Delivery",
     ),
+    deliveryStationAddressSnapshot: cleanText(billing.address),
+    deliveryStationCitySnapshot: cleanText(
+      billing.city || selected.serviceCity,
+    ),
+    deliveryStationPincodeSnapshot: cleanText(
+      billing.pincode || selected.servicePincode,
+    ),
+    serviceAreaSnapshot: cleanText(
+      billing.city || selected.serviceCity || billing.pincode,
+    ),
+    matchType: matched.matchType || selected.matchType || "NONE",
   };
 }
 
@@ -744,19 +813,19 @@ const basicAfterGradeDiscount = (basic, gradePct) => {
 };
 
 async function resolvedProductRate({ customer, product, row }) {
-  const gradePct = Number(
-    row.gradeDiscountPct ?? customer.gradeDiscountPct ?? 0,
-  );
+  // Never trust row.gradeDiscountPct from the browser. The selected customer's
+  // current grade percentage is resolved from CUSTOMER GRADES before pricing.
+  const gradePct = Number(customer.gradeDiscountPct || 0);
   let saleRate = Number(row.saleRate ?? 0);
   if (!saleRate) {
     const gstRate = Number(row.gstRate ?? product.gstRate ?? 0);
-    // Product.salePrice is the product's BASIC (ex-GST) sales rate in V2.
-    // Grade discount is a true percentage reduction from that Basic Rate.
-    // Example: Basic 100, Grade 10% => customer Basic 90 (not 90.91).
-    const baseBasic = Number(product.salePrice || 0) > 0
-      ? Number(product.salePrice)
-      : basicFromSaleGst(product.mrp || 0, gstRate);
-    const customerBasic = basicAfterGradeDiscount(baseBasic, gradePct);
+    // MRP is authoritative for default grade pricing. Remove GST from MRP,
+    // then apply the selected customer's grade discount. This matches the
+    // grade-wise Price List and prevents Product.salePrice drift from changing
+    // invoice defaults. Older products without MRP keep the salePrice fallback.
+    const customerBasic = Number(product.mrp || 0) > 0
+      ? gradeBasicFromMrp(product.mrp, gstRate, gradePct)
+      : basicAfterGradeDiscount(Number(product.salePrice || 0), gradePct);
     saleRate = saleFromBasicGst(customerBasic, gstRate);
   }
   return { saleRate, gradeDiscountPct: gradePct };
@@ -1382,6 +1451,20 @@ export async function calculateSalesInvoice({
     throw Object.assign(new Error("Active approved customer is required"), {
       statusCode: 400,
     });
+  // CUSTOMER GRADES is the authoritative source for the discount percentage.
+  // CustomerLink.gradeDiscountPct is only a cache and may be stale if a grade
+  // was edited after the customer was assigned to it.
+  const liveGrade = customer.gradeCode
+    ? await CustomerGrade.findOne({
+        tenantKey,
+        code: upper(customer.gradeCode),
+        status: "ACTIVE",
+      })
+        .select("code name discountPct")
+        .lean()
+    : null;
+  customer.gradeDiscountPct = liveGrade ? Number(liveGrade.discountPct || 0) : 0;
+  customer.gradeName = liveGrade?.name || "";
   // Historical/bulk Sales-with-Product imports may be posted before transporter
   // masters are completed. This bypass is explicit and is NOT enabled for normal
   // sales invoice creation. Transporter can be assigned/cleaned up afterwards.
@@ -1399,7 +1482,15 @@ export async function calculateSalesInvoice({
         serviceAreaSnapshot: cleanText(customer?.serviceArea || ""),
         pendingAssignment: !isCashCustomer,
       }
-    : await customerTransportSnapshot({ tenantKey, customer });
+    : await customerTransportSnapshot({
+        tenantKey,
+        customer,
+        selectedTransporterId: body.transporterId || body.selectedTransporterId || "",
+        // New invoices use the city-only transporter list with exact-pincode
+        // transporters excluded. Existing invoices keep the previous matcher so
+        // historical edits do not become invalid merely because this rule changed.
+        invoiceCityOnly: !existingInvoice,
+      });
   const firm = await resolveFirmDeliveryLocation(tenantKey);
   const customerGstin =
     customer.displayIdentifier?.length === 15 ? customer.displayIdentifier : "";
@@ -1729,6 +1820,118 @@ export function normalizedEInvoice(body = {}, existing = {}) {
     ),
   };
 }
+
+
+async function lastUsedEligibleTransporter({
+  tenantKey,
+  customerGlobalId,
+  eligibleIds = [],
+  requestedFinancialYear = "",
+}) {
+  if (!customerGlobalId || !eligibleIds.length) return "";
+  const eligible = new Set(eligibleIds.map((id) => cleanText(id)).filter(Boolean));
+  const profile = await CompanyProfile.findOne({ tenantKey })
+    .select("financialYear financialYears")
+    .lean();
+  const financialYears = [
+    requestedFinancialYear,
+    profile?.financialYear,
+    ...(Array.isArray(profile?.financialYears) ? profile.financialYears : []),
+  ]
+    .map((value) => cleanText(value))
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index);
+
+  const latestRows = await Promise.all(
+    financialYears.map(async (financialYear) => {
+      try {
+        const { SalesInvoice } = financialModels(tenantKey, financialYear);
+        return await SalesInvoice.findOne({
+          tenantKey,
+          customerGlobalId,
+          status: "POSTED",
+          "transportAssignment.transporterId": { $in: [...eligible] },
+        })
+          .sort({ date: -1, createdAt: -1 })
+          .select("date createdAt transportAssignment.transporterId transportAssignment.transporterNameSnapshot")
+          .lean();
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  latestRows.sort((a, b) => {
+    const ad = new Date(a?.date || a?.createdAt || 0).getTime();
+    const bd = new Date(b?.date || b?.createdAt || 0).getTime();
+    return bd - ad;
+  });
+
+  for (const row of latestRows) {
+    const transporterId = cleanText(row?.transportAssignment?.transporterId);
+    if (eligible.has(transporterId)) return transporterId;
+  }
+  return "";
+}
+
+router.get("/sales-invoices/transporter-options", async (req, res) => {
+  try {
+    const customerGlobalId = cleanText(req.query.customerGlobalId);
+    if (!customerGlobalId) return fail(res, "Customer is required", 400);
+
+    const customer = await CustomerLink.findOne({
+      tenantKey: req.auth.tenantKey,
+      globalCustomerId: customerGlobalId,
+      status: "ACTIVE",
+    }).lean();
+    if (!customer) return fail(res, "Active customer not found", 404);
+    if (isSystemCashParty(customer)) {
+      return ok(res, {
+        matchType: "NONE",
+        rule: "CASH_NO_TRANSPORTER",
+        items: [],
+        defaultTransporterId: "",
+        lastUsedTransporterId: "",
+      });
+    }
+
+    const billing =
+      (customer.addresses || []).find(
+        (row) => upper(row?.type || "BILLING") === "BILLING",
+      ) ||
+      (customer.addresses || [])[0] ||
+      {};
+
+    const matched = await matchInvoiceCityTransporters({
+      tenantKey: req.auth.tenantKey,
+      pincode: billing.pincode,
+      city: billing.city,
+    });
+    const items = Array.isArray(matched.items) ? matched.items : [];
+    const eligibleIds = items.map((item) => cleanText(item.transporterId)).filter(Boolean);
+    const lastUsedTransporterId = await lastUsedEligibleTransporter({
+      tenantKey: req.auth.tenantKey,
+      customerGlobalId,
+      eligibleIds,
+      requestedFinancialYear: cleanText(req.query.financialYear),
+    });
+    const defaultTransporterId =
+      lastUsedTransporterId || (items.length === 1 ? cleanText(items[0].transporterId) : "");
+
+    return ok(res, {
+      ...matched,
+      items,
+      lastUsedTransporterId,
+      defaultTransporterId,
+    });
+  } catch (error) {
+    return fail(
+      res,
+      error.message || "Unable to load transporter options",
+      error.statusCode || error.status || 400,
+    );
+  }
+});
 
 router.get("/sales-invoices/next-number", async (req, res) => {
   try {
@@ -2183,6 +2386,7 @@ router.post("/sales-invoices", async (req, res) => {
     // the Order Desk enables order-linked stock reservation and lifecycle updates.
     const sourceOrderId = cleanText(req.body.sourceOrderId || "");
     let sourceOrder = null;
+    let sourceOrderItemMap = new Map();
     if (sourceOrderId) {
       sourceOrder = await SalesOrder.findOne({
         _id: sourceOrderId,
@@ -2214,11 +2418,11 @@ router.post("/sales-invoices", async (req, res) => {
           `Order ${sourceOrder.orderNo} is not ready for invoicing`,
           409,
         );
-      const orderItems = new Map(
+      sourceOrderItemMap = new Map(
         (sourceOrder.items || []).map((x) => [String(x.productId), x]),
       );
-    for (const it of calc.items) {
-        const oi = orderItems.get(String(it.productId));
+      for (const it of calc.items) {
+        const oi = sourceOrderItemMap.get(String(it.productId));
         if (!oi)
           return fail(
             res,
@@ -2285,9 +2489,10 @@ router.post("/sales-invoices", async (req, res) => {
       warehouseNameSnapshot:
         calc.warehouse.title || calc.warehouse.reference || "",
       assignedTo: req.body.assignedTo || "",
-      workflowStatus:
-        req.body.workflowStatus ||
-        (sourceOrder ? "READY_FOR_DISPATCH" : "POSTED"),
+      // Order Desk posting creates a normal POSTED sales invoice. The linked
+      // Sales Order separately moves to INVOICED; delivery is completed later
+      // from the existing Mark Delivered action on the Sales Invoice page.
+      workflowStatus: req.body.workflowStatus || "POSTED",
       releasedToWarehouseAt:
         req.body.workflowStatus === "RELEASED_TO_WAREHOUSE"
           ? new Date()
@@ -2327,7 +2532,9 @@ router.post("/sales-invoices", async (req, res) => {
         financialYear: calc.financialYear,
         date: calc.date,
         productId: it.productId,
-        warehouseId: calc.warehouseId,
+        warehouseId: sourceOrder
+          ? (sourceOrderItemMap.get(String(it.productId))?.warehouseId || calc.warehouseId)
+          : calc.warehouseId,
         type: sourceOrder ? "ORDER_SALE" : "SALE",
         qtyIn: 0,
         qtyOut: it.qty,
@@ -3122,7 +3329,7 @@ router.post(
       tenantKey: req.auth.tenantKey,
       requested: req.body.financialYear || req.query.financialYear,
     });
-    const { SalesInvoice } = financialModels(req.auth.tenantKey, financialYear);
+    const { SalesInvoice, SalesOrder, OrderEvent } = financialModels(req.auth.tenantKey, financialYear);
     const invoice = await SalesInvoice.findOne({
       _id: req.params.id,
       tenantKey: req.auth.tenantKey,
@@ -3296,6 +3503,45 @@ router.post(
         deliveryMessage = ` Invoice delivered, but email failed: ${error.message}.`;
       }
       await invoice.save();
+
+      // Keep the source Sales Order lifecycle in sync with the existing Sales
+      // Invoice delivery action. Delivered is the successful terminal state for
+      // an order; after this point the order cannot be cancelled or deleted.
+      if (invoice.sourceOrderId) {
+        const sourceOrder = await SalesOrder.findOne({
+          _id: invoice.sourceOrderId,
+          tenantKey: req.auth.tenantKey,
+          financialYear,
+        });
+        if (sourceOrder && !["CANCELLED", "REJECTED", "CLOSED"].includes(upper(sourceOrder.workflowStatus))) {
+          const fromStatus = upper(sourceOrder.workflowStatus || "INVOICED");
+          sourceOrder.workflowStatus = "DELIVERED";
+          sourceOrder.status = "CONVERTED";
+          sourceOrder.lastWorkflowAt = new Date();
+          sourceOrder.nextAction = "Completed";
+          await sourceOrder.save();
+          await OrderEvent.create({
+            tenantKey: req.auth.tenantKey,
+            financialYear,
+            eventNo: makeId("EVT"),
+            orderId: String(sourceOrder._id),
+            orderNo: sourceOrder.orderNo,
+            invoiceId: String(invoice._id),
+            invoiceNo: invoice.invoiceNo,
+            type: "DELIVERED",
+            fromStatus,
+            toStatus: "DELIVERED",
+            note: `Invoice ${invoice.invoiceNo} marked delivered; order completed successfully`,
+            meta: { invoiceId: String(invoice._id), invoiceNo: invoice.invoiceNo, deliveredAt: invoice.delivery?.deliveredAt || new Date() },
+            audience: ["DMS", "CUSTOMER", "SALESPERSON"],
+            actorId: req.auth.sub,
+            actorNameSnapshot: req.auth.name || req.auth.fullName || req.auth.email || "",
+            actorRole: req.auth.role || "",
+            occurredAt: new Date(),
+          });
+        }
+      }
+
       return ok(
         res,
         salesInvoiceForAuth(invoice, req.auth),
@@ -4066,6 +4312,14 @@ router.get("/receipts", async (req, res) => {
     q = String(req.query.q || "").trim();
   const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
   const filter = { tenantKey: req.auth.tenantKey, financialYear };
+  const statusFilter = upper(req.query.status);
+  const modeFilter = upper(req.query.mode);
+  const sourceFilter = upper(req.query.collectionSource);
+  const workflowFilter = upper(req.query.workflowStatus);
+  if (statusFilter && statusFilter !== "ALL") filter.status = statusFilter;
+  if (modeFilter && modeFilter !== "ALL") filter.mode = modeFilter;
+  if (sourceFilter && sourceFilter !== "ALL") filter.collectionSource = sourceFilter;
+  if (workflowFilter && workflowFilter !== "ALL") filter.receiptWorkflowStatus = workflowFilter;
   const dateRange = transactionQueryDateRange(req);
   if (dateRange) filter.date = dateRange;
   if (q)
@@ -4087,6 +4341,280 @@ router.get("/receipts", async (req, res) => {
     Receipt.countDocuments(filter),
   ]);
   ok(res, { items, meta: pageMeta(page, limit, total) });
+});
+
+
+router.get("/receipts/salesperson-pending", async (req, res) => {
+  try {
+    if (!isAdminAuth(req.auth)) return fail(res, "Superadmin access required", 403);
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
+    const kind = upper(req.query.kind || req.query.mode || "GENERAL");
+    const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const filter = {
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      collectionSource: "SALESPERSON_APP",
+      customerOtpStatus: "VERIFIED",
+      cashierOtpStatus: "PENDING",
+      receiptWorkflowStatus: "PENDING_CASHIER_OTP",
+      status: { $ne: "POSTED" },
+    };
+    let items = await Receipt.find(filter).sort({ date: -1, createdAt: -1 }).limit(500).lean();
+    const isCheque = (r) => upper(r.receiptType) === "CHEQUE" || /CHEQUE|CHECK|CHQ/.test(upper(r.mode));
+    if (kind === "CHEQUE") items = items.filter(isCheque);
+    else if (["GENERAL", "CASH_UPI", "NON_CHEQUE"].includes(kind)) items = items.filter((r) => !isCheque(r));
+    else if (kind !== "ALL") items = items.filter((r) => upper(r.mode) === kind || upper(r.receiptType) === kind);
+    return ok(res, { financialYear, kind, items });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.get("/receipts/:receiptId/cashier-otp", async (req, res) => {
+  try {
+    if (!isAdminAuth(req.auth)) return fail(res, "Superadmin access required", 403);
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
+    const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const key = cleanText(req.params.receiptId);
+    let receipt = await Receipt.findOne({ tenantKey: req.auth.tenantKey, financialYear, receiptNo: key }).select("+cashierOtpCode");
+    if (!receipt && /^[a-fA-F0-9]{24}$/.test(key)) receipt = await Receipt.findOne({ tenantKey: req.auth.tenantKey, financialYear, _id: key }).select("+cashierOtpCode");
+    if (!receipt) return fail(res, "Receipt not found", 404);
+    if (receipt.collectionSource !== "SALESPERSON_APP") return fail(res, "This receipt does not use cashier OTP", 409);
+    if (receipt.customerOtpStatus !== "VERIFIED") return fail(res, "Customer OTP is not verified yet", 409);
+    if (receipt.cashierOtpStatus !== "PENDING") return fail(res, receipt.cashierOtpStatus === "VERIFIED" ? "Cashier OTP is already verified" : "Cashier OTP is not available", 409);
+    return ok(res, {
+      receiptId: String(receipt._id),
+      receiptNo: receipt.receiptNo,
+      partyName: receipt.partyNameSnapshot || "",
+      amount: Number(receipt.amount || 0),
+      mode: receipt.mode || "",
+      receiptType: receipt.receiptType || "",
+      allocationType: receipt.allocationType || "",
+      againstInvoices: receipt.againstInvoices || [],
+      otp: receipt.cashierOtpCode || "",
+      expiresAt: receipt.cashierOtpExpiresAt || null,
+      madeBy: receipt.collectedBySalespersonNameSnapshot || receipt.createdByNameSnapshot || "",
+    });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+
+// ---------------------------
+// DMS Cashier: salesperson cash handover / issues / cashbook / closing
+// ---------------------------
+const cashierMovementScope = (req) => isAdminAuth(req.auth) ? {} : { recipientUserId: cleanText(req.auth.sub) };
+const openCashIssue = (issue) => !["RESOLVED", "CANCELLED"].includes(upper(issue?.status));
+
+router.get("/cashier/handovers", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const filter = {
+      tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", "receiptBreakdown.0": { $exists: true },
+      ...cashierMovementScope(req),
+    };
+    const status = upper(req.query.status || "PENDING");
+    if (status === "PENDING") filter.status = "PENDING";
+    else if (status === "RECEIVED") filter.status = "APPROVED";
+    else if (status && status !== "ALL") filter.handoverWorkflowStatus = status;
+    const rows = await SalespersonCashMovement.find(filter)
+      .select("+handoverOtpCode")
+      .sort({ date: -1, createdAt: -1 }).limit(500).lean();
+    const items = rows.map((m) => ({
+      _id: String(m._id), movementNo: m.movementNo, date: m.date, amount: money2(m.amount),
+      salespersonId: m.salespersonId, salespersonName: m.salespersonNameSnapshot || "",
+      cashierId: m.recipientUserId || "", cashierName: m.recipientName || "",
+      status: m.status, handoverWorkflowStatus: m.handoverWorkflowStatus || "LEGACY",
+      handoverOtpStatus: m.handoverOtpStatus || "NOT_REQUIRED",
+      handoverOtp: m.handoverOtpStatus === "PENDING" ? (m.handoverOtpCode || "") : "",
+      handoverOtpExpiresAt: m.handoverOtpExpiresAt || null,
+      denominations: m.denominations || [], receiptBreakdown: m.receiptBreakdown || [],
+      partyIssues: (m.partyIssues || []).map((x) => ({
+        issueId: x.issueId, receiptId: x.receiptId, receiptNo: x.receiptNo,
+        customerGlobalId: x.customerGlobalId, partyName: x.partyNameSnapshot,
+        amount: money2(x.amount), reason: x.reason, status: x.status,
+        raisedAt: x.raisedAt, acknowledgedAt: x.acknowledgedAt, resolvedAt: x.resolvedAt,
+        resolutionRemark: x.resolutionRemark || "",
+      })),
+      cashierReceivedAt: m.cashierReceivedAt || null,
+    }));
+    return ok(res, { financialYear, items });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cashier/handovers/:id/issues", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.body.financialYear || req.query.financialYear });
+    const { SalespersonCashMovement, OrderNotification } = financialModels(req.auth.tenantKey, financialYear);
+    const movement = await SalespersonCashMovement.findOne({
+      _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "PENDING", "receiptBreakdown.0": { $exists: true },
+      ...cashierMovementScope(req),
+    });
+    if (!movement) return fail(res, "Pending cash handover not found", 404);
+    if (movement.handoverOtpStatus !== "VERIFIED") return fail(res, "Salesperson must first verify the handover OTP before the cashier can count the cash", 409);
+    const receiptId = cleanText(req.body.receiptId);
+    const row = (movement.receiptBreakdown || []).find((x) => String(x.receiptId) === receiptId || String(x.receiptNo) === receiptId);
+    if (!row) return fail(res, "Select a party receipt from this handover", 400);
+    const reason = cleanText(req.body.reason);
+    if (!reason) return fail(res, "Enter the issue found while counting the party cash", 400);
+    const duplicate = (movement.partyIssues || []).find((x) => (String(x.receiptId) === String(row.receiptId) || String(x.receiptNo) === String(row.receiptNo)) && openCashIssue(x));
+    if (duplicate) return fail(res, `An open issue already exists for ${row.customerNameSnapshot || row.receiptNo}`, 409);
+
+    const issueId = makeId("ISS");
+    const otp = await createOtp({
+      tenantKey: req.auth.tenantKey, transactionId: String(movement._id),
+      actionType: "CASH_HANDOVER_ISSUE_SALESPERSON_ACK", recipientId: movement.salespersonId,
+      context: { issueId, movementNo: movement.movementNo, receiptNo: row.receiptNo, customerGlobalId: row.customerGlobalId, amount: money2(row.amount) },
+    });
+    movement.partyIssues.push({
+      issueId, receiptId: row.receiptId, receiptNo: row.receiptNo, customerGlobalId: row.customerGlobalId,
+      partyNameSnapshot: row.customerNameSnapshot, amount: money2(row.amount), reason,
+      status: "PENDING_SALESPERSON_ACK", acknowledgementOtpId: otp.otpId,
+      acknowledgementOtpCode: otp.code, acknowledgementOtpExpiresAt: otp.expiresAt,
+      raisedAt: new Date(), raisedBy: req.auth.sub, raisedByNameSnapshot: req.auth.name || "",
+    });
+    movement.handoverWorkflowStatus = "ISSUE_OPEN";
+    await movement.save();
+
+    if (row.customerGlobalId) await OrderNotification.create({
+      tenantKey: req.auth.tenantKey, financialYear, notificationNo: makeId("NTF"),
+      recipientType: "CUSTOMER", recipientId: row.customerGlobalId, channel: "IN_APP",
+      title: `Cash collection issue • ${row.receiptNo || "Receipt"}`,
+      body: `The cashier found an issue while checking the cash collected against ${row.receiptNo || "your receipt"}: ${reason}`,
+      data: { notificationType: "CASH_COLLECTION_ISSUE", issueId, movementNo: movement.movementNo, receiptNo: row.receiptNo, amount: money2(row.amount), status: "OPEN", reason },
+      status: "PENDING",
+    });
+    return ok(res, { issueId, movementNo: movement.movementNo, partyName: row.customerNameSnapshot, status: "PENDING_SALESPERSON_ACK" }, "Issue raised; ask the salesperson for the acknowledgement OTP shown in the Sales Person app", 201);
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cashier/handovers/:id/issues/:issueId/acknowledge", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.body.financialYear || req.query.financialYear });
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const movement = await SalespersonCashMovement.findOne({
+      _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "PENDING", "receiptBreakdown.0": { $exists: true },
+      ...cashierMovementScope(req),
+    });
+    if (!movement) return fail(res, "Pending cash handover not found", 404);
+    const issue = (movement.partyIssues || []).find((x) => cleanText(x.issueId) === cleanText(req.params.issueId));
+    if (!issue) return fail(res, "Cash issue not found", 404);
+    if (issue.status === "ACKNOWLEDGED" || issue.status === "RESOLVED") return ok(res, { issueId: issue.issueId, status: issue.status }, "Issue is already acknowledged");
+    const code = cleanText(req.body.code);
+    if (!code) return fail(res, "Enter the OTP shown in the salesperson app", 400);
+    const result = await verifyOtp({ otpId: issue.acknowledgementOtpId, code });
+    if (!result.ok) return fail(res, result.reason, 400);
+    if (String(result.challenge.transactionId) !== String(movement._id) || String(result.challenge.recipientId) !== String(movement.salespersonId)) return fail(res, "OTP does not belong to this salesperson handover", 409);
+    issue.status = "ACKNOWLEDGED"; issue.acknowledgedAt = new Date(); issue.acknowledgedBy = req.auth.sub; issue.acknowledgementOtpCode = "";
+    await movement.save();
+    return ok(res, { issueId: issue.issueId, status: issue.status }, "Salesperson acknowledged the cash issue");
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cashier/handovers/:id/receive", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.body.financialYear || req.query.financialYear });
+    const { SalespersonCashMovement, Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const movement = await SalespersonCashMovement.findOne({
+      _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", "receiptBreakdown.0": { $exists: true },
+      ...cashierMovementScope(req),
+    });
+    if (!movement) return fail(res, "Cash handover not found", 404);
+    if (movement.status === "APPROVED") return ok(res, movement, "Cash handover is already received");
+    if (movement.status !== "PENDING") return fail(res, `Cash handover is ${movement.status}`, 409);
+    if (movement.handoverOtpStatus !== "VERIFIED") return fail(res, "Salesperson has not yet confirmed the cashier handover OTP", 409);
+    const openIssues = (movement.partyIssues || []).filter(openCashIssue);
+    if (openIssues.length) return fail(res, `Resolve ${openIssues.length} cash issue(s) before receiving this handover`, 409, { issues: openIssues.map((x) => ({ issueId: x.issueId, partyName: x.partyNameSnapshot, status: x.status })) });
+
+    movement.status = "APPROVED";
+    movement.handoverWorkflowStatus = "RECEIVED";
+    movement.cashierReceivedAt = new Date();
+    movement.cashierReceivedBy = req.auth.sub;
+    movement.cashierReceivedByNameSnapshot = req.auth.name || "";
+    movement.verifiedBy = req.auth.sub;
+    movement.verifiedByNameSnapshot = req.auth.name || "";
+    movement.verifiedAt = movement.cashierReceivedAt;
+    await movement.save();
+
+    const receiptIds = (movement.receiptBreakdown || []).map((x) => x.receiptId).filter(isObjectIdText);
+    if (receiptIds.length) await Receipt.updateMany(
+      { _id: { $in: receiptIds }, tenantKey: req.auth.tenantKey, financialYear, cashDepositBatchId: String(movement._id) },
+      { $set: {
+        cashDepositStatus: "DEPOSITED_TO_CASHIER", cashDepositedAt: movement.cashierReceivedAt,
+        cashDepositedBy: req.auth.sub, cashDepositedByNameSnapshot: req.auth.name || "",
+      } },
+    );
+    return ok(res, { movementNo: movement.movementNo, amount: money2(movement.amount), receivedAt: movement.cashierReceivedAt }, "Cash received and added to cashier cashbook");
+  } catch (error) { return fail(res, error.message, error.statusCode || 500, error.details); }
+});
+
+router.get("/cashier/cashbook", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const movements = await SalespersonCashMovement.find({
+      tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "APPROVED", "receiptBreakdown.0": { $exists: true },
+      ...cashierMovementScope(req),
+    }).sort({ cashierReceivedAt: -1, date: -1 }).limit(1000).lean();
+    const items = [];
+    for (const m of movements) for (const r of m.receiptBreakdown || []) items.push({
+      id: `${m._id}:${r.receiptId || r.receiptNo}`, batchId: String(m._id), movementNo: m.movementNo,
+      receivedAt: m.cashierReceivedAt || m.verifiedAt || m.date, salespersonName: m.salespersonNameSnapshot || "",
+      receiptId: r.receiptId, receiptNo: r.receiptNo, customerGlobalId: r.customerGlobalId,
+      partyName: r.customerNameSnapshot || "", amount: money2(r.amount), cashierCloseId: m.cashierCloseId || "",
+    });
+    const total = money2(items.reduce((sum, x) => sum + num(x.amount), 0));
+    const unclosedTotal = money2(items.filter((x) => !x.cashierCloseId).reduce((sum, x) => sum + num(x.amount), 0));
+    return ok(res, { financialYear, items, total, unclosedTotal });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.get("/cashier/close-preview", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const batches = await SalespersonCashMovement.find({
+      tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "APPROVED", "receiptBreakdown.0": { $exists: true },
+      $or: [{ cashierCloseId: { $exists: false } }, { cashierCloseId: "" }, { cashierCloseId: null }],
+      ...cashierMovementScope(req),
+    }).sort({ cashierReceivedAt: 1, date: 1 }).lean();
+    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.amount), 0));
+    return ok(res, {
+      financialYear, expectedAmount, batchCount: batches.length,
+      salespersonCount: new Set(batches.map((x) => x.salespersonId).filter(Boolean)).size,
+      batches: batches.map((x) => ({ _id: String(x._id), movementNo: x.movementNo, salespersonName: x.salespersonNameSnapshot || "", amount: money2(x.amount), receivedAt: x.cashierReceivedAt || x.verifiedAt })),
+    });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+router.post("/cashier/close", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.body.financialYear || req.query.financialYear });
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const batches = await SalespersonCashMovement.find({
+      tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "APPROVED", "receiptBreakdown.0": { $exists: true },
+      $or: [{ cashierCloseId: { $exists: false } }, { cashierCloseId: "" }, { cashierCloseId: null }],
+      ...cashierMovementScope(req),
+    });
+    if (!batches.length) return fail(res, "There is no unclosed cashier collection", 409);
+    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.amount), 0));
+    const denominations = parseCashDenominations(req.body.denominations);
+    const declaredAmount = denominationTotal2(denominations);
+    if (!denominations.length) return fail(res, "Enter closing denominations", 400);
+    if (Math.abs(declaredAmount - expectedAmount) > 0.009) return fail(res, `Closing denomination total ₹${declaredAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })} must match cashier collection ₹${expectedAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`, 409);
+
+    let movementNo = makeId("CSH-CLOSE");
+    while (await SalespersonCashMovement.exists({ tenantKey: req.auth.tenantKey, financialYear, movementNo })) movementNo = makeId("CSH-CLOSE");
+    const closing = await SalespersonCashMovement.create({
+      tenantKey: req.auth.tenantKey, financialYear, movementNo,
+      salespersonId: `CASHIER:${req.auth.sub}`, salespersonNameSnapshot: req.auth.name || "Cashier",
+      recipientUserId: req.auth.sub, recipientName: req.auth.name || "Cashier",
+      date: new Date(), dayKey: new Date().toISOString().slice(0, 10), type: "CASHIER_CLOSE", direction: "OUT",
+      amount: expectedAmount, denominations, closeExpectedAmount: expectedAmount, closeDeclaredAmount: declaredAmount,
+      closeVariance: money2(declaredAmount - expectedAmount), closeDate: new Date(), status: "POSTED",
+      remarks: cleanText(req.body.remarks), createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "",
+    });
+    await SalespersonCashMovement.updateMany({ _id: { $in: batches.map((x) => x._id) } }, { $set: { cashierCloseId: String(closing._id) } });
+    return ok(res, { closingNo: closing.movementNo, amount: expectedAmount, denominations, batchCount: batches.length }, "Cashier closed successfully", 201);
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
 router.get("/payments", async (req, res) => {
@@ -4275,6 +4803,10 @@ router.post("/receipts", async (req, res) => {
       bankAccountId: bank.bankAccountId,
       bankNameSnapshot: bank.bankName,
       bounceStatus: "CLEAR",
+      receiptWorkflowStatus: "DMS_DIRECT",
+      customerOtpStatus: "NOT_REQUIRED",
+      cashierOtpStatus: "NOT_REQUIRED",
+      ledgerPostedAt: new Date(),
       status: "POSTED",
       createdBy: req.auth.sub,
       createdByNameSnapshot: req.auth.name || "",

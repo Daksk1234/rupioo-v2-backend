@@ -109,25 +109,48 @@ function financialYearBounds(financialYear) {
   if (!m) return null;
   const startYear = Number(m[1]);
   const endYear = m[2].length === 2 ? Math.floor(startYear / 100) * 100 + Number(m[2]) : Number(m[2]);
-  return { start:new Date(startYear,3,1,0,0,0,0), end:new Date(endYear,2,31,23,59,59,999) };
+  // Statement dates are calendar dates stored at UTC midnight, not server-local midnight.
+  return { start:new Date(Date.UTC(startYear,3,1)), end:new Date(Date.UTC(endYear,2,31,23,59,59,999)) };
+}
+
+// Bank-statement dates represent calendar days, never instants in a time zone.
+// Using new Date(y, m, d) on an IST server turns 31-05-2025 into
+// 2025-05-30T18:30:00.000Z, so the review UI sees 30 May. Always store
+// Excel/CSV calendar dates as UTC midnight of the SAME entered day.
+function statementCalendarDate(year, month, day) {
+  const y = Number(year), m = Number(month), d = Number(day);
+  if (![y,m,d].every(Number.isInteger) || y < 1900 || y > 9999 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const date = new Date(Date.UTC(y, m - 1, d));
+  return date.getUTCFullYear() === y && date.getUTCMonth() + 1 === m && date.getUTCDate() === d ? date : null;
 }
 
 function parseStatementDate(value) {
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : statementCalendarDate(value.getUTCFullYear(), value.getUTCMonth() + 1, value.getUTCDate());
+  }
   const text = clean(value);
   if (!text) return null;
-  let m = /^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/.exec(text);
-  if (m) {
-    const d = new Date(Number(m[3]), Number(m[2])-1, Number(m[1]));
-    if (!Number.isNaN(d.getTime())) return d;
+  // Excel/CSV: DD-MM-YYYY, DD/MM/YYYY (existing compatibility).
+  let match = /^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/.exec(text);
+  if (match) {
+    const dmy = statementCalendarDate(match[3], match[2], match[1]);
+    if (dmy) return dmy;
+    // Unambiguous Excel US display format (e.g. 5/31/2025). Never reinterpret
+    // an ambiguous date such as 5/6/2025: DD/MM retains priority.
+    if (text.includes("/") && Number(match[2]) > 12 && Number(match[1]) <= 12)
+      return statementCalendarDate(match[3], match[1], match[2]);
+    return null;
   }
-  m = /^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})$/.exec(text);
-  if (m) {
-    const d = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-  const d = new Date(text);
-  return Number.isNaN(d.getTime()) ? null : d;
+  // ISO YYYY-MM-DD, also accept YYYY/MM/DD (existing compatibility).
+  match = /^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})$/.exec(text);
+  if (match) return statementCalendarDate(match[1], match[2], match[3]);
+  // Existing API clients can send a full ISO timestamp. Its date prefix is
+  // authoritative; do not re-interpret it using the server's local zone.
+  match = /^(\d{4})-(\d{2})-(\d{2})T/.exec(text);
+  if (match) return statementCalendarDate(match[1], match[2], match[3]);
+  // Preserve historical support for other human-readable Excel date formats.
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : statementCalendarDate(parsed.getFullYear(), parsed.getMonth() + 1, parsed.getDate());
 }
 
 function parseStatementAmount(value,{signedBalance=false}={}) {
@@ -545,7 +568,8 @@ function signedOpeningValue(opening={}) {
 function manualTransactionFilter(tenantKey,financialYear,bankAccountId){
   return {
     tenantKey,financialYear,bankAccountId,
-    status:{$nin:["DELETED","CANCELLED","REVERSED"]},
+    status:"POSTED",
+    mode:{$ne:"CASH"},
     $or:[
       {statementImportId:{$exists:false}},
       {statementImportId:""},
@@ -623,8 +647,9 @@ async function calculateDraftRunningBalances({tenantKey,financialYear,bankAccoun
 
 async function recalculatePostedBankRunningBalances({tenantKey,financialYear,bank}){
   const opening=openingForYear(bank,financialYear);
-  if(!opening.exists)return {updated:0,closingBalance:0};
-  const openingSigned=signedOpeningValue(opening);
+  // A bank without an explicit FY opening begins at zero; newly posted
+  // receipts and payments still need a real running balance.
+  const openingSigned=opening.exists?signedOpeningValue(opening):0;
   const movements=await loadPostedBankMovements({tenantKey,financialYear,bankAccountId:bank.bankAccountId});
   if(!movements.length)return {updated:0,closingBalance:round2(openingSigned)};
 
@@ -657,6 +682,15 @@ async function recalculatePostedBankRunningBalances({tenantKey,financialYear,ban
   ]);
 
   return {updated:movements.length,closingBalance:round2(running)};
+}
+
+// Shared by direct and bulk voucher posting. Rebuild in date order, including
+// earlier statement imports, so a backdated voucher updates every later row.
+export async function recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId}) {
+  if(!clean(bankAccountId))return {updated:0,closingBalance:0};
+  const bank=await BankAccount.findOne({tenantKey,bankAccountId,status:{$ne:"DELETED"}});
+  if(!bank)throw new Error("Bank account for posted voucher was not found");
+  return recalculatePostedBankRunningBalances({tenantKey,financialYear,bank});
 }
 
 async function buildPartyMatcher(tenantKey) {
@@ -766,7 +800,7 @@ async function transactionIdsForDeleteAll({tenantKey,financialYear,fromDate="",t
   const dateFilter=transactionDateFilter(fromDate,toDate);if(dateFilter)statementFilter.date=dateFilter;
   if(bankAccountId)statementFilter.bankAccountId=bankAccountId;if(["RECEIPT","PAYMENT"].includes(type))statementFilter.transactionType=type;
   if(rx)statementFilter.$or=[{matchedPartyName:rx},{partyName:rx},{remarks:rx},{mode:rx},{transactionId:rx}];
-  const manualBase={tenantKey,financialYear,$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
+  const manualBase={tenantKey,financialYear,bankAccountId:{$nin:[null,""]},mode:{$ne:"CASH"},status:"POSTED",$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
   if(dateFilter)manualBase.date=dateFilter;
   if(bankAccountId)manualBase.bankAccountId=bankAccountId;
   const receiptFilter={...manualBase},paymentFilter={...manualBase};
@@ -828,6 +862,28 @@ router.put("/:id/opening-balance", async (req,res)=>{
 });
 
 
+router.get("/transactions/latest-month",async(req,res)=>{
+  try{
+    const tenantKey=req.auth.tenantKey;
+    const financialYear=clean(req.query.financialYear)||await ensureDefaultFinancialYear(tenantKey,"");
+    const bankAccountId=clean(req.query.bankAccountId);
+    if(!bankAccountId)return fail(res,"Select one bank account",400);
+    const permitted=await BankAccount.exists({tenantKey,bankAccountId,status:"ACTIVE"});
+    if(!permitted)return fail(res,"Bank account not found",404);
+    const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
+    const base={tenantKey,financialYear,bankAccountId};
+    const manual={...base,mode:{$ne:"CASH"},status:"POSTED",$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
+    const [stmt,receipt,payment]=await Promise.all([
+      BankStatementRow.findOne({...base,transactionId:{$nin:[null,""]},classification:{$in:["POSTED","SUSPENSE","UNMATCHED"]}}).sort({date:-1}).select("date").lean(),
+      Receipt.findOne(manual).sort({date:-1}).select("date").lean(),
+      Payment.findOne(manual).sort({date:-1}).select("date").lean(),
+    ]);
+    const dates=[stmt?.date,receipt?.date,payment?.date].filter(Boolean);
+    dates.sort((a,b)=>new Date(b)-new Date(a));
+    return ok(res,{financialYear,bankAccountId,month:dates.length?new Date(dates[0]).getUTCMonth()+1:null});
+  }catch(e){return fail(res,e.message||"Could not determine latest bank month",400);}
+});
+
 router.get("/transactions", async (req,res)=>{
   const financialYear=clean(req.query.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");
   if(!financialYear)return fail(res,"Select Financial Year",400);
@@ -840,7 +896,7 @@ router.get("/transactions", async (req,res)=>{
   if(bankAccountId)statementFilter.bankAccountId=bankAccountId;
   if(["RECEIPT","PAYMENT"].includes(type))statementFilter.transactionType=type;
   if(rx)statementFilter.$or=[{matchedPartyName:rx},{partyName:rx},{remarks:rx},{mode:rx},{transactionId:rx}];
-  const manualBase={tenantKey:req.auth.tenantKey,financialYear,$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
+  const manualBase={tenantKey:req.auth.tenantKey,financialYear,bankAccountId:{$nin:[null,""]},mode:{$ne:"CASH"},status:"POSTED",$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
   if(dateFilter)manualBase.date=dateFilter;
   if(bankAccountId)manualBase.bankAccountId=bankAccountId;
   const receiptFilter={...manualBase},paymentFilter={...manualBase};
@@ -958,7 +1014,8 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     // DD-MM-YYYY values as MM-DD-YYYY.
     const isCsv=/\.csv$/i.test(clean(req.file.originalname))||/csv/i.test(clean(req.file.mimetype));
     let rawRows;
-    try{rawRows=readRows(req.file.buffer,{preserveText:isCsv});}
+    // Respect the displayed date format in formatted Excel date cells.
+    try{rawRows=readRows(req.file.buffer,{preserveText:isCsv,formattedDates:!isCsv});}
     catch{return fail(res,"Unable to read bank statement file",400);}
     if(!rawRows.length)return fail(res,"Uploaded bank statement has no rows",400);
 
@@ -983,7 +1040,7 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     let rows=sortStatementRows(normalized.rows);
     if(!rows.length)return fail(res,"Uploaded bank statement has no transaction rows",400);
 
-    const rowYears=[...new Set(rows.map(r=>financialYearFromDate(r.date)).filter(Boolean))];
+    const rowYears=[...new Set(rows.map(r=>financialYearFromDate(r.date.toISOString().slice(0,10))).filter(Boolean))];
     if(rowYears.length!==1)return fail(
       res,
       rowYears.length
@@ -1177,7 +1234,7 @@ router.put("/:id/statement-review/:importId", async (req,res,next)=>{
 
       let requested=has("partyGlobalId")?clean(edit.partyGlobalId):clean(doc.matchedPartyGlobalId);
       if(!date)validation.push({row:doc.rowNo,error:"Invalid date"});
-      else if(financialYearFromDate(date)!==financialYear)validation.push({row:doc.rowNo,error:`Date must remain inside ${financialYear}`});
+      else if(financialYearFromDate(date.toISOString().slice(0,10))!==financialYear)validation.push({row:doc.rowNo,error:`Date must remain inside ${financialYear}`});
       if(!Number.isFinite(debit)||!Number.isFinite(credit)||(debit>0&&credit>0)||(debit<=0&&credit<=0)){
         validation.push({row:doc.rowNo,error:"Enter either Debit or Credit, not both"});
       }

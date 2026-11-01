@@ -40,6 +40,9 @@ import storageRoutes from "./routes/storage.js";
 import mailRoutes from "./routes/mail.route.js";
 import salesAppRoutes from "./routes/salesApp.js";
 import orderFlowRoutes from "./routes/orderFlow.js";
+import orderCompletionRoutes from "./routes/orderCompletion.js";
+import warehouseAuthRoutes from "./routes/warehouseAuth.js";
+import { startWarehouseClosingScheduler } from "./services/warehouseStockService.js";
 import customerAppRoutes from "./routes/customerApp.js";
 import customerAppAdminRoutes from "./routes/customerAppAdmin.js";
 import purchaseAiRoutes, { vendorRouter as purchaseAiVendorRoutes, startPurchaseAiAutomation } from "./routes/purchaseAi.js";
@@ -113,8 +116,13 @@ app.get("/api/sales-app/order-flow/health", (_req, res) =>
     time: new Date().toISOString(),
   }),
 );
+app.use("/api/warehouse-app", warehouseAuthRoutes);
+app.use("/api/warehouse-app/flow", orderCompletionRoutes);
+app.use("/api/warehouse-app/flow", orderFlowRoutes);
+app.use("/api/sales-app/order-flow", orderCompletionRoutes);
 app.use("/api/sales-app/order-flow", orderFlowRoutes);
 // Backward-compatible alias for older frontend/mobile builds.
+app.use("/api/order-flow", orderCompletionRoutes);
 app.use("/api/order-flow", orderFlowRoutes);
 // Vendor Portal is public only through its signed vendor token. It must be mounted before company auth guards.
 app.use("/api/purchase-ai/vendor", purchaseAiVendorRoutes);
@@ -175,6 +183,7 @@ app.use("/api/modules", genericRoutes);
 // Recalculate AI purchase triggers in the background. The scan is idempotent and
 // preserves buyer-edited quantities while refreshing AI-owned recommendations.
 startPurchaseAiAutomation();
+startWarehouseClosingScheduler();
 
 app.use(errorHandler);
 app.listen(env.port, () =>

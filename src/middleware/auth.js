@@ -2,6 +2,7 @@ import jwt from "jsonwebtoken";
 import { env } from "../config/env.js";
 import { fail } from "../utils/http.js";
 import { decodePermissions } from "../utils/authToken.js";
+import { GenericRecord } from "../models/index.js";
 import { resolveTenantKeyAlias } from "../services/tenantKeyService.js";
 import { isTenantMigrationActive } from "../services/tenantMigrationLock.js";
 import { ensureFinancialStorageTenantKey } from "../services/financialStorageTenantService.js";
@@ -43,6 +44,21 @@ export async function requireAuth(req, res, next) {
     req.auth = await authFromClaims(claims);
     if (req.auth.role !== "MASTER" && isTenantMigrationActive(req.auth.originalTenantKey || req.auth.tenantKey)) {
       return fail(res, "Company GST/tenant migration is in progress. Please retry after it completes.", 423, { code: "TENANT_MIGRATION_RUNNING" });
+    }
+
+    if (String(req.auth.role || "").toUpperCase() === "WAREHOUSE") {
+      if (!String(req.originalUrl || "").startsWith("/api/warehouse-app/")) return fail(res,"Warehouse session is restricted to the Warehouse App",403);
+      const assignedWarehouse = await GenericRecord.exists({_id:req.auth.warehouseId,tenantKey:req.auth.tenantKey,app:"dms",resource:"warehouses",status:"ACTIVE"});
+      if (!assignedWarehouse) return fail(res,"Warehouse login revoked or deactivated",401);
+    }
+    if (String(req.auth.role || "").toUpperCase()==="DELIVERY_BOY" && !String(req.originalUrl || "").startsWith("/api/sales-app/order-flow/phase2/")) {
+      return fail(res,"Delivery Boy account is restricted to its dedicated delivery endpoints",403);
+    }
+    // Collection Executive accounts are mobile receipt/collection-only principals. Even
+    // if a MASTER role template accidentally grants broad DMS permissions,
+    // a collection executive JWT cannot call unrelated REST resources.
+    if (["COLLECTION_EXECUTIVE", "COLLECTOR"].includes(String(req.auth.role || "").trim().toUpperCase()) && !String(req.originalUrl || "").startsWith("/api/sales-app/")) {
+      return fail(res, "Collection Executive account is restricted to the Collection Executive app", 403);
     }
 
     // Company identity comes from the signed JWT. The optional browser header

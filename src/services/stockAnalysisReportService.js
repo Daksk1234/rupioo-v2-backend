@@ -2,7 +2,7 @@ import { CompanyProfile, GenericRecord, Product } from "../models/index.js";
 import { financialModels } from "./accountingService.js";
 import { normalizeFinancialYear } from "../utils/financialYear.js";
 
-const INVALID_INVOICE_STATUSES = ["DELETED", "CANCELLED", "VOID", "DRAFT"];
+const INVALID_INVOICE_STATUSES = ["DELETED", "CANCELLED", "VOID", "DRAFT", "PERFORMA", "CONVERTING", "CONVERTED"];
 const INVALID_ORDER_STATUSES = ["DRAFT", "CANCELLED", "REJECTED", "DELETED", "VOID"];
 const COMPLETED_ORDER_WORKFLOWS = [
   "INVOICED",

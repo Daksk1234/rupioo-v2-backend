@@ -37,6 +37,15 @@ export function fyModels(db) {
 
   const salesInvoiceSchema = new Schema({
     tenantKey: { type: String, index: true }, financialYear: { type: String, index: true }, invoiceNo: { type: String, index: true },
+    // INVOICE = statutory/posted Sales Invoice. PERFORMA = non-posting
+    // performa document that can later be converted into a real Sales Invoice.
+    // Existing rows without this field are treated as INVOICE by the API.
+    invoiceType: { type: String, enum: ["INVOICE", "PERFORMA"], default: "INVOICE", index: true },
+    performaSerial: Number,
+    // Linkage is retained on both sides when a Performa is converted.
+    sourcePerformaId: String, sourcePerformaNo: String,
+    convertedInvoiceId: String, convertedInvoiceNo: String, convertedAt: Date,
+    convertedBy: String, convertedByNameSnapshot: String,
     voidedInvoiceNo: { type: String, default: "" }, voidedAt: Date, // preserve the original number of safely recycled test invoices
     date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true }, customerNameSnapshot: String, gstinSnapshot: String, addressSnapshot: String,
@@ -83,6 +92,7 @@ export function fyModels(db) {
   }, { timestamps: true });
   salesInvoiceSchema.index({ tenantKey: 1, invoiceNo: 1 }, { unique: true });
   salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, status: 1, date: 1 });
+  salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, invoiceType: 1, status: 1, date: -1 });
   salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, status: 1, "items.productId": 1, date: -1 });
   // Fast customer activity reports (Dead Party / last purchase / 3-month activity).
   salesInvoiceSchema.index({ tenantKey: 1, financialYear: 1, status: 1, customerGlobalId: 1, date: -1 });
@@ -114,6 +124,7 @@ export function fyModels(db) {
     sourceKey: String,
     date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true },
+    partyType:String,
     partyNameSnapshot:String,
     amount: Number,
     // Top-level collection channel used by the salesperson receipt flow.
@@ -195,7 +206,7 @@ export function fyModels(db) {
   receiptSchema.index({ tenantKey: 1, financialYear: 1, chequeStatus: 1, chequeIssueDate: -1 });
   receiptSchema.index({tenantKey:1,financialYear:1,sourceKey:1},{unique:true,partialFilterExpression:{sourceKey:{$type:"string"}}});
 
-  const paymentSchema = new Schema({ tenantKey: String, financialYear: String, paymentNo: String, sourceKey:String, date: { type: Date, index: true }, partyGlobalId: { type: String, index: true }, partyNameSnapshot:String, amount: Number, mode: String, reference: String, remarks:String, bankAccountId:{type:String,index:true}, bankNameSnapshot:String, statementImportId:String, statementRowNo:Number, runningBalance:Number, createdBy:String, createdByNameSnapshot:String, status: { type: String, default: "POSTED" } }, { timestamps: true });
+  const paymentSchema = new Schema({ tenantKey: String, financialYear: String, paymentNo: String, sourceKey:String, date: { type: Date, index: true }, partyGlobalId: { type: String, index: true }, partyType:String, partyNameSnapshot:String, amount: Number, mode: String, reference: String, remarks:String, bankAccountId:{type:String,index:true}, bankNameSnapshot:String, statementImportId:String, statementRowNo:Number, runningBalance:Number, createdBy:String, createdByNameSnapshot:String, status: { type: String, default: "POSTED" } }, { timestamps: true });
 
   paymentSchema.index({tenantKey:1,financialYear:1,sourceKey:1},{unique:true,partialFilterExpression:{sourceKey:{$type:"string"}}});
   paymentSchema.index({ tenantKey: 1, financialYear: 1, status: 1, date: -1 });
@@ -226,7 +237,8 @@ export function fyModels(db) {
   const salesOrderItemSchema = new Schema({
     productId: { type: String, index: true }, sku: String, nameSnapshot: String, hsnSnapshot: String,
     qty: Number, unit: String, packingUnit: String, qtyInBag: Number, listRate: Number,
-    rate: Number, discountPct: Number, taxable: Number, gstRateSnapshot: Number, tax: Number, lineTotal: Number,
+    rate: Number, gradeDiscountPct: Number, discountPct: Number, taxable: Number, gstRateSnapshot: Number, tax: Number, lineTotal: Number,
+    // `gradeDiscountPct` has no default: old orders stored grade in discountPct.
     // Order lifecycle quantities. qty remains the immutable ordered quantity.
     reservedQty: { type: Number, default: 0 },
     packedQty: { type: Number, default: 0 },
@@ -241,6 +253,9 @@ export function fyModels(db) {
     warehousePackedAt: Date,
     warehousePackedBy: String,
     warehousePackedByNameSnapshot: String,
+    packageCount: { type: Number, default: 0 }, actualWeight: { type: Number, default: 0 },
+    damagedQty: { type: Number, default: 0 }, currentWarehouseId: String,
+    transferReceivedAt: Date, transferMode: String,
   }, { _id: false });
 
   const salesOrderSchema = new Schema({
@@ -248,6 +263,7 @@ export function fyModels(db) {
     customerGlobalId: { type: String, index: true }, customerNameSnapshot: String, salespersonId: { type: String, index: true },
     // Legacy/single-warehouse snapshot plus product-level routing in items[].
     warehouseId: { type: String, index: true }, warehouseNameSnapshot: String,
+    mainWarehouseId: { type: String, index: true },
     source: { type: String, enum: ["MANUAL", "REPEAT", "SUGGESTED"], default: "MANUAL", index: true },
     repeatFromOrderNo: String, repeatFromInvoiceNo: String, items: [salesOrderItemSchema],
     subtotal: Number, discountTotal: Number, taxTotal: Number, grandTotal: Number, remarks: String,
@@ -270,6 +286,21 @@ export function fyModels(db) {
     invoices: [{ invoiceId: String, invoiceNo: String, invoiceDate: Date, grandTotal: Number }],
     deliveryType: { type: String, enum: ["LOCAL", "TRANSPORTER"], default: "LOCAL", index: true },
     deliveryRunId: String,
+    cancellation: {
+      status: { type: String, default: "NONE" }, source: String, reason: String, remarks: String,
+      requestedBy: String, requestedAt: Date, approvedBy: String, approvedAt: Date,
+      customerOtpId: String, salespersonOtpId: String, salespersonContactedAt: Date,
+      stockImageFileId: String,
+      items: [{ productId: String, qty: Number, packageCount: Number, weight: Number }],
+      completedAt: Date, creditNoteId: String, creditNoteNo: String,
+    },
+    dispatchCustody: { recordedAt: Date, settledAt: Date, settlement: String },
+    handover: {
+      customerOtpId: String, status: String, otpId: String,
+      requestedAt: Date, requestedBy: String, offeredAt: Date,
+      confirmedAt: Date, confirmedBy: String,
+      items: [{ productId: String, qty: Number, packageCount: Number, weight: Number }],
+    },
     lastWorkflowAt: Date,
     nextAction: String,
     // Credit control is a hold, not a lost order. Admin/DMS can later approve it.
@@ -337,6 +368,7 @@ export function fyModels(db) {
     customerOtp: { otpId: String, verifiedAt: Date },
     transporterHandover: {
       cnNo: String, cnDate: Date, packages: Number, weight: Number, freightAmount: Number, freightMode: String,
+      transporterId: String, totalAmount: Number,
       contactPerson: String, mobile: String, vehicleNo: String, proofFileId: String,
       destinationSnapshot: String, capturedAt: Date,
     },
@@ -413,6 +445,27 @@ export function fyModels(db) {
 
   // Physical cash custody for Sales Person collections. Customer accounting is
   // posted through Receipt/LedgerEntry; this model tracks who physically holds cash.
+  // Physical order-scoped warehouse transfers. Each receipt creates paired stock
+  // movements ONLY when the destination warehouse accepts it.
+  const warehouseTransferSchema = new Schema({
+    tenantKey: {type:String,index:true}, financialYear:{type:String,index:true},
+    transferNo:{type:String,required:true},orderId:{type:String,index:true},orderNo:String,
+    fromWarehouseId:{type:String,index:true},toWarehouseId:{type:String,index:true},
+    mode:{type:String,enum:["PACKED","UNPACKED","RETURN"],required:true},
+    status:{type:String,enum:["REQUESTED","RECEIVED"],default:"REQUESTED",index:true},
+    items:[{productId:String,productName:String,qty:Number,packageCount:Number,weight:Number}],
+    requestedAt:Date,requestedBy:String,receivedAt:Date,receivedBy:String,
+  },{timestamps:true});
+  warehouseTransferSchema.index({tenantKey:1,financialYear:1,transferNo:1},{unique:true});
+  warehouseTransferSchema.index({tenantKey:1,financialYear:1,orderId:1,fromWarehouseId:1,toWarehouseId:1,mode:1});
+  const warehouseClosingSchema = new Schema({
+    tenantKey:{type:String,index:true},financialYear:{type:String,index:true},warehouseId:{type:String,index:true},
+    monthKey:{type:String,index:true},status:{type:String,default:"OPEN",enum:["OPEN","SUBMITTED","REVIEWED"]},
+    rows:[{productId:String,productName:String,expected:Number,actual:Number,variance:Number,reason:String}],
+    submittedAt:Date,submittedBy:String,reviewedAt:Date,reviewedBy:String,reviewRemarks:String,
+  },{timestamps:true});
+  warehouseClosingSchema.index({tenantKey:1,financialYear:1,warehouseId:1,monthKey:1},{unique:true});
+
   const salespersonCashMovementSchema = new Schema({
     tenantKey: { type: String, index: true },
     financialYear: { type: String, index: true },
@@ -441,13 +494,17 @@ export function fyModels(db) {
     proofReference: String,
     remarks: String,
 
+    // Cash and bank receipts can share a handover. Only cashAmount is physical
+    // currency, so bankAmount must NEVER enter cash denomination reconciliation.
+    cashAmount: Number,
+    bankAmount: Number,
     // Cash handover batch. One HANDOVER may contain many party-wise receipts.
     // We store the batch in the existing cash-movement collection so deployments
     // close to the Mongo collection limit do not need another FY collection.
     denominations: [{ denomination: Number, count: Number, amount: Number }],
     receiptBreakdown: [{
       receiptId: String, receiptNo: String, customerGlobalId: String,
-      customerNameSnapshot: String, amount: Number,
+      customerNameSnapshot: String, amount: Number, mode: String, receiptType: String,
       receiptDenominations: [{ denomination: Number, count: Number, amount: Number }],
     }],
     handoverWorkflowStatus: { type: String, default: "LEGACY", index: true },
@@ -525,6 +582,8 @@ export function fyModels(db) {
     Receipt: get("Receipt", receiptSchema),
     Payment: get("Payment", paymentSchema),
     StockMovement: get("StockMovement", stockMovementSchema),
+    WarehouseTransfer: get("WarehouseTransfer", warehouseTransferSchema),
+    WarehouseClosing: get("WarehouseClosing", warehouseClosingSchema),
     Expense: get("Expense", expenseSchema),
     SalesOrder: get("SalesOrder", salesOrderSchema),
     OrderEvent: get("OrderEvent", orderEventSchema),

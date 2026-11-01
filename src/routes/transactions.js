@@ -1,10 +1,16 @@
 import express from "express";
+import PDFDocument from "pdfkit";
+import XLSX from "xlsx";
+import { createHash } from "node:crypto";
+import { parseStrictVoucherDate } from "../utils/strictVoucherDate.js";
 import multer from "multer";
 import fs from "fs/promises";
 import path from "path";
 import {
   Product,
   CustomerLink,
+  User,
+  CompanyLedger,
   CustomerGrade,
   GlobalCustomer,
   CompanyProfile,
@@ -15,6 +21,7 @@ import {
   GlobalTransporterStation,
   BankAccount,
   Branding,
+  OtpChallenge,
 } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
@@ -59,6 +66,7 @@ import {
   transactionDate,
 } from "../utils/financialYear.js";
 import personalFinanceRoutes from "./personalFinance.js";
+import { recalculateBankRunningBalancesForVoucher } from "./banks.js";
 import {
   allocateCashInvoiceNumber,
   cashInvoiceNumberFromSerial,
@@ -70,10 +78,7 @@ import {
 } from "../services/documentNumberService.js";
 import { enrichSalesInvoicesWithCreditState } from "../services/creditNoteRulesService.js";
 import { createOtp, verifyOtp } from "../services/otpService.js";
-import {
-  matchCustomerTransporters,
-  matchInvoiceCityTransporters,
-} from "../services/customerTransporterMatchingService.js";
+import { matchCustomerTransporters } from "../services/customerTransporterMatchingService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -164,11 +169,96 @@ const salesInvoiceForAuth = (invoice, auth) => {
   return row;
 };
 
+async function customerAssignedTransporterOptions({ tenantKey, customer, billing = {} }) {
+  const stored = Array.isArray(customer?.assignedTransporters)
+    ? customer.assignedTransporters.filter(Boolean)
+    : [];
+
+  // Keep compatibility with older customers where only the single legacy
+  // assignedTransport field was saved.
+  const legacyId = cleanText(customer?.assignedTransport);
+  if (legacyId && !stored.some((row) => cleanText(row?.transporterId) === legacyId)) {
+    stored.unshift({
+      transporterId: legacyId,
+      globalTransporterId: cleanText(customer?.assignedTransportGlobalId),
+      stationId: cleanText(customer?.assignedTransportBookingStationId),
+      transporterName: "",
+      matchType: "ASSIGNED",
+    });
+  }
+
+  if (!stored.length) return [];
+
+  const localIds = stored
+    .map((row) => cleanText(row?.transporterId))
+    .filter((value) => /^[0-9a-fA-F]{24}$/.test(value));
+  const globalIds = stored.map((row) => cleanText(row?.globalTransporterId)).filter(Boolean);
+  const names = stored.map((row) => cleanText(row?.transporterName)).filter(Boolean);
+  const clauses = [];
+  if (localIds.length) clauses.push({ _id: { $in: localIds } });
+  if (globalIds.length) clauses.push({ globalTransporterId: { $in: globalIds } });
+  if (names.length) clauses.push({ name: { $in: names } });
+  if (!clauses.length) return [];
+
+  const active = await Transporter.find({
+    tenantKey,
+    status: { $ne: "INACTIVE" },
+    $or: clauses,
+  })
+    .select("_id globalTransporterId name gstin status stations")
+    .lean();
+
+  const byId = new Map(active.map((row) => [String(row._id), row]));
+  const byGlobalId = new Map(
+    active.filter((row) => cleanText(row.globalTransporterId)).map((row) => [cleanText(row.globalTransporterId), row]),
+  );
+  const byName = new Map(active.map((row) => [cleanText(row.name).toLowerCase(), row]));
+  const seen = new Set();
+  const items = [];
+
+  for (const assigned of stored) {
+    const local =
+      byId.get(cleanText(assigned?.transporterId)) ||
+      byGlobalId.get(cleanText(assigned?.globalTransporterId)) ||
+      byName.get(cleanText(assigned?.transporterName).toLowerCase());
+    if (!local) continue;
+    const transporterId = String(local._id);
+    if (seen.has(transporterId)) continue;
+    seen.add(transporterId);
+    const base = (local.stations || [])[0] || {};
+    items.push({
+      transporterId,
+      localTransporterId: transporterId,
+      globalTransporterId: cleanText(local.globalTransporterId),
+      name: cleanText(local.name || assigned?.transporterName),
+      gstin: cleanText(local.gstin),
+      matchType: cleanText(assigned?.matchType || customer?.transporterMatchType || "ASSIGNED"),
+      stationId: cleanText(assigned?.stationId || customer?.assignedTransportBookingStationId),
+      baseStationName: cleanText(assigned?.baseStationName || base.name || base.city),
+      baseStationPincode: cleanText(assigned?.baseStationPincode || base.pincode),
+      baseStationCity: cleanText(assigned?.baseStationCity || base.city),
+      servicePincode: cleanText(assigned?.matchedPincode || billing?.pincode),
+      serviceCity: cleanText(assigned?.matchedCity || billing?.city),
+      assignedToCustomer: true,
+    });
+  }
+  return items;
+}
+
+function mergeTransporterOptions(primary = [], secondary = []) {
+  const seen = new Set();
+  return [...primary, ...secondary].filter((row) => {
+    const id = cleanText(row?.transporterId || row?.localTransporterId);
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
 async function customerTransportSnapshot({
   tenantKey,
   customer,
   selectedTransporterId = "",
-  invoiceCityOnly = false,
 }) {
   const locality = await resolveCustomerDeliveryMode({ tenantKey, customer });
   const billing =
@@ -178,18 +268,21 @@ async function customerTransportSnapshot({
     (customer?.addresses || [])[0] ||
     {};
 
-  const matched = invoiceCityOnly
-    ? await matchInvoiceCityTransporters({
-        tenantKey,
-        pincode: billing.pincode,
-        city: billing.city,
-      })
-    : await matchCustomerTransporters({
-        tenantKey,
-        pincode: billing.pincode,
-        city: billing.city,
-      });
-  const options = matched.items || [];
+  // The Customer Master assignment is authoritative for Sales Invoice. Live
+  // pincode/city matching is used as a fallback and to add newly eligible
+  // transporters, but it must never hide a transporter already assigned to the
+  // selected customer.
+  const assignedOptions = await customerAssignedTransporterOptions({
+    tenantKey,
+    customer,
+    billing,
+  });
+  const matched = await matchCustomerTransporters({
+    tenantKey,
+    pincode: billing.pincode,
+    city: billing.city,
+  });
+  const options = mergeTransporterOptions(assignedOptions, matched.items || []);
 
   if (!options.length) {
     if (!locality.requiresTransport) {
@@ -372,15 +465,18 @@ async function resolveTransactionBank(tenantKey, mode, bankAccountId) {
       bankName: "Cash",
     };
   let bank = null;
-  if (cleanText(bankAccountId))
+  if (cleanText(bankAccountId)) {
+    const key = cleanText(bankAccountId);
     bank = await BankAccount.findOne({
       tenantKey,
       $or: [
-        { _id: bankAccountId },
-        { bankAccountId: cleanText(bankAccountId) },
+        ...(/^[a-f0-9]{24}$/i.test(key) ? [{ _id: key }] : []),
+        { bankAccountId: key },
       ],
       status: "ACTIVE",
     }).lean();
+    if (!bank) throw Object.assign(new Error("Selected Bank Account not found or inactive"), {statusCode:400});
+  }
   if (!bank)
     bank = await BankAccount.findOne({
       tenantKey,
@@ -410,6 +506,85 @@ async function resolveTransactionBank(tenantKey, mode, bankAccountId) {
   };
 }
 
+// Direct DMS vouchers can be linked to a customer/supplier, an office user,
+// a transporter or an explicitly chosen miscellaneous name. Names are matched
+// exactly (case-insensitive); ambiguous names MUST be disambiguated by type/ID.
+const voucherNameRx = (text) => new RegExp(`^${String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+const VOUCHER_TYPES = new Set(["CUSTOMER", "USER", "TRANSPORTER", "OTHER"]);
+const voucherType = (raw) => {
+  const val = upper(raw);
+  if (["PARTY", "SUPPLIER", "BUYER", "CREDITOR", "DEBITOR"].includes(val)) return "CUSTOMER";
+  return val;
+};
+const voucherPartyId = (type, rawId) => type === "CUSTOMER" ? String(rawId) : `${type}:${String(rawId)}`;
+
+// Directory is tenant-scoped and returns only fields needed by receipt/payment entry.
+router.get("/voucher-party-options", async (req, res) => {
+  try {
+    const tenantKey = req.auth.tenantKey;
+    const [customers, users, transporters] = await Promise.all([
+      CustomerLink.find({tenantKey,status:"ACTIVE"}).select("globalCustomerId localName displayIdentifier partyType").lean(),
+      User.find({tenantKey,status:"ACTIVE",systemManaged:{$ne:true}}).select("_id name employeeId role ledgerNodeKind parentLedgerAccountId tallyAccountTypeName tallyAccountTypeCode").lean(),
+      Transporter.find({tenantKey,status:"ACTIVE"}).select("_id name gstin pan").lean(),
+    ]);
+    const userById = new Map(users.map(x=>[String(x._id),x]));
+    const items = [
+      ...customers.map(x=>({type:"CUSTOMER",id:x.globalCustomerId,name:x.localName||x.displayIdentifier||"",identifier:x.displayIdentifier||"",subtype:x.partyType||""})),
+      ...users.filter(x=>x.ledgerNodeKind!=="GROUP").map(x=>{
+        const labels=[],seen=new Set();let parent=userById.get(String(x.parentLedgerAccountId||""));
+        while(parent&&!seen.has(String(parent._id))){seen.add(String(parent._id));labels.unshift(parent.name);parent=userById.get(String(parent.parentLedgerAccountId||""));}
+        const accountPath=[x.tallyAccountTypeName||x.tallyAccountTypeCode,...labels].filter(Boolean).join(" > ");
+        return {type:"USER",id:voucherPartyId("USER",x._id),name:x.name||"",identifier:x.employeeId||String(x._id),subtype:accountPath||x.role||"",accountPath};
+      }),
+      ...transporters.map(x=>({type:"TRANSPORTER",id:voucherPartyId("TRANSPORTER",x._id),name:x.name||"",identifier:x.gstin||x.pan||String(x._id),subtype:""})),
+    ].filter(x=>x.id&&x.name).sort((a,b)=>a.name.localeCompare(b.name,"en",{sensitivity:"base"}));
+    return ok(res,items);
+  } catch (e) { return fail(res,e.message||"Unable to load voucher party directory",500); }
+});
+
+async function resolveVoucherPostingParty(tenantKey, rawReference, rawType = "") {
+  const reference = cleanText(rawReference);
+  const type = voucherType(rawType);
+  if (!reference) throw Object.assign(new Error("Party name or ID is required"),{statusCode:400});
+  if (type && !VOUCHER_TYPES.has(type)) throw Object.assign(new Error("Party Type must be CUSTOMER, USER, TRANSPORTER or OTHER"),{statusCode:400});
+  if (type === "OTHER") {
+    if (reference.length > 150) throw new Error("Other party name cannot exceed 150 characters");
+    const stable = createHash("sha256").update(reference.toLocaleUpperCase("en-IN")).digest("hex").slice(0,24);
+    return {type:"OTHER",id:`OTHER:${stable}`,name:reference,accountCode:"SYS_SUSPENSE",ledgerId:""};
+  }
+  const strippedUser = reference.replace(/^USER:/i,"");
+  const strippedTransporter = reference.replace(/^TRANSPORTER:/i,"");
+  const allowed = (which) => !type || type===which;
+  const candidates=[];
+  if (allowed("CUSTOMER")) {
+    const rows=await CustomerLink.find({tenantKey,status:"ACTIVE",$or:[
+      {globalCustomerId:reference},{displayIdentifier:voucherNameRx(reference)},
+      {localName:voucherNameRx(reference)},
+    ]}).limit(3).lean();
+    candidates.push(...rows.map(x=>({type:"CUSTOMER",id:x.globalCustomerId,name:x.localName||x.displayIdentifier||"",accountCode:partyAccountCodeOf(x),ledgerId:""})));
+  }
+  if (allowed("USER")) {
+    const filter={tenantKey,status:"ACTIVE",systemManaged:{$ne:true},ledgerNodeKind:{$ne:"GROUP"},$or:[{name:voucherNameRx(reference)}]};
+    if (isObjectIdText(strippedUser))filter.$or.push({_id:strippedUser});
+    const rows=await User.find(filter).limit(3).lean();
+    for (const x of rows) {
+      const ledger=await CompanyLedger.findOne({tenantKey,ownerType:"USER",ownerId:String(x._id),status:"ACTIVE"}).sort({updatedAt:-1}).lean();
+      const mapping=(x.accountingMappings||[]).find(m=>upper(m.status||"ACTIVE")==="ACTIVE"&&m.systemAccountCode);
+      candidates.push({type:"USER",id:voucherPartyId("USER",x._id),name:x.name,accountCode:ledger?.systemAccountCode||mapping?.systemAccountCode||"SYS_SUSPENSE",ledgerId:ledger?.ledgerId||""});
+    }
+  }
+  if (allowed("TRANSPORTER")) {
+    const filter={tenantKey,status:"ACTIVE",$or:[{name:voucherNameRx(reference)},{gstin:voucherNameRx(reference)},{pan:voucherNameRx(reference)}]};
+    if (isObjectIdText(strippedTransporter))filter.$or.push({_id:strippedTransporter});
+    const rows=await Transporter.find(filter).limit(3).lean();
+    candidates.push(...rows.map(x=>({type:"TRANSPORTER",id:voucherPartyId("TRANSPORTER",x._id),name:x.name,accountCode:"SYS_SUNDRY_CREDITORS",ledgerId:""})));
+  }
+  const unique=[...new Map(candidates.map(x=>[x.id,x])).values()];
+  if (unique.length>1) throw Object.assign(new Error(`Party name "${reference}" matches multiple records. Select the specific party from the directory or provide Party Type and ID.`),{statusCode:400});
+  if (!unique.length) throw Object.assign(new Error(`Party "${reference}" not found/active. Select a Customer, User or Transporter, or choose Party Type OTHER for an unmapped name.`),{statusCode:400});
+  return unique[0];
+}
+
 router.post(
   "/:type/bulk-upload",
   upload.single("file"),
@@ -421,14 +596,16 @@ router.post(
         return fail(res, "Excel/CSV file is required", 400);
       let rows;
       try {
-        rows = readRows(req.file.buffer);
+        rows = ["receipts", "payments"].includes(type)
+          ? readRows(req.file.buffer, { preserveText: true, formattedDates: true })
+          : readRows(req.file.buffer);
       } catch {
         return fail(res, "Unable to read Excel/CSV file", 400);
       }
       if (!rows.length) return fail(res, "Uploaded file has no rows", 400);
       const requestedFy = req.body.financialYear || "";
       const common = [
-        { key: "date", label: "Date", type: "date" },
+        { key: "date", label: "Date", aliases: ["Date (DD-MM-YYYY or YYYY-MM-DD)", "Voucher Date"], required: ["receipts", "payments"].includes(type) },
         { key: "amount", label: "Amount", type: "number", required: true },
         { key: "reference", label: "Reference" },
       ];
@@ -442,12 +619,15 @@ router.post(
               },
               {
                 key: "customer",
-                label: "Customer ID / GSTIN / PAN",
-                aliases: ["customer", "party", "gstin", "pan"],
+                label: "Party Name / ID",
+                aliases: ["Customer ID / GSTIN / PAN", "customer", "party", "gstin", "pan", "Party / Supplier ID", "party name"],
                 required: true,
               },
+              { key: "partyType", label: "Party Type", aliases: ["category", "party category"] },
               ...common,
               { key: "mode", label: "Mode" },
+              { key: "bankAccountId", label: "Bank Account ID", aliases: ["bank id", "bank account"] },
+              { key: "remarks", label: "Remarks", aliases: ["narration", "description"] },
               { key: "bounceStatus", label: "Bounce Status" },
             ]
           : type === "payments"
@@ -459,12 +639,15 @@ router.post(
                 },
                 {
                   key: "partyGlobalId",
-                  label: "Party / Supplier ID",
-                  aliases: ["party", "supplier"],
+                  label: "Party Name / ID",
+                  aliases: ["Party / Supplier ID", "party", "supplier", "party name", "customer"],
                   required: true,
                 },
+                { key: "partyType", label: "Party Type", aliases: ["category", "party category"] },
                 ...common,
                 { key: "mode", label: "Mode" },
+                { key: "bankAccountId", label: "Bank Account ID", aliases: ["bank id", "bank account"] },
+                { key: "remarks", label: "Remarks", aliases: ["narration", "description"] },
               ]
             : [
                 {
@@ -497,6 +680,7 @@ router.post(
       const errors = [];
       let inserted = 0,
         duplicates = 0;
+      const affectedBankFys = new Map();
       for (let i = 0; i < rows.length; i++) {
         const body = { financialYear: requestedFy };
         for (const f of fields) {
@@ -514,127 +698,62 @@ router.post(
         }
         let createdVoucher = null;
         try {
-          const date = transactionDate(body.date);
+          const date = ["receipts", "payments"].includes(type)
+            ? parseStrictVoucherDate(body.date)
+            : transactionDate(body.date);
           const fy =
-            financialYearFromDate(body.date) ||
+            financialYearFromDate(date) ||
             financialYearFromDate(date) ||
             (await resolveFinancialYear({
               tenantKey: req.auth.tenantKey,
               requested: requestedFy,
             }));
           const models = financialModels(req.auth.tenantKey, fy);
-          if (type === "receipts") {
-            const customer = await resolveReceiptCustomer(
-              req.auth.tenantKey,
-              body.customer,
-            );
-            if (!customer) {
-              if (errors.length < 100)
-                errors.push({
-                  row: i + 2,
-                  error: `Customer not found: ${body.customer || ""}`,
-                });
-              continue;
-            }
-            const receiptNo = cleanText(body.receiptNo) || makeId("RCT");
-            if (
-              await models.Receipt.exists({
-                tenantKey: req.auth.tenantKey,
-                financialYear: fy,
-                receiptNo,
-              })
-            ) {
-              duplicates++;
-              continue;
-            }
+          if (["receipts", "payments"].includes(type)) {
             const mode = upper(body.mode || "BANK");
-            createdVoucher = await models.Receipt.create({
-              tenantKey: req.auth.tenantKey,
-              financialYear: fy,
-              receiptNo,
-              sourceKey: receiptNo,
-              date,
-              customerGlobalId: customer.globalCustomerId,
-              partyNameSnapshot:
-                customer.localName ||
-                customer.displayIdentifier ||
-                body.customer ||
-                "Customer",
-              amount,
-              mode,
-              reference: body.reference || "",
-              bounceStatus: upper(body.bounceStatus || "CLEAR"),
-              createdBy: req.auth.sub,
-              createdByNameSnapshot: req.auth.name || "",
-              status: "POSTED",
-            });
-            await postBalancedEntries({
-              tenantKey: req.auth.tenantKey,
-              financialYear: fy,
-              transactionId: receiptNo,
-              transactionType: "RECEIPT",
-              date,
-              partyGlobalId: customer.globalCustomerId,
-              narration: `Receipt ${receiptNo}`,
-              entries: [
-                {
-                  accountCode:
-                    mode === "CASH" ? "SYS_CASH" : "SYS_BANK_ACCOUNT",
-                  debit: amount,
-                },
-                { accountCode: "SYS_SUNDRY_DEBTORS", credit: amount },
-              ],
-            });
-          } else if (type === "payments") {
-            const paymentNo = cleanText(body.paymentNo) || makeId("PAY");
-            if (
-              await models.Payment.exists({
-                tenantKey: req.auth.tenantKey,
-                financialYear: fy,
-                paymentNo,
-              })
-            ) {
+            if (!["BANK", "NEFT", "RTGS", "UPI", "CHEQUE", "CASH"].includes(mode))
+              throw new Error(`Invalid payment mode: ${mode}`);
+            const party = await resolveVoucherPostingParty(
+              req.auth.tenantKey,
+              type === "receipts" ? body.customer : body.partyGlobalId,
+              body.partyType,
+            );
+            const numberField = type === "receipts" ? "receiptNo" : "paymentNo";
+            const voucherNo = cleanText(body[numberField]) || makeId(type === "receipts" ? "RCT" : "PAY");
+            const Model = type === "receipts" ? models.Receipt : models.Payment;
+            if (await Model.exists({tenantKey:req.auth.tenantKey,financialYear:fy,[numberField]:voucherNo})) {
               duplicates++;
               continue;
             }
-            const mode = upper(body.mode || "BANK"),
-              party = cleanText(body.partyGlobalId);
-            const partyMap = await resolvePartyDisplayMap(req.auth.tenantKey, [
-              party,
-            ]);
-            const partyName = partyMap.get(party)?.name || party || "Party";
-            createdVoucher = await models.Payment.create({
-              tenantKey: req.auth.tenantKey,
-              financialYear: fy,
-              paymentNo,
-              sourceKey: paymentNo,
-              date,
-              partyGlobalId: party,
-              partyNameSnapshot: partyName,
-              amount,
-              mode,
-              reference: body.reference || "",
-              createdBy: req.auth.sub,
-              createdByNameSnapshot: req.auth.name || "",
-              status: "POSTED",
-            });
+            const chosenBankId = cleanText(body.bankAccountId || req.body.bankAccountId);
+            if (mode !== "CASH" && !chosenBankId)
+              throw new Error("Bank Account is required for a non-cash bulk voucher");
+            const bank = await resolveTransactionBank(req.auth.tenantKey,mode,chosenBankId);
+            const commonVoucher = {
+              tenantKey:req.auth.tenantKey,financialYear:fy,[numberField]:voucherNo,
+              sourceKey:voucherNo,date,partyType:party.type,partyNameSnapshot:party.name,
+              amount,mode,reference:body.reference||"",remarks:body.remarks||"",
+              bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,
+              status:"POSTED",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||"",
+            };
+            createdVoucher = await Model.create(type === "receipts" ? {
+              ...commonVoucher,customerGlobalId:party.id,
+              bounceStatus:upper(body.bounceStatus||"CLEAR"),
+              receiptWorkflowStatus:"DMS_DIRECT",customerOtpStatus:"NOT_REQUIRED",
+              cashierOtpStatus:"NOT_REQUIRED",ledgerPostedAt:new Date(),
+            } : {...commonVoucher,partyGlobalId:party.id});
+            const bankEntry = {accountCode:bank.accountCode,ledgerId:bank.ledgerId,
+              bankAccountId:bank.bankAccountId};
             await postBalancedEntries({
-              tenantKey: req.auth.tenantKey,
-              financialYear: fy,
-              transactionId: paymentNo,
-              transactionType: "PAYMENT",
-              date,
-              partyGlobalId: party,
-              narration: `Payment ${paymentNo}`,
-              entries: [
-                { accountCode: "SYS_SUNDRY_CREDITORS", debit: amount },
-                {
-                  accountCode:
-                    mode === "CASH" ? "SYS_CASH" : "SYS_BANK_ACCOUNT",
-                  credit: amount,
-                },
-              ],
+              tenantKey:req.auth.tenantKey,financialYear:fy,transactionId:voucherNo,
+              transactionType:type === "receipts" ? "RECEIPT" : "PAYMENT",
+              date,partyGlobalId:party.id,
+              narration:body.remarks||`${type === "receipts" ? "Receipt" : "Payment"} ${voucherNo}`,
+              entries:type === "receipts"
+                ? [{...bankEntry,debit:amount},{accountCode:party.accountCode,ledgerId:party.ledgerId,credit:amount}]
+                : [{accountCode:party.accountCode,ledgerId:party.ledgerId,debit:amount},{...bankEntry,credit:amount}],
             });
+            if (bank.bankAccountId) affectedBankFys.set(`${fy}::${bank.bankAccountId}`,{financialYear:fy,bankAccountId:bank.bankAccountId});
           } else {
             const expenseNo = cleanText(body.expenseNo) || makeId("EXP");
             if (
@@ -685,6 +804,11 @@ router.post(
             errors.push({ row: i + 2, error: e.message });
         }
       }
+      const balanceWarnings=[];
+      for (const affected of affectedBankFys.values()) {
+        try { await recalculateBankRunningBalancesForVoucher({tenantKey:req.auth.tenantKey,...affected}); }
+        catch (error) { balanceWarnings.push(`FY ${affected.financialYear}, bank ${affected.bankAccountId}: ${error.message}`); }
+      }
       return ok(
         res,
         {
@@ -693,8 +817,9 @@ router.post(
           duplicates,
           invalid: errors.length,
           errors,
+          balanceWarnings,
         },
-        `${inserted} ${type} imported`,
+        `${inserted} ${type} imported${balanceWarnings.length ? "; bank balance refresh needs attention" : ""}`,
       );
     } catch (e) {
       next(e);
@@ -1225,6 +1350,124 @@ async function salesInvoiceSeriesFinancialYears(
   return years;
 }
 
+const PERFORMA_INVOICE_PREFIX = "Performa Invoice-";
+
+function normalizedSalesInvoiceType(value) {
+  return upper(value) === "PERFORMA" ? "PERFORMA" : "INVOICE";
+}
+
+function performaInvoiceSerialInfo(value) {
+  const match = cleanText(value).match(/^Performa\s+Invoice-(\d+)$/i);
+  if (!match) return null;
+  const serial = Number(match[1]);
+  return Number.isFinite(serial) && serial >= 1
+    ? { serial, serialText: match[1] }
+    : null;
+}
+
+async function maxKnownPerformaSerial(tenantKey, requestedFinancialYear = "") {
+  const years = await salesInvoiceSeriesFinancialYears(
+    tenantKey,
+    requestedFinancialYear,
+  );
+  let maxSerial = 0;
+  for (const financialYear of years) {
+    try {
+      const { SalesInvoice } = financialModels(tenantKey, financialYear);
+      const rows = await SalesInvoice.find({
+        tenantKey,
+        $or: [
+          { invoiceType: "PERFORMA" },
+          { invoiceNo: /^Performa\s+Invoice-\d+$/i },
+          { sourcePerformaNo: /^Performa\s+Invoice-\d+$/i },
+        ],
+      })
+        .select("invoiceNo sourcePerformaNo performaSerial")
+        .lean();
+      for (const row of rows) {
+        maxSerial = Math.max(
+          maxSerial,
+          Number(row.performaSerial || 0),
+          Number(performaInvoiceSerialInfo(row.invoiceNo)?.serial || 0),
+          Number(performaInvoiceSerialInfo(row.sourcePerformaNo)?.serial || 0),
+        );
+      }
+    } catch {
+      // A configured historical FY may not have been created yet.
+    }
+  }
+  return maxSerial;
+}
+
+async function performaInvoiceSeries(
+  tenantKey,
+  requestedFinancialYear = "",
+  { consume = false } = {},
+) {
+  const observedMax = await maxKnownPerformaSerial(
+    tenantKey,
+    requestedFinancialYear,
+  );
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const company = await CompanyProfile.findOne({ tenantKey })
+      .select("performaInvoiceNextNumber")
+      .lean();
+    if (!company)
+      throw Object.assign(new Error("Company profile not found"), {
+        statusCode: 404,
+      });
+
+    const storedValue = Number(company.performaInvoiceNextNumber || 0);
+    const serial = Math.max(1, observedMax + 1, storedValue || 1);
+    if (!consume) {
+      return {
+        invoiceNo: `${PERFORMA_INVOICE_PREFIX}${serial}`,
+        serial,
+        serialText: String(serial),
+        prefix: PERFORMA_INVOICE_PREFIX,
+        suffix: "",
+        financialYear: cleanText(requestedFinancialYear),
+        performaInvoice: true,
+        invoiceType: "PERFORMA",
+      };
+    }
+
+    const counterFilter = storedValue >= 1
+      ? { tenantKey, performaInvoiceNextNumber: storedValue }
+      : {
+          tenantKey,
+          $or: [
+            { performaInvoiceNextNumber: { $exists: false } },
+            { performaInvoiceNextNumber: null },
+            { performaInvoiceNextNumber: 0 },
+          ],
+        };
+    const updated = await CompanyProfile.findOneAndUpdate(
+      counterFilter,
+      { $set: { performaInvoiceNextNumber: serial + 1 } },
+      { new: true },
+    ).lean();
+    if (updated) {
+      return {
+        invoiceNo: `${PERFORMA_INVOICE_PREFIX}${serial}`,
+        serial,
+        serialText: String(serial),
+        prefix: PERFORMA_INVOICE_PREFIX,
+        suffix: "",
+        financialYear: cleanText(requestedFinancialYear),
+        performaInvoice: true,
+        invoiceType: "PERFORMA",
+      };
+    }
+  }
+
+  throw Object.assign(
+    new Error("Could not allocate the next Performa Invoice number. Retry once."),
+    { statusCode: 409 },
+  );
+}
+
 async function salesInvoiceNumberExistsAcrossSeries({
   tenantKey,
   financialYear,
@@ -1428,6 +1671,25 @@ function applySalesInvoiceScope(filter, auth) {
   return filter;
 }
 
+function applySalesInvoiceTypeFilter(filter, invoiceType = "INVOICE") {
+  const type = normalizedSalesInvoiceType(invoiceType);
+  if (type === "PERFORMA") {
+    filter.invoiceType = "PERFORMA";
+    return filter;
+  }
+
+  const legacyInvoiceType = {
+    $or: [
+      { invoiceType: "INVOICE" },
+      { invoiceType: { $exists: false } },
+      { invoiceType: "" },
+      { invoiceType: null },
+    ],
+  };
+  filter.$and = [...(Array.isArray(filter.$and) ? filter.$and : []), legacyInvoiceType];
+  return filter;
+}
+
 export async function calculateSalesInvoice({
   auth,
   body,
@@ -1486,10 +1748,6 @@ export async function calculateSalesInvoice({
         tenantKey,
         customer,
         selectedTransporterId: body.transporterId || body.selectedTransporterId || "",
-        // New invoices use the city-only transporter list with exact-pincode
-        // transporters excluded. Existing invoices keep the previous matcher so
-        // historical edits do not become invalid merely because this rule changed.
-        invoiceCityOnly: !existingInvoice,
       });
   const firm = await resolveFirmDeliveryLocation(tenantKey);
   const customerGstin =
@@ -1508,9 +1766,20 @@ export async function calculateSalesInvoice({
     requested: body.gstType,
   });
 
-  const warehouseId = cleanText(
-    body.warehouseId || existingInvoice?.warehouseId,
-  );
+  // A multi-warehouse order is legally billed as one invoice. Dispatch and
+  // custody belong to the Main Warehouse; this ID is derived from the order
+  // rather than asked again on the invoice form. Direct invoices stay unchanged.
+  const orderBillingId = cleanText(body.sourceOrderId);
+  const sourceOrderForWarehouse = orderBillingId
+    ? await financialModels(tenantKey, financialYear).SalesOrder.findOne({
+        _id:orderBillingId, tenantKey, financialYear,
+      }).select("mainWarehouseId warehouseId items").lean()
+    : null;
+  if (orderBillingId && !sourceOrderForWarehouse)
+    throw Object.assign(new Error("Order not found for warehouse auto-assignment"),{statusCode:404});
+  const warehouseId = orderBillingId
+    ? cleanText(sourceOrderForWarehouse.mainWarehouseId || sourceOrderForWarehouse.warehouseId)
+    : cleanText(body.warehouseId || existingInvoice?.warehouseId);
   if (!warehouseId)
     throw Object.assign(new Error("Warehouse is mandatory for Sales Invoice"), {
       statusCode: 400,
@@ -1599,6 +1868,7 @@ export async function calculateSalesInvoice({
       Number(p.currentStock || 0) + Number(oldQty.get(String(p._id)) || 0);
     if (
       available < qty &&
+      !orderBillingId &&
       !(body.allowNegativeStock === true || isQuickEntryImport)
     )
       throw Object.assign(
@@ -1607,11 +1877,20 @@ export async function calculateSalesInvoice({
         ),
         { statusCode: 409 },
       );
-    const { saleRate, gradeDiscountPct } = await resolvedProductRate({
+    const { saleRate, gradeDiscountPct: liveGradeDiscountPct } = await resolvedProductRate({
       customer,
       product: p,
       row,
     });
+    // Order-linked invoices must keep the grade captured when the order was
+    // placed, not silently replace it with today's customer grade. Grade is
+    // derived from the persisted order, not an editable browser payload.
+    const savedOrderItem = orderBillingId
+      ? (sourceOrderForWarehouse?.items || []).find((x) => String(x.productId) === String(p._id))
+      : null;
+    const gradeDiscountPct = savedOrderItem
+      ? Math.max(0, Math.min(100, Number(savedOrderItem.gradeDiscountPct ?? savedOrderItem.discountPct ?? 0)))
+      : liveGradeDiscountPct;
     const gstRate = Number(row.gstRate ?? p.gstRate ?? 0),
       basicRate = Number(row.basicRate || basicFromSaleGst(saleRate, gstRate)),
       itemDiscountPct = Number(row.discountPct || 0);
@@ -1902,12 +2181,17 @@ router.get("/sales-invoices/transporter-options", async (req, res) => {
       (customer.addresses || [])[0] ||
       {};
 
-    const matched = await matchInvoiceCityTransporters({
+    const assignedItems = await customerAssignedTransporterOptions({
+      tenantKey: req.auth.tenantKey,
+      customer,
+      billing,
+    });
+    const matched = await matchCustomerTransporters({
       tenantKey: req.auth.tenantKey,
       pincode: billing.pincode,
       city: billing.city,
     });
-    const items = Array.isArray(matched.items) ? matched.items : [];
+    const items = mergeTransporterOptions(assignedItems, Array.isArray(matched.items) ? matched.items : []);
     const eligibleIds = items.map((item) => cleanText(item.transporterId)).filter(Boolean);
     const lastUsedTransporterId = await lastUsedEligibleTransporter({
       tenantKey: req.auth.tenantKey,
@@ -1915,11 +2199,19 @@ router.get("/sales-invoices/transporter-options", async (req, res) => {
       eligibleIds,
       requestedFinancialYear: cleanText(req.query.financialYear),
     });
+    const storedAssignedId = cleanText(customer.assignedTransport);
+    const assignedDefaultId = eligibleIds.includes(storedAssignedId)
+      ? storedAssignedId
+      : assignedItems.length === 1
+        ? cleanText(assignedItems[0].transporterId)
+        : "";
     const defaultTransporterId =
-      lastUsedTransporterId || (items.length === 1 ? cleanText(items[0].transporterId) : "");
+      assignedDefaultId || lastUsedTransporterId || (items.length === 1 ? cleanText(items[0].transporterId) : "");
 
     return ok(res, {
       ...matched,
+      matchType: assignedItems.length ? (customer.transporterMatchType || matched.matchType || "ASSIGNED") : matched.matchType,
+      rule: assignedItems.length ? "CUSTOMER_ASSIGNED_FIRST" : "PINCODE_THEN_CITY",
       items,
       lastUsedTransporterId,
       defaultTransporterId,
@@ -1939,6 +2231,13 @@ router.get("/sales-invoices/next-number", async (req, res) => {
       tenantKey: req.auth.tenantKey,
       requested: req.query.financialYear,
     });
+    const invoiceType = normalizedSalesInvoiceType(req.query.invoiceType);
+    if (invoiceType === "PERFORMA") {
+      return ok(
+        res,
+        await performaInvoiceSeries(req.auth.tenantKey, financialYear),
+      );
+    }
     const customerGlobalId = cleanText(req.query.customerGlobalId || "");
     if (customerGlobalId) {
       const customer = await CustomerLink.findOne({
@@ -2006,10 +2305,11 @@ router.get("/sales-invoices", async (req, res) => {
   const { SalesInvoice } = models;
   const page = Number(req.query.page || 1),
     limit = Math.min(100, Number(req.query.limit || 25));
-  const filter = applySalesInvoiceScope(
+  const invoiceType = normalizedSalesInvoiceType(req.query.invoiceType);
+  const filter = applySalesInvoiceTypeFilter(applySalesInvoiceScope(
     { tenantKey: req.auth.tenantKey, financialYear },
     req.auth,
-  );
+  ), invoiceType);
   if (req.query.customerGlobalId)
     filter.customerGlobalId = cleanText(req.query.customerGlobalId);
   if (req.query.includeDeleted !== "true")
@@ -2034,12 +2334,14 @@ router.get("/sales-invoices", async (req, res) => {
       })),
     }));
   }
-  items = await enrichSalesInvoicesWithCreditState({
-    models,
-    tenantKey: req.auth.tenantKey,
-    financialYear,
-    invoices: items,
-  });
+  if (invoiceType === "INVOICE") {
+    items = await enrichSalesInvoicesWithCreditState({
+      models,
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      invoices: items,
+    });
+  }
   items = await enrichTransactionRows({
     tenantKey: req.auth.tenantKey,
     rows: items,
@@ -2057,18 +2359,21 @@ router.get("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
     }),
     models = financialModels(req.auth.tenantKey, financialYear),
     { SalesInvoice } = models;
-  const filter = applySalesInvoiceScope(
+  const invoiceType = normalizedSalesInvoiceType(req.query.invoiceType);
+  const filter = applySalesInvoiceTypeFilter(applySalesInvoiceScope(
     { _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear },
     req.auth,
-  );
+  ), invoiceType);
   const invoice = await SalesInvoice.findOne(filter).lean();
   if (!invoice) return fail(res, "Sales invoice not found", 404);
-  const [withCredit] = await enrichSalesInvoicesWithCreditState({
-    models,
-    tenantKey: req.auth.tenantKey,
-    financialYear,
-    invoices: [invoice],
-  });
+  const withCredit = invoiceType === "INVOICE"
+    ? (await enrichSalesInvoicesWithCreditState({
+        models,
+        tenantKey: req.auth.tenantKey,
+        financialYear,
+        invoices: [invoice],
+      }))[0]
+    : invoice;
   const [enriched] = await enrichTransactionRows({
     tenantKey: req.auth.tenantKey,
     rows: [withCredit],
@@ -2185,10 +2490,11 @@ router.get(
         req.auth.tenantKey,
         financialYear,
       );
-      const filter = applySalesInvoiceScope(
+      const invoiceType = normalizedSalesInvoiceType(req.query.invoiceType);
+      const filter = applySalesInvoiceTypeFilter(applySalesInvoiceScope(
         { _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear },
         req.auth,
-      );
+      ), invoiceType);
       const invoice = await SalesInvoice.findOne(filter).lean();
       if (!invoice) return fail(res, "Sales invoice not found", 404);
       const pdf = await buildInvoicePdfBuffer({
@@ -2255,9 +2561,23 @@ async function releaseDeletedTestSalesNumber({ tenantKey, financialYear, invoice
 
 router.post("/sales-invoices", async (req, res) => {
   try {
+    const invoiceType = normalizedSalesInvoiceType(req.body.invoiceType);
+    const requestedSourceOrderId = cleanText(req.body.sourceOrderId || "");
+    if (invoiceType === "PERFORMA" && requestedSourceOrderId) {
+      return fail(
+        res,
+        "A Sales Order can only generate an actual Invoice. Create a Performa as a direct document instead.",
+        409,
+      );
+    }
     const calc = await calculateSalesInvoice({
       auth: req.auth,
-      body: req.body,
+      // A Performa is non-posting and must not consume the customer's credit
+      // limit. Credit is checked again when it is converted to an actual invoice.
+      body:
+        invoiceType === "PERFORMA"
+          ? { ...req.body, creditOverrideApproved: true }
+          : req.body,
     });
     const importSource = upper(req.body.importSource || "");
     const preserveRequestedInvoiceNo = new Set([
@@ -2269,7 +2589,13 @@ router.post("/sales-invoices", async (req, res) => {
       req.body.manualInvoiceNo === true ||
       String(req.body.manualInvoiceNo || "").toLowerCase() === "true";
     let series;
-    if (preserveRequestedInvoiceNo && requestedInvoiceNo) {
+    if (invoiceType === "PERFORMA") {
+      series = await performaInvoiceSeries(
+        req.auth.tenantKey,
+        calc.financialYear,
+        { consume: true },
+      );
+    } else if (preserveRequestedInvoiceNo && requestedInvoiceNo) {
       // Import/scan flows already supply the complete printed invoice number.
       series = { invoiceNo: requestedInvoiceNo, manualInvoiceNo: true };
     } else if (manualInvoiceNo) {
@@ -2345,22 +2671,22 @@ router.post("/sales-invoices", async (req, res) => {
     }
     const models = financialModels(calc.tenantKey, calc.financialYear);
     const { SalesInvoice, StockMovement, SalesOrder, OrderEvent } = models;
-    // One last source-of-truth check: never save an unregistered invoice under
-    // the registered series, even if the browser sent an outdated number.
+    // One last source-of-truth check: never save an unregistered actual invoice
+    // under the registered series. Performa numbering is independent of GST type.
     const registeredSale = isRegisteredParty(calc.customer);
     const company = await CompanyProfile.findOne({ tenantKey: calc.tenantKey })
       .select("salesInvoicePrefix salesInvoiceSuffix").lean();
     const expectedPrefix = cleanText(company?.salesInvoicePrefix).replace(/\s+/g, "");
     const expectedSuffix = suffixForFinancialYear(company?.salesInvoiceSuffix, calc.financialYear)
       .replace(/[^0-9A-Za-z]/g, "");
-    if (!registeredSale) {
+    if (invoiceType === "INVOICE" && !registeredSale) {
       const expected = new RegExp(`^${escapeSalesRegex(expectedPrefix)}C\\d+${escapeSalesRegex(expectedSuffix)}$`, "i");
       if (!expected.test(series.invoiceNo))
         return fail(res, "An unregistered sale must have Prefix + C + Serial + FY suffix. Invoice was not saved.", 409);
     }
     // A deleted TEST invoice is archived (not erased), so its number can be
     // reused without colliding with the unique index or strict journal keys.
-    if (!preserveRequestedInvoiceNo) {
+    if (invoiceType === "INVOICE" && !preserveRequestedInvoiceNo) {
       await releaseDeletedTestSalesNumber({
         tenantKey: calc.tenantKey,
         financialYear: calc.financialYear,
@@ -2376,7 +2702,9 @@ router.post("/sales-invoices", async (req, res) => {
     )
       return fail(
         res,
-        preserveRequestedInvoiceNo || manualInvoiceNo
+        invoiceType === "PERFORMA"
+          ? `Performa invoice ${series.invoiceNo} already exists. Retry once to allocate the next number.`
+          : preserveRequestedInvoiceNo || manualInvoiceNo
           ? `Sales invoice ${series.invoiceNo} already exists in FY ${calc.financialYear}`
           : "Generated invoice number already exists. Update the series in Super Admin Profile.",
         409,
@@ -2384,7 +2712,8 @@ router.post("/sales-invoices", async (req, res) => {
 
     // DIRECT billing remains independent. Only a sourceOrderId explicitly supplied by
     // the Order Desk enables order-linked stock reservation and lifecycle updates.
-    const sourceOrderId = cleanText(req.body.sourceOrderId || "");
+    if (requestedSourceOrderId && invoiceType !== "INVOICE") return fail(res,"Order billing supports Tax Invoice only",400);
+    const sourceOrderId = requestedSourceOrderId;
     let sourceOrder = null;
     let sourceOrderItemMap = new Map();
     if (sourceOrderId) {
@@ -2421,6 +2750,13 @@ router.post("/sales-invoices", async (req, res) => {
       sourceOrderItemMap = new Map(
         (sourceOrder.items || []).map((x) => [String(x.productId), x]),
       );
+      // Order Desk produces one complete invoice, not a partial or duplicate bill.
+      if(new Set(calc.items.map(x=>String(x.productId))).size!==calc.items.length)
+        return fail(res,"Order invoice cannot contain duplicate product lines",409);
+      if(calc.items.length!==sourceOrderItemMap.size)
+        return fail(res,"Invoice must contain every packed product in the Sales Order",409);
+      if((sourceOrder.items||[]).some(x=>Number(x.invoicedQty||0)>0))
+        return fail(res,"This order is already invoiced; duplicate invoicing is not allowed",409);
       for (const it of calc.items) {
         const oi = sourceOrderItemMap.get(String(it.productId));
         if (!oi)
@@ -2433,6 +2769,8 @@ router.post("/sales-invoices", async (req, res) => {
           0,
           Number(oi.packedQty || 0) - Number(oi.invoicedQty || 0),
         );
+        if(Math.abs(Number(it.qty||0)-Number(oi.packedQty||0))>0.000001 || Math.abs(available-Number(oi.packedQty||0))>0.000001)
+          return fail(res,`${it.nameSnapshot||it.sku||"Product"}: invoice must include all ${oi.packedQty} packed units. Shortage/damage remains on the order.`,409);
         if (Number(it.qty || 0) > available + 0.000001)
           return fail(
             res,
@@ -2446,6 +2784,9 @@ router.post("/sales-invoices", async (req, res) => {
       tenantKey: calc.tenantKey,
       financialYear: calc.financialYear,
       invoiceNo: series.invoiceNo,
+      invoiceType,
+      performaSerial:
+        invoiceType === "PERFORMA" ? Number(series.serial || 0) : undefined,
       date: calc.date,
       customerGlobalId: calc.customer.globalCustomerId,
       customerNameSnapshot:
@@ -2482,7 +2823,10 @@ router.post("/sales-invoices", async (req, res) => {
       deliveryBoy: req.body.deliveryBoy,
       gstType: calc.gstType,
       remarks: req.body.remarks,
-      eInvoice: normalizedEInvoice(req.body),
+      eInvoice:
+        invoiceType === "PERFORMA"
+          ? normalizedEInvoice({ eInvoice: { status: "NOT_GENERATED" } })
+          : normalizedEInvoice(req.body),
       transportAssignment: calc.transportAssignment,
       branchId: req.body.branchId || req.auth.branch || "",
       warehouseId: calc.warehouseId,
@@ -2492,55 +2836,47 @@ router.post("/sales-invoices", async (req, res) => {
       // Order Desk posting creates a normal POSTED sales invoice. The linked
       // Sales Order separately moves to INVOICED; delivery is completed later
       // from the existing Mark Delivered action on the Sales Invoice page.
-      workflowStatus: req.body.workflowStatus || "POSTED",
+      workflowStatus:
+        invoiceType === "PERFORMA"
+          ? "PERFORMA"
+          : req.body.workflowStatus || "POSTED",
       releasedToWarehouseAt:
-        req.body.workflowStatus === "RELEASED_TO_WAREHOUSE"
+        invoiceType === "INVOICE" && req.body.workflowStatus === "RELEASED_TO_WAREHOUSE"
           ? new Date()
           : undefined,
-      status: "POSTED",
+      status: invoiceType === "PERFORMA" ? "PERFORMA" : "POSTED",
       createdBy: req.auth.sub,
       createdByNameSnapshot: req.auth.name || "",
     });
+
+    // Performa invoices are intentionally non-posting documents: no stock
+    // movement, no ledger/customer receivable, no order lifecycle movement.
+    if (invoiceType === "PERFORMA") {
+      return ok(
+        res,
+        salesInvoiceForAuth(invoice, req.auth),
+        `Performa invoice ${invoice.invoiceNo} created`,
+        201,
+      );
+    }
 
     // Regular Sales Invoice sequencing is derived from invoices already saved in
     // calc.financialYear. Do not update the legacy global CompanyProfile counter;
     // otherwise an old FY could leak its sequence into a new FY.
 
     for (const it of calc.items) {
-      if (sourceOrder) {
-        const usedQty = Number(it.qty || 0);
-        await Product.updateOne(
-          { _id: it.productId, tenantKey: calc.tenantKey },
-          { $inc: { currentStock: -usedQty, reservedStock: -usedQty } },
-        );
-        await Product.updateOne(
-          {
-            _id: it.productId,
-            tenantKey: calc.tenantKey,
-            reservedStock: { $lt: 0 },
-          },
-          { $set: { reservedStock: 0 } },
-        );
-      } else {
-        await Product.updateOne(
-          { _id: it.productId, tenantKey: calc.tenantKey },
-          { $inc: { currentStock: -it.qty } },
-        );
+      // Order invoices are ledger debits but remain PHYSICALLY PENDING.
+      // Do not decrement Product.currentStock, Product.reservedStock or create
+      // outward movement until the Delivery Boy confirms delivery.
+      if (!sourceOrder) {
+        await Product.updateOne({ _id: it.productId, tenantKey: calc.tenantKey }, { $inc: { currentStock: -it.qty } });
+        await StockMovement.create({
+          tenantKey: calc.tenantKey, financialYear: calc.financialYear, date: calc.date,
+          productId: it.productId, warehouseId: calc.warehouseId, type: "SALE",
+          qtyIn: 0, qtyOut: it.qty, landedCost: it.landedCostSnapshot,
+          referenceId: series.invoiceNo,
+        });
       }
-      await StockMovement.create({
-        tenantKey: calc.tenantKey,
-        financialYear: calc.financialYear,
-        date: calc.date,
-        productId: it.productId,
-        warehouseId: sourceOrder
-          ? (sourceOrderItemMap.get(String(it.productId))?.warehouseId || calc.warehouseId)
-          : calc.warehouseId,
-        type: sourceOrder ? "ORDER_SALE" : "SALE",
-        qtyIn: 0,
-        qtyOut: it.qty,
-        landedCost: it.landedCostSnapshot,
-        referenceId: series.invoiceNo,
-      });
     }
     await postSalesAccounting({ ...calc, invoiceNo: series.invoiceNo });
 
@@ -2552,7 +2888,7 @@ router.post("/sales-invoices", async (req, res) => {
         const used = Number(invMap.get(String(oi.productId)) || 0);
         if (used) {
           oi.invoicedQty = Number(oi.invoicedQty || 0) + used;
-          oi.reservedQty = Math.max(0, Number(oi.reservedQty || 0) - used);
+          // Remain reserved until verified delivery (not while merely invoiced).
         }
       }
       sourceOrder.invoice = {
@@ -2569,8 +2905,10 @@ router.post("/sales-invoices", async (req, res) => {
           grandTotal: invoice.grandTotal,
         },
       ];
+      // A single full invoice covers the entire physically packed quantity.
+      // Reported shortages stay recorded rather than being falsely invoiced.
       const complete = (sourceOrder.items || []).every(
-        (x) => Number(x.invoicedQty || 0) >= Number(x.qty || 0) - 0.000001,
+        (x) => Number(x.invoicedQty || 0) >= Number(x.packedQty || 0) - 0.000001,
       );
       const packedConsumed = (sourceOrder.items || []).every(
         (x) =>
@@ -2580,7 +2918,7 @@ router.post("/sales-invoices", async (req, res) => {
       sourceOrder.status = "PROCESSING";
       sourceOrder.lastWorkflowAt = new Date();
       sourceOrder.nextAction = complete
-        ? "Prepare dispatch"
+        ? "Assign Delivery Boy in Main Warehouse"
         : packedConsumed
           ? "Pack / invoice remaining quantity"
           : "Invoice remaining packed quantity";
@@ -2621,6 +2959,9 @@ router.post("/sales-invoices", async (req, res) => {
 });
 
 router.put("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
+  const requestedInvoiceType = normalizedSalesInvoiceType(
+    req.body.invoiceType || req.query.invoiceType,
+  );
   const financialYear = await resolveFinancialYear({
       tenantKey: req.auth.tenantKey,
       requested:
@@ -2629,13 +2970,92 @@ router.put("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
         req.body.financialYear,
     }),
     models = financialModels(req.auth.tenantKey, financialYear);
-  const existing = await models.SalesInvoice.findOne({
+
+  const existingFilter = {
     _id: req.params.id,
     tenantKey: req.auth.tenantKey,
     financialYear,
-    status: "POSTED",
-  });
-  if (!existing) return fail(res, "Posted sales invoice not found", 404);
+    status: requestedInvoiceType === "PERFORMA" ? "PERFORMA" : "POSTED",
+  };
+  applySalesInvoiceTypeFilter(existingFilter, requestedInvoiceType);
+  const existing = await models.SalesInvoice.findOne(existingFilter);
+  if (!existing)
+    return fail(
+      res,
+      requestedInvoiceType === "PERFORMA"
+        ? "Active Performa invoice not found"
+        : "Posted sales invoice not found",
+      404,
+    );
+
+  // A Performa is editable but deliberately non-posting. Do not reverse or
+  // re-post stock/accounting while its commercial details are being changed.
+  if (requestedInvoiceType === "PERFORMA") {
+    try {
+      const calc = await calculateSalesInvoice({
+        auth: req.auth,
+        body: { ...req.body, invoiceType: "PERFORMA", creditOverrideApproved: true },
+      });
+      if (calc.financialYear !== financialYear)
+        return fail(
+          res,
+          `The selected date belongs to FY ${calc.financialYear}. An existing Performa cannot be moved across financial-year databases. Delete/recreate it with the new date.`,
+          409,
+        );
+
+      existing.invoiceType = "PERFORMA";
+      existing.date = calc.date;
+      existing.customerGlobalId = calc.customer.globalCustomerId;
+      existing.customerNameSnapshot =
+        calc.customer.localName || calc.customer.displayIdentifier || "Customer";
+      existing.gstinSnapshot =
+        isRegisteredParty(calc.customer) && calc.customer.displayIdentifier?.length === 15
+          ? calc.customer.displayIdentifier
+          : "";
+      existing.addressSnapshot =
+        req.body.addressSnapshot || calc.customerAddress?.address || "";
+      existing.items = calc.items;
+      existing.subtotal = calc.lineSubtotal;
+      existing.billDiscount = Number(req.body.billDiscount || 0);
+      existing.otherCharges = Number(req.body.otherCharges || 0);
+      existing.taxableTotal = calc.taxableTotal;
+      existing.taxTotal = calc.taxTotal;
+      existing.roundOff = calc.roundOff;
+      existing.grandTotal = calc.grandTotal;
+      existing.creditNoteAmount = 0;
+      existing.netInvoiceAmount = calc.grandTotal;
+      existing.creditNoteStatus = "NONE";
+      existing.grossProfit = calc.grossProfit;
+      existing.grossMarginPct = calc.taxableTotal
+        ? (calc.grossProfit / calc.taxableTotal) * 100
+        : 0;
+      existing.orderNo = req.body.orderNo;
+      existing.arn = req.body.arn;
+      existing.noOfPackages = Number(req.body.noOfPackages || 0);
+      existing.deliveryBoy = req.body.deliveryBoy;
+      existing.gstType = calc.gstType;
+      existing.remarks = req.body.remarks;
+      existing.eInvoice = normalizedEInvoice({ eInvoice: { status: "NOT_GENERATED" } });
+      existing.transportAssignment = calc.transportAssignment;
+      existing.branchId =
+        req.body.branchId || existing.branchId || req.auth.branch || "";
+      existing.warehouseId = calc.warehouseId;
+      existing.warehouseNameSnapshot =
+        calc.warehouse.title || calc.warehouse.reference || "";
+      existing.assignedTo = req.body.assignedTo || existing.assignedTo || "";
+      existing.workflowStatus = "PERFORMA";
+      existing.status = "PERFORMA";
+      await existing.save();
+      return ok(
+        res,
+        salesInvoiceForAuth(existing, req.auth),
+        `Performa invoice ${existing.invoiceNo} updated`,
+      );
+    } catch (e) {
+      return fail(res, e.message, e.statusCode || 400, e.details);
+    }
+  }
+
   const issuedCreditNote = await models.CreditNote.findOne({
     tenantKey: req.auth.tenantKey,
     financialYear,
@@ -2723,6 +3143,7 @@ router.put("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
         referenceId: originalInvoiceNo,
       });
     }
+    existing.invoiceType = "INVOICE";
     existing.invoiceNo = requestedInvoiceNo;
     existing.date = calc.date;
     existing.customerGlobalId = calc.customer.globalCustomerId;
@@ -2795,6 +3216,273 @@ router.put("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
   }
 });
 
+router.post(
+  "/sales-invoices/:id/convert-to-invoice",
+  requireObjectIdParam,
+  async (req, res) => {
+    const sourceFinancialYear = await resolveFinancialYear({
+      tenantKey: req.auth.tenantKey,
+      requested:
+        req.body.sourceFinancialYear ||
+        req.query.financialYear ||
+        req.body.financialYear,
+    });
+    const sourceModels = financialModels(req.auth.tenantKey, sourceFinancialYear);
+
+    let performa = null;
+    let createdInvoice = null;
+    let targetModels = null;
+    const stockApplied = [];
+
+    try {
+      // Claim the Performa before doing any posting work so a double click cannot
+      // generate two actual invoices from the same source document.
+      performa = await sourceModels.SalesInvoice.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          tenantKey: req.auth.tenantKey,
+          financialYear: sourceFinancialYear,
+          invoiceType: "PERFORMA",
+          status: "PERFORMA",
+        },
+        {
+          $set: {
+            status: "CONVERTING",
+            workflowStatus: "CONVERTING",
+          },
+        },
+        { new: true },
+      );
+      if (!performa) {
+        const previous = await sourceModels.SalesInvoice.findOne({
+          _id: req.params.id,
+          tenantKey: req.auth.tenantKey,
+          financialYear: sourceFinancialYear,
+          invoiceType: "PERFORMA",
+        })
+          .select("status convertedInvoiceNo")
+          .lean();
+        if (previous?.status === "CONVERTED")
+          return fail(
+            res,
+            `This Performa is already converted to Invoice ${previous.convertedInvoiceNo || ""}`.trim(),
+            409,
+          );
+        return fail(res, "Active Performa invoice not found", 404);
+      }
+
+      const invoiceDate =
+        req.body.invoiceDate || req.body.date || new Date().toISOString();
+      const items = (performa.items || []).map((it) => {
+        const discountPct = Number(it.discountPct || 0);
+        const divisor = 1 - discountPct / 100;
+        const basicRate =
+          divisor > 0.000001
+            ? Number(it.effectiveRate || 0) / divisor
+            : basicFromSaleGst(it.rate, it.gstRateSnapshot);
+        return {
+          productId: String(it.productId || ""),
+          qty: Number(it.qty || 0),
+          mrp: Number(it.mrpSnapshot || 0),
+          saleRate: Number(it.rate || 0),
+          basicRate,
+          discountPct,
+          gstRate: Number(it.gstRateSnapshot || 0),
+        };
+      });
+      const calcBody = {
+        date: invoiceDate,
+        customerGlobalId: performa.customerGlobalId,
+        warehouseId: performa.warehouseId,
+        transporterId: performa.transportAssignment?.transporterId || "",
+        gstType: performa.gstType,
+        billDiscount: Number(performa.billDiscount || 0),
+        otherCharges: Number(performa.otherCharges || 0),
+        orderNo: performa.orderNo,
+        arn: performa.arn,
+        noOfPackages: Number(performa.noOfPackages || 0),
+        deliveryBoy: performa.deliveryBoy,
+        remarks: performa.remarks,
+        branchId: performa.branchId,
+        assignedTo: performa.assignedTo,
+        items,
+      };
+      // This is the point at which a quote becomes a real sale. Re-check stock,
+      // live customer grade pricing and credit rules using the normal invoice engine.
+      const calc = await calculateSalesInvoice({ auth: req.auth, body: calcBody });
+      let series;
+      if (!isRegisteredParty(calc.customer)) {
+        series = {
+          invoiceNo: await allocateCashInvoiceNumber({
+            tenantKey: calc.tenantKey,
+            financialYear: calc.financialYear,
+            customerGlobalId: calc.customer.globalCustomerId,
+          }),
+          cashInvoice: true,
+        };
+      } else {
+        series = await salesInvoiceSeries(
+          req.auth.tenantKey,
+          calc.financialYear,
+          { consume: true },
+        );
+      }
+
+      targetModels = financialModels(calc.tenantKey, calc.financialYear);
+      if (
+        await targetModels.SalesInvoice.exists({
+          tenantKey: calc.tenantKey,
+          financialYear: calc.financialYear,
+          invoiceNo: series.invoiceNo,
+        })
+      )
+        throw Object.assign(
+          new Error(
+            `Generated sales invoice ${series.invoiceNo} already exists. Retry conversion once.`,
+          ),
+          { statusCode: 409 },
+        );
+
+      createdInvoice = await targetModels.SalesInvoice.create({
+        tenantKey: calc.tenantKey,
+        financialYear: calc.financialYear,
+        invoiceNo: series.invoiceNo,
+        invoiceType: "INVOICE",
+        sourcePerformaId: String(performa._id),
+        sourcePerformaNo: performa.invoiceNo,
+        date: calc.date,
+        customerGlobalId: calc.customer.globalCustomerId,
+        customerNameSnapshot:
+          calc.customer.localName || calc.customer.displayIdentifier || "Customer",
+        gstinSnapshot:
+          isRegisteredParty(calc.customer) && calc.customer.displayIdentifier?.length === 15
+            ? calc.customer.displayIdentifier
+            : "",
+        addressSnapshot: calc.customerAddress?.address || performa.addressSnapshot || "",
+        items: calc.items,
+        subtotal: calc.lineSubtotal,
+        billDiscount: Number(performa.billDiscount || 0),
+        otherCharges: Number(performa.otherCharges || 0),
+        taxableTotal: calc.taxableTotal,
+        taxTotal: calc.taxTotal,
+        roundOff: calc.roundOff,
+        grandTotal: calc.grandTotal,
+        grossProfit: calc.grossProfit,
+        grossMarginPct: calc.taxableTotal
+          ? (calc.grossProfit / calc.taxableTotal) * 100
+          : 0,
+        creditNoteAmount: 0,
+        netInvoiceAmount: calc.grandTotal,
+        creditNoteStatus: "NONE",
+        billingMode: "DIRECT",
+        sourceOrderId: "",
+        orderNo: performa.orderNo,
+        arn: performa.arn,
+        noOfPackages: Number(performa.noOfPackages || 0),
+        deliveryBoy: performa.deliveryBoy,
+        gstType: calc.gstType,
+        remarks: performa.remarks,
+        eInvoice: normalizedEInvoice({ eInvoice: { status: "NOT_GENERATED" } }),
+        transportAssignment: calc.transportAssignment,
+        branchId: performa.branchId || req.auth.branch || "",
+        warehouseId: calc.warehouseId,
+        warehouseNameSnapshot:
+          calc.warehouse.title || calc.warehouse.reference || "",
+        assignedTo: performa.assignedTo || "",
+        workflowStatus: "POSTED",
+        status: "POSTED",
+        createdBy: req.auth.sub,
+        createdByNameSnapshot: req.auth.name || "",
+      });
+
+      for (const it of calc.items) {
+        await Product.updateOne(
+          { _id: it.productId, tenantKey: calc.tenantKey },
+          { $inc: { currentStock: -Number(it.qty || 0) } },
+        );
+        stockApplied.push({ productId: it.productId, qty: Number(it.qty || 0) });
+        await targetModels.StockMovement.create({
+          tenantKey: calc.tenantKey,
+          financialYear: calc.financialYear,
+          date: calc.date,
+          productId: it.productId,
+          warehouseId: calc.warehouseId,
+          type: "SALE",
+          qtyIn: 0,
+          qtyOut: Number(it.qty || 0),
+          landedCost: Number(it.landedCostSnapshot || 0),
+          referenceId: createdInvoice.invoiceNo,
+        });
+      }
+      await postSalesAccounting({ ...calc, invoiceNo: createdInvoice.invoiceNo });
+
+      performa.status = "CONVERTED";
+      performa.workflowStatus = "CONVERTED";
+      performa.convertedInvoiceId = String(createdInvoice._id);
+      performa.convertedInvoiceNo = createdInvoice.invoiceNo;
+      performa.convertedAt = new Date();
+      performa.convertedBy = req.auth.sub;
+      performa.convertedByNameSnapshot = req.auth.name || "";
+      await performa.save();
+
+      return ok(
+        res,
+        salesInvoiceForAuth(createdInvoice, req.auth),
+        `${performa.invoiceNo} converted to Sales Invoice ${createdInvoice.invoiceNo}`,
+        201,
+      );
+    } catch (e) {
+      // Roll back anything applied after the source Performa was claimed. This
+      // keeps a failed conversion retryable and prevents stock from drifting.
+      if (createdInvoice && targetModels) {
+        try {
+          await reversePostedTransaction({
+            tenantKey: req.auth.tenantKey,
+            financialYear: createdInvoice.financialYear,
+            transactionId: createdInvoice.invoiceNo,
+            reason: "Performa conversion rolled back",
+          });
+        } catch {}
+        try {
+          await targetModels.StockMovement.deleteMany({
+            tenantKey: req.auth.tenantKey,
+            financialYear: createdInvoice.financialYear,
+            referenceId: createdInvoice.invoiceNo,
+            type: "SALE",
+          });
+        } catch {}
+        for (const row of stockApplied) {
+          try {
+            await Product.updateOne(
+              { _id: row.productId, tenantKey: req.auth.tenantKey },
+              { $inc: { currentStock: Number(row.qty || 0) } },
+            );
+          } catch {}
+        }
+        try {
+          await targetModels.SalesInvoice.deleteOne({
+            _id: createdInvoice._id,
+            tenantKey: req.auth.tenantKey,
+          });
+        } catch {}
+      }
+      if (performa) {
+        try {
+          await sourceModels.SalesInvoice.updateOne(
+            {
+              _id: performa._id,
+              tenantKey: req.auth.tenantKey,
+              status: "CONVERTING",
+            },
+            { $set: { status: "PERFORMA", workflowStatus: "PERFORMA" } },
+          );
+        } catch {}
+      }
+      return fail(res, e.message, e.statusCode || 400, e.details);
+    }
+  },
+);
+
 router.delete("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
   const financialYear = await resolveFinancialYear({
       tenantKey: req.auth.tenantKey,
@@ -2807,6 +3495,23 @@ router.delete("/sales-invoices/:id", requireObjectIdParam, async (req, res) => {
     financialYear,
   });
   if (!invoice) return fail(res, "Sales invoice not found", 404);
+
+  // Performa rows never post stock or accounting, so a hard delete only needs
+  // to remove the source document. A converted actual Invoice is a separate row.
+  if (normalizedSalesInvoiceType(invoice.invoiceType) === "PERFORMA") {
+    const invoiceNo = invoice.invoiceNo;
+    const id = String(invoice._id);
+    await models.SalesInvoice.deleteOne({
+      _id: invoice._id,
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+    });
+    return ok(
+      res,
+      { _id: id, invoiceNo, deleted: true, hardDeleted: true },
+      `Performa invoice ${invoiceNo} permanently deleted from database`,
+    );
+  }
 
   // Old builds used soft delete. If one of those legacy DELETED/CANCELLED rows is
   // deleted again, physically remove it without running stock/account reversal twice.
@@ -3352,6 +4057,11 @@ router.post(
     const from = String(invoice.workflowStatus || "POSTED").toUpperCase(),
       to = String(req.body.toStatus || "").toUpperCase();
     if (!to) return fail(res, "toStatus is required", 400);
+    // All order-linked deliveries/cancellations must follow the Delivery Boy + Order Desk workflow.
+    // Direct invoices continue to use this endpoint.
+    if (invoice.sourceOrderId && ["DELIVERED", "HANDED_TO_TRANSPORTER", "CANCELLED"].includes(to)) {
+      return fail(res, "Order invoice delivery/cancellation must use Phase 2 delivery/cancellation verification", 409);
+    }
     const transition = `${from}>${to}`;
     if (req.auth.role !== "MASTER" && req.auth.role !== "SUPERADMIN") {
       const allowed = req.auth.workflowTransitions?.salesInvoice || [];
@@ -3514,6 +4224,16 @@ router.post(
           financialYear,
         });
         if (sourceOrder && !["CANCELLED", "REJECTED", "CLOSED"].includes(upper(sourceOrder.workflowStatus))) {
+          if (upper(sourceOrder.workflowStatus) === "DELIVERED") return fail(res,"This order was already delivered",409);
+          // One-way transfer from pending to outward on confirmed delivery.
+          for (const line of invoice.items || []) {
+            const qty=Number(line.qty || 0);
+            if (!(qty>0)) continue;
+            await Product.updateOne({_id:line.productId,tenantKey:req.auth.tenantKey},{$inc:{currentStock:-qty,reservedStock:-qty}});
+            await Product.updateOne({_id:line.productId,tenantKey:req.auth.tenantKey,reservedStock:{$lt:0}},{$set:{reservedStock:0}});
+            await StockMovement.create({tenantKey:req.auth.tenantKey,financialYear,date:new Date(),productId:line.productId,warehouseId:sourceOrder.mainWarehouseId||sourceOrder.warehouseId||invoice.warehouseId,type:"DELIVERY_SALE",qtyIn:0,qtyOut:qty,referenceId:invoice.invoiceNo});
+          }
+          for(const item of sourceOrder.items || []) item.reservedQty=0;
           const fromStatus = upper(sourceOrder.workflowStatus || "INVOICED");
           sourceOrder.workflowStatus = "DELIVERED";
           sourceOrder.status = "CONVERTED";
@@ -4302,6 +5022,295 @@ function transactionQueryDateRange(req) {
   return Object.keys(range).length ? range : null;
 }
 
+
+// Keep route authorization consistent with plan/role PAGE_PERMISSION_MAP: the
+// JWT carries action-specific permission keys (screen.view / screen.create).
+const canManualVoucherAction=(auth,channel,transactionType,action="create")=>{
+  if(auth?.role==="MASTER")return true;
+  const granted=new Set(auth?.permissions||[]);
+  if(granted.has("*"))return true;
+  const byType=upper(transactionType)==="PAYMENT"?"dms.transaction.payment":"dms.transaction.receipt";
+  const shared=channel==="cash"
+    ? ["dms.transaction.cashbook","dms.transaction.cashaccount"]
+    : ["dms.finance_reports.bank_statement"];
+  return [byType,...shared].some(p=>granted.has(`${p}.${action}`));
+};
+const canViewCompanyCashbook=auth=>{
+  if(auth?.role==="MASTER")return true;
+  const granted=new Set(auth?.permissions||[]);
+  return granted.has("*")||["dms.transaction.cashbook","dms.transaction.cashaccount","dms.transaction.receipt","dms.transaction.payment"].some(p=>granted.has(`${p}.view`));
+};
+
+// Native Excel export (XLSX), authorized with the same ceilings as PDF.
+router.post("/export-table-xlsx",async(req,res)=>{
+ try{
+  const granted=new Set(req.auth?.permissions||[]);
+  const authorized=req.auth?.role==="MASTER"||isAdminAuth(req.auth)||granted.has("*")||
+    ["dms.finance_reports.bank_statement.view","dms.transaction.cashbook.view","dms.transaction.cashaccount.view"].some(p=>granted.has(p));
+  if(!authorized)return fail(res,"Transaction export permission required",403);
+  const headers=Array.isArray(req.body.headers)?req.body.headers:[];
+  const rows=Array.isArray(req.body.rows)?req.body.rows:[];
+  if(!headers.length||headers.length>14||rows.length>5000||!rows.every(r=>Array.isArray(r)&&r.length===headers.length))return fail(res,"Invalid export table or too many rows",400);
+  const asText=x=>String(x??"").replace(/[\u0000-\u001f]/g," ").slice(0,350);
+  const sheet=XLSX.utils.aoa_to_sheet([headers.map(asText),...rows.map(row=>row.map(asText))]);
+  sheet["!cols"]=headers.map((h,i)=>({wch:Math.min(50,Math.max(12,asText(h).length,...rows.slice(0,250).map(row=>asText(row[i]).length)))}));
+  const workbook=XLSX.utils.book_new();XLSX.utils.book_append_sheet(workbook,sheet,"Transactions");
+  const file=XLSX.write(workbook,{type:"buffer",bookType:"xlsx"});
+  const name=cleanText(req.body.kind).toLowerCase().replace(/[^a-z0-9-]/g,"-")||"transactions";
+  res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition",`attachment; filename="${name}.xlsx"`);
+  return res.send(file);
+ }catch(e){return fail(res,e.message||"Excel export failed",400);}
+});
+
+// Shared export: the user downloads the filtered table they are viewing.
+// PDFKit is already a backend dependency; no additional frontend packages.
+router.post("/export-table-pdf",async(req,res)=>{
+ try{
+  const authorized=req.auth?.role==="MASTER"||isAdminAuth(req.auth)||new Set(req.auth?.permissions||[]).has("*")||
+   ["dms.finance_reports.bank_statement.view","dms.transaction.cashbook.view","dms.transaction.cashaccount.view"]
+    .some(p=>(req.auth?.permissions||[]).includes(p));
+  if(!authorized)return fail(res,"Transaction export permission required",403);
+  const kind=cleanText(req.body.kind).slice(0,70),scope=cleanText(req.body.scope).slice(0,110);
+  const headers=Array.isArray(req.body.headers)?req.body.headers.slice(0,14).map(x=>cleanText(x).slice(0,100)):[];
+  const rows=Array.isArray(req.body.rows)?req.body.rows:[];
+  if(!headers.length||headers.length>14||rows.length>5000||!rows.every(r=>Array.isArray(r)&&r.length===headers.length))return fail(res,"Invalid export table or too many rows",400);
+  const printable=x=>String(x??"").replace(/₹/g,"Rs. ").replace(/[\u0000-\u001f]/g," ").slice(0,350);
+  const doc=new PDFDocument({size:"A4",layout:"landscape",margin:30,bufferPages:true});
+  res.setHeader("Content-Type","application/pdf");
+  res.setHeader("Content-Disposition",`attachment; filename="${kind.toLowerCase().replace(/[^a-z0-9-]/g,"-")||"transactions"}.pdf"`);
+  doc.pipe(res);
+  const left=30,w=(doc.page.width-60)/headers.length,rowHeight=24;
+  doc.font("Helvetica-Bold").fontSize(14).fillColor("#101827").text(`${printable(kind)} | ${printable(scope)}`);
+  doc.moveDown(0.5);
+  let y=doc.y;
+  const drawHeading=()=>{
+   doc.font("Helvetica-Bold").fontSize(8);
+   headers.forEach((h,i)=>{doc.rect(left+i*w,y,w,rowHeight).fillAndStroke("#e8eef5","#cbd5e1");doc.fillColor("#111827").text(printable(h),left+i*w+3,y+5,{width:w-6,height:rowHeight-8,align:"center",ellipsis:true});});
+   y+=rowHeight;
+  };
+  drawHeading();
+  for(const [index,row] of rows.entries()){
+   if(y+rowHeight>doc.page.height-37){doc.addPage();y=35;drawHeading();}
+   doc.font("Helvetica").fontSize(7).fillColor("#111827");
+   for(let i=0;i<headers.length;i++){
+    doc.rect(left+i*w,y,w,rowHeight).fillAndStroke(index%2?"#f8fafc":"#ffffff","#e2e8f0");
+    doc.fillColor("#111827").text(printable(row[i]),left+i*w+3,y+4,{width:w-6,height:rowHeight-7,align:"center",ellipsis:true});
+   }
+   y+=rowHeight;
+  }
+  doc.end();
+ }catch(e){if(!res.headersSent)return fail(res,e.message||"PDF export failed",400);res.end();}
+});
+
+// Company CASH book: canonical posted SYS_CASH ledger movements, never BANK.
+// Running balance uses the financial-year opening balances and the complete FY
+// journal before the user's month/search filters are applied.
+router.get("/cashbook/latest-month",async(req,res)=>{
+  if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing cashbook view permission",403);
+  try{
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
+    const {LedgerEntry}=financialModels(req.auth.tenantKey,financialYear);
+    const row=await LedgerEntry.findOne({tenantKey:req.auth.tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH"}).sort({date:-1,_id:-1}).select("date").lean();
+    return ok(res,{financialYear,month:row?.date?new Date(row.date).getUTCMonth()+1:null});
+  }catch(e){return fail(res,e.message||"Could not determine cash month",400);}
+});
+
+async function cashFyOpening({tenantKey,financialYear,ledgerOpenings}){
+  const rows=new Map();
+  for(const ledger of ledgerOpenings)for(const row of (ledger.openingBalances||[])){
+    const year=String(row.financialYear||"");
+    rows.set(year,(rows.get(year)||0)+(upper(row.type)==="CR"?-1:1)*num(row.amount));
+  }
+  const profile=await CompanyProfile.findOne({tenantKey}).select("firstCashFinancialYear firstCashOpeningBalance").lean();
+  const first=String(profile?.firstCashFinancialYear||"");
+  const firstAmt=money2(profile?.firstCashOpeningBalance||0);
+  if(first)rows.set(first,firstAmt);
+  if(rows.has(financialYear))return money2(rows.get(financialYear));
+  // Roll the first-year cash opening forward across FY boundaries; each year
+  // remains based on actual posted cash journal entries, not on the selected month.
+  const prior=[...rows.keys()].filter(y=>/^\d{4}-\d{2}$/.test(y)&&y<financialYear).sort();
+  if(!prior.length)return 0;
+  let current=prior[0],balance=money2(rows.get(current));
+  const targetYear=Number(financialYear.slice(0,4));
+  for(let y=Number(current.slice(0,4));y<targetYear && y<Number(current.slice(0,4))+25;y++){
+    const fy=`${y}-${String((y+1)%100).padStart(2,"0")}`;
+    if(rows.has(fy))balance=money2(rows.get(fy));
+    const {LedgerEntry:PriorEntry}=financialModels(tenantKey,fy);
+    const result=await PriorEntry.aggregate([{$match:{tenantKey,financialYear:fy,status:"POSTED",accountCode:"SYS_CASH"}},{$group:{_id:null,debit:{$sum:"$debit"},credit:{$sum:"$credit"}}}]);
+    balance=money2(balance+num(result[0]?.debit)-num(result[0]?.credit));
+  }
+  return balance;
+}
+
+router.get("/cashbook", async (req, res) => {
+  if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing cashbook view permission",403);
+  try {
+    const tenantKey=req.auth.tenantKey;
+    const financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
+    const {LedgerEntry,Receipt,Payment}=financialModels(tenantKey,financialYear);
+    const [openings,lines]=await Promise.all([
+      CompanyLedger.find({tenantKey,systemAccountCode:"SYS_CASH",status:{$ne:"INACTIVE"}}).select("openingBalances").lean(),
+      LedgerEntry.find({tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH"})
+        .select("_id transactionId transactionType date partyGlobalId debit credit narration createdAt")
+        .sort({date:1,createdAt:1,_id:1}).lean(),
+    ]);
+    const openingBalance=await cashFyOpening({tenantKey,financialYear,ledgerOpenings:openings});
+    const receiptIds=[...new Set(lines.filter(x=>["RECEIPT","BANK_STATEMENT_RECEIPT"].includes(x.transactionType)).map(x=>x.transactionId))];
+    const paymentIds=[...new Set(lines.filter(x=>["PAYMENT","BANK_STATEMENT_PAYMENT"].includes(x.transactionType)).map(x=>x.transactionId))];
+    const [receipts,payments]=await Promise.all([
+      Receipt.find({tenantKey,financialYear,receiptNo:{$in:receiptIds}}).select("receiptNo partyNameSnapshot mode remarks").lean(),
+      Payment.find({tenantKey,financialYear,paymentNo:{$in:paymentIds}}).select("paymentNo partyNameSnapshot mode remarks").lean(),
+    ]);
+    const partyNames=new Map([
+      ...receipts.map(x=>[String(x.receiptNo),x.partyNameSnapshot||""]),
+      ...payments.map(x=>[String(x.paymentNo),x.partyNameSnapshot||""]),
+    ]);
+    let balance=openingBalance;
+    const all=lines.map(line=>{
+      balance=money2(balance+num(line.debit)-num(line.credit));
+      return {
+        _id:String(line._id),transactionId:line.transactionId||"",date:line.date,
+        transactionType:line.transactionType||"",type:num(line.debit)>0?"RECEIPT":"PAYMENT",
+        partyName:partyNames.get(String(line.transactionId))||line.partyGlobalId||"—",
+        partyGlobalId:line.partyGlobalId||"",
+        remarks:line.narration||"",mode:"CASH",debit:num(line.credit),credit:num(line.debit),
+        runningBalance:balance,
+      };
+    });
+    const closingBalance=money2(balance);
+    const from=String(req.query.fromDate||"");const to=String(req.query.toDate||"");
+    const dateRange=transactionQueryDateRange(req);
+    const type=upper(req.query.type);const q=cleanText(req.query.q).toLocaleLowerCase("en-IN");
+    const filtered=all.filter(x=>{
+      const day=new Date(x.date).toISOString().slice(0,10);
+      if(dateRange&&((from&&day<from)||(to&&day>to)))return false;
+      if((type==="RECEIPT"||type==="PAYMENT")&&x.type!==type)return false;
+      if(q&&!`${x.transactionId} ${x.transactionType} ${x.partyName} ${x.remarks}`.toLocaleLowerCase("en-IN").includes(q))return false;
+      return true;
+    }).reverse();
+    const page=Math.max(1,Number(req.query.page)||1);
+    const limit=Math.min(200,Math.max(1,Number(req.query.limit)||50));
+    return ok(res,{items:filtered.slice((page-1)*limit,page*limit),meta:pageMeta(page,limit,filtered.length),
+      openingBalance,closingBalance,financialYear});
+  } catch(e){return fail(res,e.message||"Unable to read Cashbook",e.statusCode||400);}
+});
+
+// Channel-scoped direct vouchers. We enforce CASH/BANK on the server rather
+// than trusting form fields or spreadsheet modes. Existing receipt/payment
+// creation and bank-statement upload endpoints are deliberately untouched.
+async function postManualTransactionVoucher({auth,channel,input,recalculate=true}){
+  const tenantKey=auth.tenantKey;
+  const mode=channel==="cash"?"CASH":"BANK";
+  const transactionType=upper(input.transactionType||input.type);
+  if(!["RECEIPT","PAYMENT"].includes(transactionType))throw Object.assign(new Error("Transaction Mode must be Receipt or Payment"),{statusCode:400});
+  if(!canManualVoucherAction(auth,channel,transactionType))throw Object.assign(new Error("Missing permission to create this receipt/payment"),{statusCode:403});
+  if(input.mode&&upper(input.mode)!==mode)throw Object.assign(new Error(`This page accepts ${mode} entries only`),{statusCode:400});
+  const date=parseStrictVoucherDate(input.date);
+  const financialYear=financialYearFromDate(date);
+  const amount=Number(input.amount);
+  if(!Number.isFinite(amount)||amount<=0)throw Object.assign(new Error("Amount must be greater than zero"),{statusCode:400});
+  const party=await resolveVoucherPostingParty(tenantKey,input.partyGlobalId||input.party||input.partyName,input.partyType);
+  const bank=await resolveTransactionBank(tenantKey,mode,channel==="bank"?input.bankAccountId:"");
+  if(channel==="bank"&&!bank.bankAccountId)throw Object.assign(new Error("Select an active Bank Account"),{statusCode:400});
+  const {Receipt,Payment}=financialModels(tenantKey,financialYear);
+  const isReceipt=transactionType==="RECEIPT";
+  const Model=isReceipt?Receipt:Payment;
+  const noField=isReceipt?"receiptNo":"paymentNo";
+  const voucherNo=cleanText(input[noField])||makeId(isReceipt?"RCT":"PAY");
+  if(await Model.exists({tenantKey,financialYear,[noField]:voucherNo}))throw Object.assign(new Error("Voucher number already exists in this FY"),{statusCode:409});
+  const entry={tenantKey,financialYear,[noField]:voucherNo,sourceKey:voucherNo,date,
+    partyType:party.type,partyNameSnapshot:party.name,amount,mode,remarks:cleanText(input.remarks),
+    bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,status:"POSTED",
+    createdBy:auth.sub,createdByNameSnapshot:auth.name||"",reference:""};
+  const record=await Model.create(isReceipt?{
+    ...entry,customerGlobalId:party.id,bounceStatus:"CLEAR",receiptWorkflowStatus:"DMS_DIRECT",
+    customerOtpStatus:"NOT_REQUIRED",cashierOtpStatus:"NOT_REQUIRED",ledgerPostedAt:new Date(),
+  }:{...entry,partyGlobalId:party.id});
+  const cashBankLine={accountCode:bank.accountCode,ledgerId:bank.ledgerId,bankAccountId:bank.bankAccountId};
+  const partyLine={accountCode:party.accountCode,ledgerId:party.ledgerId};
+  try{
+    await postBalancedEntries({tenantKey,financialYear,transactionId:voucherNo,transactionType,date,
+      partyGlobalId:party.id,narration:entry.remarks||`${transactionType} ${voucherNo}`,
+      entries:isReceipt?[{...cashBankLine,debit:amount},{...partyLine,credit:amount}]
+                       :[{...partyLine,debit:amount},{...cashBankLine,credit:amount}],
+    });
+  }catch(e){await record.deleteOne();throw e;}
+  let balanceWarning="";
+  if(recalculate&&channel==="bank"){
+    try{await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId:bank.bankAccountId});}
+    catch(e){balanceWarning=e.message;}
+  }
+  return {record:record.toObject(),financialYear,bankAccountId:bank.bankAccountId,balanceWarning};
+}
+
+router.post("/manual-entry/:channel",async(req,res)=>{
+  try{
+    const channel=String(req.params.channel||"").toLowerCase();
+    if(!["cash","bank"].includes(channel))return fail(res,"Invalid transaction channel",400);
+    const result=await postManualTransactionVoucher({auth:req.auth,channel,input:req.body});
+    return ok(res,result,"Transaction posted",201);
+  }catch(e){return fail(res,e.message||"Could not post transaction",e.statusCode||400);}
+});
+
+router.post("/manual-bulk/:channel",upload.single("file"),async(req,res)=>{
+  try{
+    const channel=String(req.params.channel||"").toLowerCase();
+    if(!["cash","bank"].includes(channel))return fail(res,"Invalid transaction channel",400);
+    if(!req.file?.buffer)return fail(res,"Excel or CSV file is required",400);
+    let rows;
+    try{rows=readRows(req.file.buffer,{preserveText:true,formattedDates:true});}
+    catch{return fail(res,"Could not read Excel/CSV file",400);}
+    if(!rows.length)return fail(res,"Uploaded file has no records",400);
+    if(rows.length>2000)return fail(res,"Maximum 2,000 rows per upload",400);
+    const fields=[
+      {key:"transactionType",label:"Transaction Mode",aliases:["transaction type","type","receipt/payment"],required:true},
+      {key:"date",label:"Date",aliases:["transaction date"],required:true},
+      {key:"partyName",label:"Party Name / ID",aliases:["party name","party","customer","customer id"],required:true},
+      {key:"partyType",label:"Party Type",aliases:["category"]},
+      {key:"amount",label:"Amount",required:true},
+      {key:"remarks",label:"Remarks",aliases:["remark","narration","description"]},
+      {key:"bankAccountId",label:"Bank Account ID",aliases:["bank account","bank id"]},
+    ];
+    const cols=resolveColumns(rows[0],fields);
+    const missing=fields.filter(x=>x.required&&!cols[x.key]).map(x=>x.label);
+    if(missing.length)return fail(res,`Missing column(s): ${missing.join(", ")}`,400);
+    const records=rows.map((row,index)=>{
+      const input={};for(const f of fields){const value=valueFor(row,cols[f.key]);if(value!==undefined&&value!=="")input[f.key]=value;}
+      input.bankAccountId=input.bankAccountId||req.body.bankAccountId||"";
+      return {row:index+2,input};
+    });
+    // Whole-file shape validation before any posting; invalid dates are never guessed.
+    const errors=[];
+    for(const {row,input} of records){
+      try{
+        parseStrictVoucherDate(input.date);
+        if(!["RECEIPT","PAYMENT"].includes(upper(input.transactionType)))throw new Error("Transaction Mode must be Receipt or Payment");
+        if(!canManualVoucherAction(req.auth,channel,input.transactionType))throw new Error("Not permitted to create this receipt/payment");
+        if(!cleanText(input.partyName))throw new Error("Party Name / ID is mandatory");
+        if(!(Number(input.amount)>0))throw new Error("Amount must be greater than zero");
+        if(channel==="bank"&&!input.bankAccountId)throw new Error("Bank Account required");
+      }catch(e){errors.push({row,error:e.message});}
+    }
+    if(errors.length)return fail(res,"Bulk upload rejected: correct the invalid rows",400,{errors:errors.slice(0,100)});
+    let inserted=0;const bankYears=new Map();
+    for(const {row,input} of records){
+      try{
+        const out=await postManualTransactionVoucher({auth:req.auth,channel,input,recalculate:false});
+        inserted++;
+        if(channel==="bank")bankYears.set(`${out.financialYear}::${out.bankAccountId}`,out);
+      }catch(e){errors.push({row,error:e.message});}
+    }
+    const warnings=[];
+    for(const {financialYear,bankAccountId} of bankYears.values()){
+      try{await recalculateBankRunningBalancesForVoucher({tenantKey:req.auth.tenantKey,financialYear,bankAccountId});}
+      catch(e){warnings.push(e.message);}
+    }
+    return ok(res,{received:records.length,inserted,invalid:errors.length,errors:errors.slice(0,100),warnings,
+      partial:errors.length>0},errors.length?"Some rows were rejected; accepted rows posted":"Transactions posted",201);
+  }catch(e){return fail(res,e.message||"Bulk upload failed",e.statusCode||400);}
+});
+
 router.get("/receipts", async (req, res) => {
   const financialYear = await resolveFinancialYear({
       tenantKey: req.auth.tenantKey,
@@ -4419,7 +5428,7 @@ router.get("/cashier/handovers", async (req, res) => {
       .select("+handoverOtpCode")
       .sort({ date: -1, createdAt: -1 }).limit(500).lean();
     const items = rows.map((m) => ({
-      _id: String(m._id), movementNo: m.movementNo, date: m.date, amount: money2(m.amount),
+      _id: String(m._id), movementNo: m.movementNo, date: m.date, amount: money2(m.amount), cashAmount: money2(m.cashAmount ?? m.amount), bankAmount: money2(m.bankAmount ?? 0),
       salespersonId: m.salespersonId, salespersonName: m.salespersonNameSnapshot || "",
       cashierId: m.recipientUserId || "", cashierName: m.recipientName || "",
       status: m.status, handoverWorkflowStatus: m.handoverWorkflowStatus || "LEGACY",
@@ -4437,6 +5446,46 @@ router.get("/cashier/handovers", async (req, res) => {
       cashierReceivedAt: m.cashierReceivedAt || null,
     }));
     return ok(res, { financialYear, items });
+  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+// Cashier can issue a replacement OTP for an expired handover WITHOUT creating
+// another receipt or splitting the one-OTP-per-bundle contract.
+router.post("/cashier/handovers/:id/otp/refresh", async (req, res) => {
+  try {
+    const financialYear = await resolveFinancialYear({
+      tenantKey: req.auth.tenantKey,
+      requested: req.body.financialYear || req.query.financialYear,
+    });
+    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const movement = await SalespersonCashMovement.findOne({
+      _id: req.params.id,
+      tenantKey: req.auth.tenantKey,
+      financialYear,
+      type: "HANDOVER",
+      status: "PENDING",
+      "receiptBreakdown.0": { $exists: true },
+      ...cashierMovementScope(req),
+    }).select("+handoverOtpCode");
+    if (!movement) return fail(res, "Pending handover not found", 404);
+    if (movement.handoverOtpStatus !== "PENDING") return fail(res, "This handover OTP has already been verified", 409);
+    if (movement.handoverOtpCode && movement.handoverOtpExpiresAt && new Date(movement.handoverOtpExpiresAt) > new Date()) {
+      return fail(res, "Current cashier OTP is still valid. Refresh the Pending Receipts page to view it.", 409);
+    }
+    const oldOtpId = movement.handoverOtpId;
+    const otp = await createOtp({
+      tenantKey: req.auth.tenantKey,
+      transactionId: String(movement._id),
+      actionType: "CASH_HANDOVER_CASHIER_TO_SALESPERSON",
+      recipientId: movement.salespersonId,
+      context: { movementNo: movement.movementNo, amount: movement.amount, cashierId: movement.recipientUserId, cashierName: movement.recipientName },
+    });
+    movement.handoverOtpId = otp.otpId;
+    movement.handoverOtpCode = otp.code;
+    movement.handoverOtpExpiresAt = otp.expiresAt;
+    await movement.save();
+    if (oldOtpId) await OtpChallenge.updateOne({ otpId: oldOtpId, status: "PENDING" }, { $set: { status: "EXPIRED" } });
+    return ok(res, { movementId: String(movement._id), movementNo: movement.movementNo, handoverOtp: otp.code, handoverOtpExpiresAt: otp.expiresAt }, "New OTP generated for the existing cashier handover");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
@@ -4526,6 +5575,8 @@ router.post("/cashier/handovers/:id/receive", async (req, res) => {
 
     movement.status = "APPROVED";
     movement.handoverWorkflowStatus = "RECEIVED";
+    // Bank-only handovers do not need to participate in cashier cash closing.
+    if (num(movement.cashAmount ?? movement.amount) === 0) movement.cashierCloseId = "BANK_ONLY";
     movement.cashierReceivedAt = new Date();
     movement.cashierReceivedBy = req.auth.sub;
     movement.cashierReceivedByNameSnapshot = req.auth.name || "";
@@ -4540,6 +5591,8 @@ router.post("/cashier/handovers/:id/receive", async (req, res) => {
       { $set: {
         cashDepositStatus: "DEPOSITED_TO_CASHIER", cashDepositedAt: movement.cashierReceivedAt,
         cashDepositedBy: req.auth.sub, cashDepositedByNameSnapshot: req.auth.name || "",
+        cashierOtpStatus: "VERIFIED", cashierOtpVerifiedAt: movement.handoverOtpVerifiedAt || movement.cashierReceivedAt,
+        receiptWorkflowStatus: "COMPLETED",
       } },
     );
     return ok(res, { movementNo: movement.movementNo, amount: money2(movement.amount), receivedAt: movement.cashierReceivedAt }, "Cash received and added to cashier cashbook");
@@ -4559,10 +5612,10 @@ router.get("/cashier/cashbook", async (req, res) => {
       id: `${m._id}:${r.receiptId || r.receiptNo}`, batchId: String(m._id), movementNo: m.movementNo,
       receivedAt: m.cashierReceivedAt || m.verifiedAt || m.date, salespersonName: m.salespersonNameSnapshot || "",
       receiptId: r.receiptId, receiptNo: r.receiptNo, customerGlobalId: r.customerGlobalId,
-      partyName: r.customerNameSnapshot || "", amount: money2(r.amount), cashierCloseId: m.cashierCloseId || "",
+      partyName: r.customerNameSnapshot || "", mode: r.mode || "CASH", receiptType: r.receiptType || "", amount: money2(r.amount), cashierCloseId: m.cashierCloseId || "",
     });
     const total = money2(items.reduce((sum, x) => sum + num(x.amount), 0));
-    const unclosedTotal = money2(items.filter((x) => !x.cashierCloseId).reduce((sum, x) => sum + num(x.amount), 0));
+    const unclosedTotal = money2(items.filter((x) => x.mode === "CASH" && !x.cashierCloseId).reduce((sum, x) => sum + num(x.amount), 0));
     return ok(res, { financialYear, items, total, unclosedTotal });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
@@ -4576,11 +5629,11 @@ router.get("/cashier/close-preview", async (req, res) => {
       $or: [{ cashierCloseId: { $exists: false } }, { cashierCloseId: "" }, { cashierCloseId: null }],
       ...cashierMovementScope(req),
     }).sort({ cashierReceivedAt: 1, date: 1 }).lean();
-    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.amount), 0));
+    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.cashAmount ?? x.amount), 0));
     return ok(res, {
       financialYear, expectedAmount, batchCount: batches.length,
       salespersonCount: new Set(batches.map((x) => x.salespersonId).filter(Boolean)).size,
-      batches: batches.map((x) => ({ _id: String(x._id), movementNo: x.movementNo, salespersonName: x.salespersonNameSnapshot || "", amount: money2(x.amount), receivedAt: x.cashierReceivedAt || x.verifiedAt })),
+      batches: batches.map((x) => ({ _id: String(x._id), movementNo: x.movementNo, salespersonName: x.salespersonNameSnapshot || "", amount: money2(x.cashAmount ?? x.amount), receivedAt: x.cashierReceivedAt || x.verifiedAt })),
     });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
@@ -4595,9 +5648,10 @@ router.post("/cashier/close", async (req, res) => {
       ...cashierMovementScope(req),
     });
     if (!batches.length) return fail(res, "There is no unclosed cashier collection", 409);
-    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.amount), 0));
+    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.cashAmount ?? x.amount), 0));
     const denominations = parseCashDenominations(req.body.denominations);
     const declaredAmount = denominationTotal2(denominations);
+    if (!(expectedAmount > 0)) return fail(res, "No physical cash requires closing", 409);
     if (!denominations.length) return fail(res, "Enter closing denominations", 400);
     if (Math.abs(declaredAmount - expectedAmount) > 0.009) return fail(res, `Closing denomination total ₹${declaredAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })} must match cashier collection ₹${expectedAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`, 409);
 
@@ -4652,9 +5706,8 @@ router.get("/payments", async (req, res) => {
 router.post("/payments", async (req, res) => {
   try {
     const tenantKey = req.auth.tenantKey,
-      date = transactionDate(req.body.date),
+      date = parseStrictVoucherDate(req.body.date),
       financialYear =
-        financialYearFromDate(req.body.date) ||
         financialYearFromDate(date) ||
         (await resolveFinancialYear({
           tenantKey,
@@ -4664,13 +5717,7 @@ router.post("/payments", async (req, res) => {
     if (amount <= 0)
       return fail(res, "Payment amount must be greater than zero");
     const partyId = req.body.partyGlobalId || req.body.party || "";
-    const party = await resolvePostingParty(tenantKey, partyId);
-    if (!party)
-      return fail(
-        res,
-        "Party is not ACTIVE. Complete and verify the migrated profile before Purchase/Payment.",
-        400,
-      );
+    const party = await resolveVoucherPostingParty(tenantKey, partyId, req.body.partyType);
     const mode = upper(req.body.mode || "BANK"),
       bank = await resolveTransactionBank(
         tenantKey,
@@ -4686,8 +5733,9 @@ router.post("/payments", async (req, res) => {
       paymentNo,
       sourceKey:paymentNo,
       date,
-      partyGlobalId: party.globalCustomerId,
-      partyNameSnapshot: party.localName || party.displayIdentifier,
+      partyGlobalId: party.id,
+      partyType: party.type,
+      partyNameSnapshot: party.name,
       amount,
       mode,
       reference: req.body.reference || "",
@@ -4705,11 +5753,11 @@ router.post("/payments", async (req, res) => {
       transactionId: paymentNo,
       transactionType: "PAYMENT",
       date,
-      partyGlobalId: party.globalCustomerId,
+      partyGlobalId: party.id,
       narration:
         req.body.remarks || req.body.narration || `Payment ${paymentNo}`,
       entries: [
-        { accountCode: partyAccountCodeOf(party), debit: amount },
+        { accountCode: party.accountCode, ledgerId: party.ledgerId, debit: amount },
         {
           accountCode: bank.accountCode,
           ledgerId: bank.ledgerId,
@@ -4719,7 +5767,12 @@ router.post("/payments", async (req, res) => {
       ],
     });
     } catch (error) { await payment.deleteOne(); throw error; }
-    return ok(res, payment, "Payment posted", 201);
+    let balanceWarning="";
+    if (bank.bankAccountId) {
+      try { await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId:bank.bankAccountId}); }
+      catch (e) { balanceWarning=e.message; }
+    }
+    return ok(res, {...payment.toObject(),balanceWarning}, "Payment posted", 201);
   } catch (error) {
     return fail(res, error.message, error.statusCode || 400);
   }
@@ -4758,9 +5811,8 @@ router.get("/expenses", async (req, res) => {
 router.post("/receipts", async (req, res) => {
   try {
     const tenantKey = req.auth.tenantKey,
-      date = transactionDate(req.body.date),
+      date = parseStrictVoucherDate(req.body.date),
       financialYear =
-        financialYearFromDate(req.body.date) ||
         financialYearFromDate(date) ||
         (await resolveFinancialYear({
           tenantKey,
@@ -4769,16 +5821,10 @@ router.post("/receipts", async (req, res) => {
     const amount = Number(req.body.amount || 0);
     if (amount <= 0)
       return fail(res, "Receipt amount must be greater than zero");
-    const party = await resolvePostingParty(
-      tenantKey,
-      req.body.customerGlobalId,
+    const party = await resolveVoucherPostingParty(tenantKey,
+      req.body.customerGlobalId || req.body.party || req.body.partyName,
+      req.body.partyType,
     );
-    if (!party)
-      return fail(
-        res,
-        "Party is not ACTIVE. Complete and verify the migrated profile before Receipt/Sales.",
-        400,
-      );
     const mode = upper(req.body.mode || "BANK"),
       bank = await resolveTransactionBank(
         tenantKey,
@@ -4794,8 +5840,9 @@ router.post("/receipts", async (req, res) => {
       receiptNo,
       sourceKey:receiptNo,
       date,
-      customerGlobalId: party.globalCustomerId,
-      partyNameSnapshot: party.localName || party.displayIdentifier,
+      customerGlobalId: party.id,
+      partyType: party.type,
+      partyNameSnapshot: party.name,
       amount,
       mode,
       reference: req.body.reference || "",
@@ -4818,7 +5865,7 @@ router.post("/receipts", async (req, res) => {
       transactionId: receiptNo,
       transactionType: "RECEIPT",
       date,
-      partyGlobalId: party.globalCustomerId,
+      partyGlobalId: party.id,
       narration: req.body.remarks || `Receipt ${receiptNo}`,
       entries: [
         {
@@ -4827,11 +5874,16 @@ router.post("/receipts", async (req, res) => {
           bankAccountId: bank.bankAccountId,
           debit: amount,
         },
-        { accountCode: partyAccountCodeOf(party), credit: amount },
+        { accountCode: party.accountCode, ledgerId: party.ledgerId, credit: amount },
       ],
     });
     } catch (error) { await receipt.deleteOne(); throw error; }
-    return ok(res, receipt, "Receipt posted", 201);
+    let balanceWarning="";
+    if (bank.bankAccountId) {
+      try { await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId:bank.bankAccountId}); }
+      catch (e) { balanceWarning=e.message; }
+    }
+    return ok(res, {...receipt.toObject(),balanceWarning}, "Receipt posted", 201);
   } catch (error) {
     return fail(res, error.message, error.statusCode || 400);
   }

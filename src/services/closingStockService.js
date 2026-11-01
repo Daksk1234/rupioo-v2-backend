@@ -262,6 +262,10 @@ export async function buildClosingStockRows({
     ),
   ]);
 
+  // An order-linked tax invoice is Pending until actual delivery; never turn
+  // it into Outward just because the Order Desk generated an invoice.
+  const orderById = new Map(orders.map((x) => [T(x._id), x]));
+  const orderByNumber = new Map(orders.map((x) => [T(x.orderNo), x]));
   const movement = new Map();
 
   // INWARD STOCK: every valid Purchase Invoice quantity in the selected FY,
@@ -299,6 +303,12 @@ export async function buildClosingStockRows({
   for (const invoice of sales) {
     const ts = new Date(invoice.date || 0);
     if (Number.isNaN(ts.getTime()) || ts >= periodEnd) continue;
+    const isOrderInvoice = Boolean(T(invoice.sourceOrderId) || U(invoice.billingMode)==="ORDER");
+    const linkedOrder = isOrderInvoice ? (orderById.get(T(invoice.sourceOrderId)) || orderByNumber.get(T(invoice.orderNo))) : null;
+    // Delivery status is authoritative for order invoices. Direct invoices
+    // retain their established immediate Outward accounting.
+    if (isOrderInvoice && !linkedOrder) continue;
+    if (linkedOrder && !["DELIVERED", "CLOSED", "HANDED_TO_TRANSPORTER"].includes(U(linkedOrder.workflowStatus))) continue;
     for (const item of invoice.items || []) {
       const line = salesLine(item);
       if (!line.qty) continue;
@@ -395,6 +405,7 @@ export async function buildClosingStockRows({
 
     return {
       financialYear,
+      productId: id,
       warehouse: warehouseMap.get(T(product.warehouseId)) || T(product.warehouseId) || "UNASSIGNED",
       product: product.name || product.sku || "",
       hsn: product.hsnCode || "",

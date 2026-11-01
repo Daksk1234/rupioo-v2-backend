@@ -24,7 +24,9 @@ import { makeId } from "../utils/ids.js";
 import { searchTaxpayer } from "../services/gstService.js";
 import { resolveCustomerSalesperson } from "../services/assignmentHierarchyService.js";
 import { financialModels } from "../services/accountingService.js";
-import { createOtp, verifyOtp } from "../services/otpService.js";
+import { buildCustomerReceivableLedger } from "../services/customerReceivableLedgerService.js";
+import { dmsAvailableStockMap } from "../services/dmsAvailableStockService.js";
+import { createOtp, verifyOtp, getActiveCustomerOrderOtp } from "../services/otpService.js";
 import {
   getMaxActiveGradeDiscount,
   gradeBasicFromMrp,
@@ -139,6 +141,14 @@ async function supplierContext(req, res, { activeOnly = false } = {}) {
     return null;
   }
   return { supplierId, company, link, tenantKey: company.tenantKey };
+}
+async function collectorsFor(link, tenantKey) {
+  if (!link?.globalCustomerId || !tenantKey || link.status !== "ACTIVE") return [];
+  const rows = await User.find({
+    tenantKey, role: { $in: ["COLLECTION_EXECUTIVE", "COLLECTOR"] }, status: "ACTIVE", loginEnabled: true,
+    collectorCustomerIds: link.globalCustomerId,
+  }).select("_id name mobile").sort({ name: 1 }).lean();
+  return rows.map((u) => ({ id: String(u._id), name: u.name || "Collection Executive", mobile: u.mobile || "" }));
 }
 async function salespersonFor(link, tenantKey) {
   const id = clean(link?.salespersonId);
@@ -658,16 +668,8 @@ router.get("/supplier-home-list", async (req, res) => {
       if (link.status !== "ACTIVE") {
         return { ...membership, financialYear, ledgerBalance: null, ledgerBalanceSigned: null, ledgerBalanceType: "", catalogueOnly: true };
       }
-      const { LedgerEntry } = financialModels(company.tenantKey, financialYear);
-      const ledgerAgg = await LedgerEntry.aggregate([
-        { $match: { tenantKey: company.tenantKey, financialYear, partyGlobalId: req.customerAuth.globalCustomerId, status: "POSTED" } },
-        { $group: { _id: null, debit: { $sum: "$debit" }, credit: { $sum: "$credit" } } },
-      ]);
-      const ledger = ledgerAgg[0] || {};
-      const opening = link.accountingProfile?.financialYear === financialYear
-        ? (upper(link.accountingProfile?.openingBalanceType) === "CR" ? -num(link.accountingProfile?.openingBalance) : num(link.accountingProfile?.openingBalance))
-        : 0;
-      const signedBalance = money(opening + num(ledger.debit) - num(ledger.credit));
+      const ledger = await buildCustomerReceivableLedger({ tenantKey: company.tenantKey, financialYear, customer: link });
+      const signedBalance = money(ledger.closingSigned);
       return {
         ...membership, financialYear, catalogueOnly: false,
         ledgerBalance: Math.abs(signedBalance), ledgerBalanceSigned: signedBalance,
@@ -722,25 +724,38 @@ router.get("/home", async (req, res) => {
   try {
     const ctx = await supplierContext(req, res, { activeOnly: false }); if (!ctx) return;
     const financialYear = companyFinancialYear(ctx.company);
-    const sales = await salespersonFor(ctx.link, ctx.tenantKey);
-    const base = { supplier: safeCompany(ctx.company), membership: { status: ctx.link.status, active: ctx.link.status === "ACTIVE", registrationSource: ctx.link.registrationSource, registeredAt: ctx.link.registrationRequestedAt || ctx.link.createdAt }, salesperson: sales, financialYear };
+    const [sales, collectors] = await Promise.all([
+      salespersonFor(ctx.link, ctx.tenantKey), collectorsFor(ctx.link, ctx.tenantKey),
+    ]);
+    const base = { supplier: safeCompany(ctx.company), membership: { status: ctx.link.status, active: ctx.link.status === "ACTIVE", registrationSource: ctx.link.registrationSource, registeredAt: ctx.link.registrationRequestedAt || ctx.link.createdAt }, salesperson: sales, collectors, financialYear };
     if (ctx.link.status !== "ACTIVE") {
       const productCount = await Product.countDocuments({ tenantKey: ctx.tenantKey, status: "ACTIVE" });
       return ok(res, { ...base, locked: true, productCount, message: "Registration is awaiting Superadmin activation. Product catalogue and current prices are visible; ordering and financial features unlock after approval." });
     }
-    const { SalesOrder, SalesInvoice, Receipt, LedgerEntry } = financialModels(ctx.tenantKey, financialYear);
-    const [orderCount, invoiceCount, recentOrders, recentInvoices, receiptAgg, ledgerAgg, promoCount] = await Promise.all([
-      SalesOrder.countDocuments({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId }),
-      SalesInvoice.countDocuments({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: "POSTED" }),
-      SalesOrder.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId }).sort({ date: -1 }).limit(3).lean(),
-      SalesInvoice.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: "POSTED" }).sort({ date: -1 }).limit(3).select("invoiceNo date grandTotal workflowStatus delivery status").lean(),
-      Receipt.aggregate([{ $match: { tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: "POSTED" } }, { $group: { _id: null, amount: { $sum: "$amount" } } }]),
-      LedgerEntry.aggregate([{ $match: { tenantKey: ctx.tenantKey, financialYear, partyGlobalId: ctx.link.globalCustomerId, status: "POSTED" } }, { $group: { _id: null, debit: { $sum: "$debit" }, credit: { $sum: "$credit" } } }]),
+    const { SalesOrder, SalesInvoice, Receipt } = financialModels(ctx.tenantKey, financialYear);
+    const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
+    const monthEnd = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 1);
+    const baseFilter = { tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId };
+    const orderFilter = { ...baseFilter, date: { $gte: monthStart, $lt: monthEnd }, status: { $nin: ["CANCELLED", "REJECTED", "DELETED", "COMPLETED"] }, workflowStatus: { $nin: ["CANCELLED", "REJECTED", "DELIVERED", "COMPLETED"] } };
+    const invoiceFilter = { ...baseFilter, date: { $gte: monthStart, $lt: monthEnd }, status: "POSTED", invoiceType: { $ne: "PERFORMA" } };
+    const [ordersAgg, invoicesAgg, recentOrders, recentInvoices, receiptAgg, ledger, promoCount] = await Promise.all([
+      SalesOrder.aggregate([{ $match: orderFilter }, { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$grandTotal" } } }]),
+      SalesInvoice.aggregate([{ $match: invoiceFilter }, { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$grandTotal" } } }]),
+      SalesOrder.find(orderFilter).sort({ date: -1 }).limit(3).lean(),
+      SalesInvoice.find(invoiceFilter).sort({ date: -1 }).limit(3).select("invoiceNo date grandTotal workflowStatus delivery status").lean(),
+      Receipt.aggregate([{ $match: { ...baseFilter, status: "POSTED" } }, { $group: { _id: null, amount: { $sum: "$amount" } } }]),
+      buildCustomerReceivableLedger({ tenantKey: ctx.tenantKey, financialYear, customer: ctx.link }),
       activePromotionFilter(ctx).then((filter) => CustomerPromotion.countDocuments(filter)),
     ]);
-    const ledger = ledgerAgg[0] || {}; const opening = ctx.link.accountingProfile?.financialYear === financialYear ? (upper(ctx.link.accountingProfile?.openingBalanceType) === "CR" ? -num(ctx.link.accountingProfile?.openingBalance) : num(ctx.link.accountingProfile?.openingBalance)) : 0;
-    const outstanding = money(opening + num(ledger.debit) - num(ledger.credit));
-    return ok(res, { ...base, locked: false, summary: { orderCount, invoiceCount, receipts: money(receiptAgg[0]?.amount), outstanding, creditLimit: money(ctx.link.creditLimit), availableCredit: ctx.link.creditLimit > 0 ? money(Math.max(0, ctx.link.creditLimit - Math.max(0, outstanding))) : null, promotionCount: promoCount }, recentOrders, recentInvoices });
+    const outstanding = money(ledger.closingSigned);
+    const creditLimit = money(ctx.link.creditLimit || ctx.link.approvedTerms?.creditLimit);
+    return ok(res, { ...base, locked: false, summary: {
+      orderCount: ordersAgg[0]?.count || 0, orderTotal: money(ordersAgg[0]?.amount),
+      invoiceCount: invoicesAgg[0]?.count || 0, invoiceTotal: money(invoicesAgg[0]?.amount),
+      period: "CURRENT_MONTH", receipts: money(receiptAgg[0]?.amount), outstanding,
+      creditLimit, availableCredit: money(creditLimit - outstanding),
+      promotionCount: promoCount,
+    }, recentOrders, recentInvoices });
   } catch (error) { return fail(res, error.message, error.status || 500); }
 });
 
@@ -768,10 +783,11 @@ async function priceRowsFor(ctx, products, financialYear = "") {
   // /catalog/old-dms-price-list/products + Create Sales Invoice logic.
   // Do not trust a stale Product.mrp because the Price List is now calculated
   // dynamically from the selected FY's market sale/purchase history.
-  const [maxDiscount, history] = await Promise.all([
+  const [maxDiscount, history, stockByProduct] = await Promise.all([
     getMaxActiveGradeDiscount(ctx.tenantKey),
     historicalAverageRates({ tenantKey: ctx.tenantKey, financialYear: fy, productIds })
       .catch(() => ({ sales: new Map(), purchases: new Map() })),
+    dmsAvailableStockMap({ tenantKey: ctx.tenantKey, financialYear: fy }),
   ]);
 
   return products.map((p) => {
@@ -813,7 +829,7 @@ async function priceRowsFor(ctx, products, financialYear = "") {
       hsnCode: p.hsnCode || "", gstRate,
       unit: p.basicUnit || "PCS", packingUnit: p.packingUnit || "",
       qtyInBag: num(p.qtyInBag || 1),
-      availableStock: Math.max(0, num(p.currentStock) - num(p.reservedStock)),
+      availableStock: stockByProduct.get(id) ?? 0,
       mrp, basicRate: money(mrpBasic), discountPct: money(grade.discountPct),
       landedPrice: money(landedPrice), marketSalePrice: money(marketSalePrice), minimumSalePrice: money(minimumSalePrice),
       maxGradeDiscountPct: money(maxDiscount),
@@ -1004,37 +1020,53 @@ router.get("/orders/:id", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.status || 500); }
 });
 
-router.post("/orders/:id/cancel", async (req, res) => {
-  try {
-    const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return;
-    const financialYear = companyFinancialYear(ctx.company);
-    const { SalesOrder, OrderEvent } = financialModels(ctx.tenantKey, financialYear);
-    const order = await SalesOrder.findOne({ _id: req.params.id, tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId });
-    if (!order) return fail(res, "Order not found", 404);
-    const status = upper(order.workflowStatus || order.status);
-    if (["DELIVERED", "CLOSED"].includes(status)) return fail(res, "A delivered/completed order cannot be cancelled", 409);
-    if (["CANCELLED", "REJECTED"].includes(status)) return ok(res, order, `Order is already ${status.toLowerCase()}`);
-    if (order.invoice?.invoiceId || (order.invoices || []).some((x) => x?.invoiceId)) {
-      return fail(res, "This order is already invoiced. Please contact the supplier/order desk for cancellation before delivery.", 409);
-    }
-
-    const releasable = (order.items || []).map((item) => ({ productId: item.productId, qty: Math.max(0, num(item.reservedQty)) })).filter((x) => x.qty > 0);
-    await releaseCustomerReservationRows(ctx.tenantKey, releasable);
-    for (const item of order.items || []) item.reservedQty = 0;
-    order.reservation = { ...(order.reservation?.toObject?.() || order.reservation || {}), status: "RELEASED", releasedAt: new Date(), releasedReason: clean(req.body.reason) || "Cancelled by customer" };
-    const fromStatus = status;
-    order.workflowStatus = "CANCELLED";
-    order.status = "CANCELLED";
-    order.nextAction = "Cancelled";
-    order.lastWorkflowAt = new Date();
+router.post("/orders/:id/cancel", async (req,res)=>{
+  try{
+    const ctx=await supplierContext(req,res,{activeOnly:true});if(!ctx)return;
+    const financialYear=companyFinancialYear(ctx.company);
+    const {SalesOrder,OrderEvent}=financialModels(ctx.tenantKey,financialYear);
+    const order=await SalesOrder.findOne({_id:req.params.id,tenantKey:ctx.tenantKey,financialYear,customerGlobalId:ctx.link.globalCustomerId});
+    if(!order)return fail(res,"Order not found",404);
+    if(["DELIVERED","HANDED_TO_TRANSPORTER","CLOSED","CANCELLED","REJECTED"].includes(upper(order.workflowStatus)))return fail(res,"This order cannot be cancelled",409);
+    if(upper(order.workflowStatus)==="CANCELLATION_IN_PROCESS")return ok(res,order,"Cancellation already requested. Salesperson must contact you and record the reason.");
+    const reason=clean(req.body.reason);
+    if(!reason)return fail(res,"Please provide the cancellation reason",400);
+    const previous=order.workflowStatus;
+    order.cancellation={source:"CUSTOMER",status:"AWAITING_SALESPERSON",reason,requestedBy:ctx.link.globalCustomerId,requestedAt:new Date()};
+    order.workflowStatus="CANCELLATION_IN_PROCESS";order.nextAction="Salesperson must contact customer and add remarks";order.lastWorkflowAt=new Date();
     await order.save();
-    await OrderEvent.create({
-      tenantKey: ctx.tenantKey, financialYear, eventNo: makeId("EVT"), orderId: String(order._id), orderNo: order.orderNo,
-      type: "ORDER_CANCELLED", fromStatus, toStatus: "CANCELLED", note: clean(req.body.reason) || "Order cancelled by customer from Customer App",
-      meta: {}, audience: ["DMS", "CUSTOMER", "SALESPERSON"], actorId: ctx.link.globalCustomerId, actorNameSnapshot: ctx.link.localName, actorRole: "CUSTOMER", occurredAt: new Date(),
-    });
-    return ok(res, order, "Order cancelled and reserved stock released");
-  } catch (error) { return fail(res, error.message, error.status || error.statusCode || 500); }
+    await OrderEvent.create({tenantKey:ctx.tenantKey,financialYear,eventNo:makeId("EVT"),orderId:String(order._id),orderNo:order.orderNo,type:"CANCELLATION_REQUESTED",fromStatus:previous,toStatus:"CANCELLATION_IN_PROCESS",note:reason,audience:["DMS","CUSTOMER","SALESPERSON"],actorId:ctx.link.globalCustomerId,actorRole:"CUSTOMER",occurredAt:new Date()});
+    return ok(res,order,"Cancellation requested. Assigned salesperson must contact customer and record remarks.");
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+
+router.get("/orders/:id/phase2-otp",async(req,res)=>{
+  try{
+    const ctx=await supplierContext(req,res,{activeOnly:true});if(!ctx)return;
+    const financialYear=companyFinancialYear(ctx.company);
+    const order=await financialModels(ctx.tenantKey,financialYear).SalesOrder.findOne({_id:req.params.id,tenantKey:ctx.tenantKey,financialYear,customerGlobalId:ctx.link.globalCustomerId}).lean();
+    if(!order)return fail(res,"Order not found",404);
+    const purpose=upper(req.query.purpose)==="CANCEL"?"CANCEL":"DELIVERY";
+    const otpId=purpose==="CANCEL"?order.cancellation?.customerOtpId:order.handover?.customerOtpId;
+    const actionType=purpose==="CANCEL"?"ORDER_CANCEL_CONFIRM":"DELIVERY_CUSTOMER_CONFIRM";
+    return ok(res,await getActiveCustomerOrderOtp({tenantKey:ctx.tenantKey,transactionId:String(order._id),recipientId:ctx.link.globalCustomerId,otpId,actionType})||{otp:null});
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+
+// Only the authenticated customer can VIEW their own order OTP. Staff must
+// ask the customer for the code and enter it in their own DMS/Salesperson app.
+router.get("/orders/:id/customer-otp", async (req,res) => {
+  try {
+    const ctx = await supplierContext(req,res,{activeOnly:true}); if(!ctx)return;
+    const financialYear=companyFinancialYear(ctx.company);
+    const order=await financialModels(ctx.tenantKey,financialYear).SalesOrder.findOne({
+      _id:req.params.id,tenantKey:ctx.tenantKey,financialYear,customerGlobalId:ctx.link.globalCustomerId
+    }).select("_id customerOtpId customerOtpVerifiedAt").lean();
+    if(!order)return fail(res,"Order not found",404);
+    if(order.customerOtpVerifiedAt)return ok(res,{verified:true});
+    return ok(res,await getActiveCustomerOrderOtp({tenantKey:ctx.tenantKey,transactionId:String(order._id),
+      recipientId:ctx.link.globalCustomerId,otpId:order.customerOtpId}) || {otp:null},"Customer OTP status");
+  }catch(error){return fail(res,error.message,error.status||error.statusCode||500)}
 });
 
 router.post("/orders/:id/customer-otp/request", async (req, res) => {
@@ -1051,30 +1083,14 @@ router.post("/orders/:id/customer-otp/request", async (req, res) => {
     const fromStatus = upper(order.workflowStatus || "OTP_PENDING");
     order.customerOtpRequired = true; order.customerOtpId = result.otpId; order.workflowStatus = "OTP_PENDING"; order.nextAction = "Customer OTP verification required"; order.lastWorkflowAt = new Date(); await order.save();
     await OrderEvent.create({ tenantKey: ctx.tenantKey, financialYear, eventNo: makeId("EVT"), orderId: String(order._id), orderNo: order.orderNo, type: "OTP_REQUESTED", fromStatus, toStatus: "OTP_PENDING", note: "Customer requested order verification OTP from Customer App", meta: {}, audience: ["DMS", "CUSTOMER", "SALESPERSON"], actorId: ctx.link.globalCustomerId, actorNameSnapshot: ctx.link.localName, actorRole: "CUSTOMER", occurredAt: new Date() });
-    return ok(res, { otpId: result.otpId, expiresAt: result.expiresAt, devCode: process.env.NODE_ENV === "production" ? undefined : result.code }, "Order verification OTP generated");
+    return ok(res, { otpId: result.otpId, expiresAt: result.expiresAt, otp:result.code }, "Show this OTP to your salesperson or Superadmin; do not enter it in this app");
   } catch (error) { return fail(res, error.message, error.status || error.statusCode || 500); }
 });
 
-router.post("/orders/:id/customer-otp/verify", async (req, res) => {
-  try {
-    const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return;
-    const financialYear = companyFinancialYear(ctx.company);
-    const { SalesOrder, OrderEvent } = financialModels(ctx.tenantKey, financialYear);
-    const order = await SalesOrder.findOne({ _id: req.params.id, tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId });
-    if (!order) return fail(res, "Order not found", 404);
-    const otpId = clean(req.body.otpId || order.customerOtpId), code = clean(req.body.code);
-    if (!otpId || !code) return fail(res, "OTP ID and code are required", 400);
-    const result = await verifyOtp({ otpId, code });
-    if (!result.ok) return fail(res, result.reason, 400);
-    const challenge = result.challenge;
-    if (clean(challenge.transactionId) !== String(order._id) || upper(challenge.actionType) !== "ORDER_CUSTOMER_CONFIRM") return fail(res, "OTP does not belong to this order", 409);
-    if (clean(challenge.recipientId) !== ctx.link.globalCustomerId) return fail(res, "OTP does not belong to this customer", 403);
-    const fromStatus = upper(order.workflowStatus || "OTP_PENDING");
-    order.customerOtpRequired = true; order.customerOtpVerifiedAt = new Date(); order.customerOtpId = otpId; order.workflowStatus = "ORDER_PLACED"; order.nextAction = "Verify order"; order.lastWorkflowAt = new Date(); await order.save();
-    await OrderEvent.create({ tenantKey: ctx.tenantKey, financialYear, eventNo: makeId("EVT"), orderId: String(order._id), orderNo: order.orderNo, type: "CUSTOMER_OTP_VERIFIED", fromStatus, toStatus: "ORDER_PLACED", note: "Customer verified the order by OTP in Customer App", meta: {}, audience: ["DMS", "CUSTOMER", "SALESPERSON"], actorId: ctx.link.globalCustomerId, actorNameSnapshot: ctx.link.localName, actorRole: "CUSTOMER", occurredAt: new Date() });
-    return ok(res, { verified: true, order }, "Order OTP verified");
-  } catch (error) { return fail(res, error.message, error.status || error.statusCode || 500); }
-});
+// Customer-entered order OTP verification is forbidden. Verification must be
+// carried out by the salesperson or Superadmin using the staff-authenticated API.
+router.post("/orders/:id/customer-otp/verify", (_req,res) =>
+  fail(res,"Give the OTP to your salesperson or Superadmin. Customers do not verify their own order OTP.",403));
 
 router.get("/invoices", async (req, res) => {
   try {
@@ -1083,17 +1099,58 @@ router.get("/invoices", async (req, res) => {
   } catch (error) { return fail(res, error.message, error.status || 500); }
 });
 
+// Customer financial statement: same customer receivables source as the DMS ledger.
+// Rows are always limited to the selected supplier's CURRENT financial year.
 router.get("/financials", async (req, res) => {
   try {
-    const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return; const financialYear = companyFinancialYear(ctx.company); const { SalesInvoice, Receipt, LedgerEntry } = financialModels(ctx.tenantKey, financialYear);
-    const [invoices, receipts, ledgerRows] = await Promise.all([
-      SalesInvoice.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: "POSTED" }).sort({ date: 1 }).select("_id invoiceNo date grandTotal netInvoiceAmount creditNoteAmount workflowStatus delivery").lean(),
-      Receipt.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: "POSTED" }).sort({ date: -1 }).lean(),
-      LedgerEntry.find({ tenantKey: ctx.tenantKey, financialYear, partyGlobalId: ctx.link.globalCustomerId, status: "POSTED" }).sort({ date: -1, createdAt: -1 }).lean(),
+    const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return;
+    const financialYear = companyFinancialYear(ctx.company);
+    const { SalesInvoice, Receipt } = financialModels(ctx.tenantKey, financialYear);
+    const [invoices, receipts, ledger] = await Promise.all([
+      SalesInvoice.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: "POSTED", invoiceType: { $ne: "PERFORMA" } }).sort({ date: 1 }).select("_id invoiceNo date grandTotal netInvoiceAmount creditNoteAmount workflowStatus").lean(),
+      Receipt.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: { $nin: ["DELETED", "CANCELLED"] } }).sort({ date: -1, createdAt: -1 }).select("-customerOtpCode -cashierOtpCode").lean(),
+      buildCustomerReceivableLedger({ tenantKey: ctx.tenantKey, financialYear, customer: ctx.link }),
     ]);
-    let remainingReceipts = receipts.reduce((s, r) => s + num(r.amount), 0); const invoiceStatus = invoices.map((inv) => { const net = num(inv.netInvoiceAmount || (num(inv.grandTotal) - num(inv.creditNoteAmount))); const paid = Math.min(net, Math.max(0, remainingReceipts)); remainingReceipts -= paid; const outstanding = money(Math.max(0, net - paid)); return { ...inv, netAmount: money(net), paidAmount: money(paid), outstanding, paymentStatus: outstanding <= 0 ? "PAID" : paid > 0 ? "PARTIAL" : "UNPAID" }; }).reverse();
-    const opening = ctx.link.accountingProfile?.financialYear === financialYear ? (upper(ctx.link.accountingProfile?.openingBalanceType) === "CR" ? -num(ctx.link.accountingProfile?.openingBalance) : num(ctx.link.accountingProfile?.openingBalance)) : 0; const balance = money(opening + ledgerRows.reduce((s, x) => s + num(x.debit) - num(x.credit), 0));
-    return ok(res, { financialYear, summary: { opening: money(opening), balance, totalInvoices: money(invoices.reduce((s, x) => s + num(x.netInvoiceAmount || x.grandTotal), 0)), totalReceipts: money(receipts.reduce((s, x) => s + num(x.amount), 0)), creditLimit: money(ctx.link.creditLimit), creditDays: num(ctx.link.creditDays) }, invoices: invoiceStatus, receipts, ledger: ledgerRows });
+    const paidReceipts = receipts.filter((r) => upper(r.status) === "POSTED");
+    let remainingReceipts = paidReceipts.reduce((sum, r) => sum + num(r.amount), 0);
+    const invoiceStatus = invoices.map((inv) => {
+      const net = num(inv.netInvoiceAmount || (num(inv.grandTotal) - num(inv.creditNoteAmount)));
+      const paid = Math.min(net, Math.max(0, remainingReceipts)); remainingReceipts -= paid;
+      const outstanding = money(Math.max(0, net - paid));
+      return { ...inv, netAmount: money(net), paidAmount: money(paid), outstanding, paymentStatus: outstanding <= 0 ? "PAID" : paid > 0 ? "PARTIAL" : "UNPAID" };
+    }).reverse();
+    const fyStartYear = Number(financialYear.slice(0, 4));
+    const fyStartDate = `${fyStartYear}-04-01`, fyEndDate = `${fyStartYear + 1}-03-31`;
+    const safeDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(clean(v)) ? clean(v) : "";
+    const requestedFrom = safeDay(req.query.startDate), requestedTo = safeDay(req.query.endDate);
+    const month = Number(req.query.month);
+    let from = requestedFrom || fyStartDate, to = requestedTo || fyEndDate;
+    if (!requestedFrom && !requestedTo && Number.isInteger(month) && month >= 1 && month <= 12) {
+      const year = month >= 4 ? fyStartYear : fyStartYear + 1;
+      from = `${year}-${String(month).padStart(2, "0")}-01`;
+      to = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+    }
+    if (from < fyStartDate || to > fyEndDate || from > to) return fail(res, "Selected dates must lie within the current financial year", 400);
+    const dateKey = (d) => d ? new Date(d).toISOString().slice(0, 10) : "";
+    const before = ledger.rows.filter((r) => dateKey(r.date) < from);
+    let running = money(ledger.openingSigned + before.reduce((sum, r) => sum + num(r.debit) - num(r.credit), 0));
+    const opening = running;
+    const rows = ledger.rows.filter((r) => dateKey(r.date) >= from && dateKey(r.date) <= to).map((r) => {
+      running = money(running + num(r.debit) - num(r.credit));
+      return { id: String(r._id), date: r.date, particular: r.narration || ctx.link.localName || "Party", voucherType: upper(r.transactionType).replaceAll("_", " "), voucherNo: r.transactionId || "", debit: money(r.debit), credit: money(r.credit), runningBalance: Math.abs(running), runningBalanceType: running < 0 ? "CR" : "DR" };
+    });
+    // An unverified collection must not be labelled PAID simply because its accounting entry exists.
+    const paymentRows = receipts.map((r) => {
+      const isSalesperson = upper(r.collectionSource) === "SALESPERSON_APP";
+      const cashierVerified = upper(r.cashierOtpStatus) === "VERIFIED" || Boolean(r.cashierOtpVerifiedAt);
+      const readyForCount = upper(r.receiptWorkflowStatus) === "READY_FOR_CASHIER_COUNT";
+      const paymentStatus = upper(r.status) === "POSTED" && (!isSalesperson || cashierVerified || readyForCount) ? "PAID" : "UNPAID";
+      return { ...r, paymentStatus, customerOtpStatus: r.customerOtpStatus || (isSalesperson ? "PENDING" : "NOT_REQUIRED"), cashierOtpStatus: r.cashierOtpStatus || (isSalesperson ? "PENDING" : "NOT_REQUIRED") };
+    });
+    return ok(res, { financialYear, filters: { startDate: from, endDate: to }, summary: {
+      opening: money(opening), balance: money(running), closing: money(ledger.closingSigned),
+      totalDebit: money(rows.reduce((sum, r) => sum + r.debit, 0)), totalCredit: money(rows.reduce((sum, r) => sum + r.credit, 0)),
+    }, invoices: invoiceStatus, receipts: paymentRows, ledger: rows });
   } catch (error) { return fail(res, error.message, error.status || 500); }
 });
 
@@ -1101,11 +1158,44 @@ router.get("/promotions", async (req, res) => {
   try { const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return; const filter = await activePromotionFilter(ctx); const items = await CustomerPromotion.find(filter).sort({ startAt: -1, createdAt: -1 }).lean(); return ok(res, { items }); } catch (error) { return fail(res, error.message, 500); }
 });
 
+router.get("/complaint-references", async (req, res) => {
+  try {
+    const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return;
+    const financialYear = companyFinancialYear(ctx.company);
+    const { Receipt, SalesInvoice, SalesOrder } = financialModels(ctx.tenantKey, financialYear);
+    const base = { tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId };
+    const [payments, bills, orders] = await Promise.all([
+      Receipt.find({ ...base, status: { $ne: "DELETED" } }).sort({ date: -1 }).limit(250).select("receiptNo date amount").lean(),
+      SalesInvoice.find({ ...base, status: "POSTED", invoiceType: { $ne: "PERFORMA" } }).sort({ date: -1 }).limit(250).select("invoiceNo date grandTotal").lean(),
+      SalesOrder.find({ ...base, status: { $ne: "DELETED" } }).sort({ date: -1 }).limit(250).select("orderNo date grandTotal").lean(),
+    ]);
+    return ok(res, { payments: payments.map(r => ({ id: String(r._id), no: r.receiptNo, date: r.date, amount: r.amount })), bills: bills.map(r => ({ id: String(r._id), no: r.invoiceNo, date: r.date, amount: r.grandTotal })), orders: orders.map(r => ({ id: String(r._id), no: r.orderNo, date: r.date, amount: r.grandTotal })) });
+  } catch (error) { return fail(res, error.message, 500); }
+});
+
 router.get("/complaints", async (req, res) => {
   try { const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return; const items = await CustomerSupportTicket.find({ tenantKey: ctx.tenantKey, globalCustomerId: ctx.link.globalCustomerId }).sort({ createdAt: -1 }).limit(200).lean(); return ok(res, { items }); } catch (error) { return fail(res, error.message, 500); }
 });
 router.post("/complaints", async (req, res) => {
-  try { const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return; const type = upper(req.body.type || "GENERAL"); const subject = clean(req.body.subject); if (!subject) return fail(res, "Complaint subject is required", 400); const ticket = await CustomerSupportTicket.create({ ticketNo: makeId("CST"), tenantKey: ctx.tenantKey, globalCustomerId: ctx.link.globalCustomerId, type: ["PAYMENT", "BILL", "SCHEME", "ORDER", "GENERAL"].includes(type) ? type : "GENERAL", referenceType: upper(req.body.referenceType), referenceId: clean(req.body.referenceId), referenceNo: clean(req.body.referenceNo), subject, description: clean(req.body.description), priority: ["LOW", "NORMAL", "HIGH", "URGENT"].includes(upper(req.body.priority)) ? upper(req.body.priority) : "NORMAL" }); return ok(res, ticket, "Complaint raised successfully", 201); } catch (error) { return fail(res, error.message, 500); }
+  try {
+    const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return;
+    const type = upper(req.body.type || "GENERAL"), subject = clean(req.body.subject);
+    if (!subject) return fail(res, "Complaint subject is required", 400);
+    const referenceId = clean(req.body.referenceId);
+    let referenceNo = "", referenceType = "";
+    if (referenceId) {
+      const names = { PAYMENT: ["Receipt", "receiptNo"], BILL: ["SalesInvoice", "invoiceNo"], ORDER: ["SalesOrder", "orderNo"] };
+      if (!names[type]) return fail(res, "References are only available for payments, bills and orders", 400);
+      const financialYear = companyFinancialYear(ctx.company);
+      const models = financialModels(ctx.tenantKey, financialYear);
+      const [modelName, field] = names[type];
+      const record = /^[a-fA-F0-9]{24}$/.test(referenceId) ? await models[modelName].findOne({ _id: referenceId, tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId }).select(field).lean() : null;
+      if (!record) return fail(res, "Selected reference does not belong to this customer", 403);
+      referenceType = type; referenceNo = clean(record[field]);
+    }
+    const ticket = await CustomerSupportTicket.create({ ticketNo: makeId("CST"), tenantKey: ctx.tenantKey, globalCustomerId: ctx.link.globalCustomerId, type: ["PAYMENT", "BILL", "SCHEME", "ORDER", "GENERAL"].includes(type) ? type : "GENERAL", referenceType, referenceId, referenceNo, subject, description: clean(req.body.description), priority: "NORMAL" });
+    return ok(res, ticket, "Complaint raised successfully", 201);
+  } catch (error) { return fail(res, error.message, 500); }
 });
 
 const uploadDir = path.resolve(process.cwd(), "storage", "customer-app");
@@ -1116,7 +1206,7 @@ router.post("/damage-claims", claimUpload.array("images", 5), async (req, res) =
   try {
     const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return; const financialYear = companyFinancialYear(ctx.company); const { SalesInvoice } = financialModels(ctx.tenantKey, financialYear); const invoiceNo = clean(req.body.invoiceNo); if (!invoiceNo) return fail(res, "Invoice number is required", 400);
     const invoice = await SalesInvoice.findOne({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, invoiceNo, status: "POSTED" }).lean(); if (!invoice) return fail(res, "Invoice not found for this customer", 404);
-    let requestedItems = []; try { requestedItems = JSON.parse(req.body.items || "[]"); } catch {} const im = new Map((invoice.items || []).map((x) => [String(x.productId), x])); const items = requestedItems.map((x) => { const billed = im.get(clean(x.productId)); if (!billed) return null; const damagedQty = Math.max(0, num(x.damagedQty)); if (damagedQty <= 0 || damagedQty > num(billed.qty)) return null; return { productId: clean(x.productId), productName: billed.nameSnapshot, billedQty: num(billed.qty), damagedQty, reason: clean(x.reason) }; }).filter(Boolean); if (!items.length) return fail(res, "Add at least one valid damaged product quantity", 400);
+    let requestedItems = []; try { requestedItems = JSON.parse(req.body.items || "[]"); } catch {} const invoiceLines = invoice.items || []; const items = requestedItems.map((x) => { const lineIndex = Number(x.lineIndex); const billed = Number.isInteger(lineIndex) && lineIndex >= 0 && lineIndex < invoiceLines.length ? invoiceLines[lineIndex] : invoiceLines.find(r => String(r.productId) === clean(x.productId)); if (!billed || String(billed.productId) !== clean(x.productId)) return null; const damagedQty = Math.max(0, num(x.damagedQty)); if (damagedQty <= 0 || damagedQty > num(billed.qty)) return null; return { productId: clean(x.productId), productName: billed.nameSnapshot, billedQty: num(billed.qty), damagedQty, reason: clean(x.reason) }; }).filter(Boolean); if (!items.length) return fail(res, "Add at least one valid damaged product quantity", 400);
     const images = (req.files || []).map((f) => ({ fileName: f.originalname, storedName: f.filename, mimeType: f.mimetype, size: f.size })); const claim = await CustomerDamageClaim.create({ claimNo: makeId("DMG"), tenantKey: ctx.tenantKey, globalCustomerId: ctx.link.globalCustomerId, invoiceId: String(invoice._id), invoiceNo: invoice.invoiceNo, invoiceDate: invoice.date, items, notes: clean(req.body.notes), images }); return ok(res, claim, "Damage claim submitted", 201);
   } catch (error) { return fail(res, error.message, 500); }
 });

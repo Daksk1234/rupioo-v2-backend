@@ -130,16 +130,17 @@ export async function finalizeSalespersonReceipt({ tenantKey, financialYear, rec
   }
 
   fresh.status = "POSTED";
-  fresh.receiptWorkflowStatus = "COMPLETED";
+  // Customer OTP permits ledger posting; it is NOT physical cashier receipt.
+  // Cashier handover OTP moves this to READY_FOR_CASHIER_COUNT, and only the
+  // DMS cashier's final count/receive action may mark it COMPLETED.
+  fresh.receiptWorkflowStatus = "CUSTOMER_OTP_VERIFIED";
   fresh.cashierOtpStatus = "NOT_REQUIRED";
   fresh.ledgerPostedAt = fresh.ledgerPostedAt || new Date();
   // Accounting verification and physical cash custody are two separate facts.
   // A cash receipt reduces customer outstanding after OTP completion, but stays
   // with the salesperson until a cashier accepts the later handover batch.
-  if (upper(fresh.mode) === "CASH" && !["DEPOSITED_TO_CASHIER", "CLOSED"].includes(upper(fresh.cashDepositStatus))) {
+  if (["CASH", "BANK"].includes(upper(fresh.mode)) && !["DEPOSITED_TO_CASHIER", "CLOSED", "HANDOVER_PENDING"].includes(upper(fresh.cashDepositStatus))) {
     fresh.cashDepositStatus = "PENDING_TO_DEPOSIT";
-  } else if (upper(fresh.mode) !== "CASH") {
-    fresh.cashDepositStatus = "NOT_APPLICABLE";
   }
   if (movement?._id) fresh.cashCustodyMovementId = String(movement._id);
 

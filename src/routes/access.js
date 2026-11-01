@@ -1,4 +1,5 @@
 import express from "express";
+import mongoose from "mongoose";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import multer from "multer";
@@ -648,10 +649,27 @@ const ensureTenantMasterRoles = async (req) => {
 
   const templateFilter={tenantKey:MASTER_TEMPLATE_TENANT,status:"ACTIVE"};
   const templates=(await Role.find(templateFilter).sort({name:1,code:1}).lean())
-    .filter(row=>(row.apps||[]).includes("dms"));
+    .filter(row=>!Array.isArray(row.apps) || !row.apps.length || row.apps.includes("dms"));
   if(!templates.length)return [];
 
   const ceiling=await companyPermissionCeiling(req);
+  // Roles created under MASTER > Designations previously never reached the
+  // tenant /access/roles endpoint, so Create User showed only old role templates.
+  // Sync newly created active Master designations as tenant-scoped Role records.
+  // Existing tenant Roles are never overwritten (permissions/departments survive).
+  const masterDesignations=(await DesignationTemplate.find({tenantKey:MASTER_DESIGNATION_TENANT,status:"ACTIVE"}).lean())
+    .filter(row=>hasDmsAccess(row)||(!row.apps?.length&&!row.permissions?.length));
+  for(const designation of masterDesignations){
+    if(await Role.exists({tenantKey,code:designation.code}))continue;
+    try{await Role.create({
+      tenantKey,name:designation.name,code:designation.code,
+      description:designation.description||"",apps:["dms"],
+      permissions:permissionIntersection(designation.permissions||[],ceiling||[]),
+      dataScope:designation.dataScope||"SELF",approvalLimits:designation.approvalLimits||{},
+      sourceTemplateCode:designation.code,templateVersion:designation.templateVersion||2,
+      hierarchyOrder:0,locked:true,status:"ACTIVE"
+    });}catch(e){if(e?.code!==11000)throw e;}
+  }
   for(const template of templates){
     const existing=await Role.findOne({tenantKey,code:template.code});
     if(existing){
@@ -1000,7 +1018,7 @@ router.get("/users", async (req,res) => {
     {pincode:new RegExp(q,"i")},{city:new RegExp(q,"i")},{district:new RegExp(q,"i")},{state:new RegExp(q,"i")}
   ];
   const [docs,total]=await Promise.all([
-    User.find(filter).select("-passwordHash -aadhaarHash -coveragePincodes").populate("roleId","name code hierarchyOrder departmentId").populate("departmentId","name code status").populate("assignedToUserId","name role designation").populate("branchId","name branchCode").sort({createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),
+    User.find(filter).select("-passwordHash -aadhaarHash -coveragePincodes").populate("roleId","name code hierarchyOrder departmentId").populate("departmentId","name code status").populate("assignedToUserId","name role designation").populate("branchId","name branchCode").populate("parentLedgerAccountId","name tallyAccountTypeCode").sort({createdAt:-1}).skip((page-1)*limit).limit(limit).lean(),
     User.countDocuments(filter)
   ]);
   return ok(res,{items:docs.map(publicUser),meta:pageMeta(page,limit,total)});
@@ -1366,6 +1384,279 @@ const replaceSalesRolePincodes=async({tenantKey,user,roleDoc,pincodes,actorId})=
   return {roleCode:code,pincodes:pins};
 };
 
+const isCollectionExecutiveRole = (code) => ["COLLECTION_EXECUTIVE", "COLLECTOR"].includes(String(code || "").trim().toUpperCase());
+
+// Collection Executive parties must belong to the exact same company. No implicit
+// fallback to a salesperson's territory or any other tenant is allowed.
+async function validateCollectorCustomerIds(tenantKey, raw) {
+  if (!Array.isArray(raw)) { const e = new Error("Choose customers for the Collection Executive"); e.statusCode = 400; throw e; }
+  const ids = [...new Set(raw.map(x => String(x || "").trim()).filter(Boolean))];
+  if (!ids.length || ids.length > 5000) { const e = new Error("Assign between 1 and 5000 active customers to the Collection Executive"); e.statusCode = 400; throw e; }
+  const count = await CustomerLink.countDocuments({ tenantKey, globalCustomerId: { $in: ids }, status: "ACTIVE" });
+  if (count !== ids.length) { const e = new Error("Collection Executive assignments contain unknown or inactive customers"); e.statusCode = 400; throw e; }
+  return ids;
+}
+
+router.get("/collector-customers/options", async (req, res) => {
+  if (!canManageAccess(req)) return fail(res, "Access administration permission required", 403);
+  if (req.auth.role === "MASTER" && !req.query.tenantKey) return fail(res, "Select a company", 400);
+  const tenantKey = await tenantFilter(req);
+  const rows = await CustomerLink.find({ tenantKey, status: "ACTIVE" })
+    .select("globalCustomerId localName displayIdentifier creditDays creditLimit paymentType")
+    .sort({ localName: 1 }).limit(10000).lean();
+  return ok(res, { items: rows.map(x => ({ id: x.globalCustomerId, name: x.localName || x.displayIdentifier || x.globalCustomerId, creditDays: x.creditDays, paymentType: x.paymentType })) });
+});
+
+// Multi-level, tenant-scoped account tree. GROUP nodes never create posting ledgers;
+// leaf LEDGER nodes reuse the existing User/CompanyLedger posting integrations.
+const ledgerNodeKind = node => String(node?.ledgerNodeKind || node?.nodeKind || "LEDGER").toUpperCase();
+const ledgerSiblingKey = (name, type, parentId) => [
+  String(type || "").toUpperCase(), String(parentId || "root"),
+  String(name || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-IN")
+].join("::");
+
+router.get("/users/ledger-accounts", async (req,res) => {
+  if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
+  const tenantKey=req.auth.role==="MASTER" && req.query.tenantKey?await resolveTenantKeyAlias(req.query.tenantKey):req.auth.tenantKey;
+  const items=await User.find({tenantKey,role:"LEDGER_ACCOUNT"})
+    .select("_id name tallyAccountTypeCode tallyAccountTypeName parentLedgerAccountId ledgerNodeKind ledgerNodeLevel openingBalance openingBalanceType openingFinancialYear status")
+    .sort({name:1}).limit(10000).lean();
+  return ok(res,{items:items.map(x=>({...x,ledgerNodeKind:ledgerNodeKind(x),ledgerNodeLevel:x.ledgerNodeLevel||4}))});
+});
+
+// Export the authoritative account path and only vouchers linked to these
+// specific ledger IDs. Name matching is deliberately not used: two branches
+// may contain separate ledgers named for the same person.
+router.get("/users/ledger-accounts/report.xlsx", async (req,res) => {
+  if(!canManageAccess(req))return fail(res,"Access administration permission required",403);
+  const perms=new Set(req.auth?.permissions||[]);
+  if(!["MASTER","SUPERADMIN"].includes(String(req.auth?.role||"").toUpperCase())&&!perms.has("*")
+    &&!["dms.transaction.cashbook.view","dms.transaction.payment.view","dms.transaction.receipt.view","dms.finance_reports.bank_statement.view"].some(x=>perms.has(x)))
+    return fail(res,"Financial reporting permission required",403);
+  try {
+    const tenantKey=req.auth.role==="MASTER"&&req.query.tenantKey
+      ?await resolveTenantKeyAlias(req.query.tenantKey):req.auth.tenantKey;
+    const financialYear=String(req.query.financialYear||"").trim();
+    if(!/^\d{4}-\d{2}$/.test(financialYear)||Number(financialYear.slice(-2))!==(Number(financialYear.slice(2,4))+1)%100)
+      return fail(res,"Choose a valid financial year such as 2026-27",400);
+    const accounts=await User.find({tenantKey,role:"LEDGER_ACCOUNT"})
+      .select("_id name tallyAccountTypeCode tallyAccountTypeName parentLedgerAccountId ledgerNodeKind ledgerNodeLevel openingBalance openingBalanceType openingFinancialYear status")
+      .limit(10000).lean();
+    const byId=new Map(accounts.map(x=>[String(x._id),x]));
+    const pathFor=(account)=>{
+      const chain=[],seen=new Set();let cursor=account;
+      while(cursor&&!seen.has(String(cursor._id))){
+        seen.add(String(cursor._id));chain.unshift(cursor);
+        cursor=byId.get(String(cursor.parentLedgerAccountId||""));
+      }
+      const groups=chain.filter(x=>ledgerNodeKind(x)==="GROUP");
+      return [account.tallyAccountTypeName||account.tallyAccountTypeCode||"",groups[0]?.name||"",
+        groups.slice(1).map(x=>x.name).join(" > "),ledgerNodeKind(account)==="LEDGER"?account.name:""];
+    };
+    const headers=["Main Account","Sub Account","Sub-sub Account","Ledger / Party Name","Record Type","Ledger User ID","Accounting Type Code","Opening FY","Opening Amount","DR / CR","Status"];
+    const accountRows=accounts.map(x=>[...pathFor(x),ledgerNodeKind(x),String(x._id),x.tallyAccountTypeCode||"",
+      x.openingFinancialYear||"",ledgerNodeKind(x)==="LEDGER"?Number(x.openingBalance||0):0,
+      x.openingBalanceType||"DR",x.status||""]);
+    accountRows.sort((a,b)=>[...a.slice(0,4)].join(" | ").localeCompare(b.slice(0,4).join(" | "),"en",{sensitivity:"base"}));
+    const postingAccounts=accounts.filter(x=>ledgerNodeKind(x)==="LEDGER");
+    const ids=postingAccounts.map(x=>`USER:${String(x._id)}`);
+    const byRef=new Map(postingAccounts.map(x=>[`USER:${String(x._id)}`,x]));
+    const {Receipt,Payment}=financialModels(tenantKey,financialYear);
+    const [receipts,payments]=ids.length?await Promise.all([
+      Receipt.find({tenantKey,financialYear,status:"POSTED",customerGlobalId:{$in:ids}})
+        .select("date receiptNo customerGlobalId amount remarks mode status").limit(50000).lean(),
+      Payment.find({tenantKey,financialYear,status:"POSTED",partyGlobalId:{$in:ids}})
+        .select("date paymentNo partyGlobalId amount remarks mode status").limit(50000).lean(),
+    ]):[[],[]];
+    const movementHeaders=["Date","Voucher No.","Receipt / Payment","Main Account","Sub Account","Sub-sub Account","Ledger / Party Name","Ledger User ID","Amount","Mode","Remarks","Status"];
+    const movements=[
+      ...receipts.map(x=>({date:x.date,no:x.receiptNo,type:"RECEIPT",ref:x.customerGlobalId,amount:x.amount,mode:x.mode,remark:x.remarks,status:x.status})),
+      ...payments.map(x=>({date:x.date,no:x.paymentNo,type:"PAYMENT",ref:x.partyGlobalId,amount:x.amount,mode:x.mode,remark:x.remarks,status:x.status})),
+    ].sort((a,b)=>new Date(a.date)-new Date(b.date));
+    const voucherRows=movements.map(x=>{
+      const account=byRef.get(String(x.ref));
+      return [x.date?new Date(x.date).toISOString().slice(0,10):"",x.no||"",x.type,
+        ...(account?pathFor(account):["","","",""]),String(account?._id||""),Number(x.amount||0),
+        x.mode||"",x.remark||"",x.status||""];
+    });
+    const book=XLSX.utils.book_new();
+    const accountsSheet=XLSX.utils.aoa_to_sheet([headers,...accountRows]);
+    accountsSheet["!cols"]=[{wch:23},{wch:25},{wch:32},{wch:31},{wch:13},{wch:27},{wch:26},{wch:15},{wch:16},{wch:11},{wch:12}];
+    XLSX.utils.book_append_sheet(book,accountsSheet,"Account Hierarchy");
+    const voucherSheet=XLSX.utils.aoa_to_sheet([movementHeaders,...voucherRows]);
+    voucherSheet["!cols"]=[{wch:14},{wch:23},{wch:21},{wch:22},{wch:25},{wch:32},{wch:31},{wch:26},{wch:16},{wch:12},{wch:42},{wch:12}];
+    XLSX.utils.book_append_sheet(book,voucherSheet,"Linked Vouchers");
+    const note=XLSX.utils.aoa_to_sheet([
+      ["Report Financial Year",financialYear],
+      ["Account Hierarchy","Group headings are non-posting. Only Ledger rows hold accounting entries."],
+      ["Linked Vouchers","Only posted receipts and payments recorded against the exact USER:ledger-id are included."],
+      ["Unmapped records","Unclassified OTHER/Suspense entries or transactions paid to unrelated party IDs are not guessed or included."],
+      ["Historical records","Account hierarchy is displayed at its current configuration. Moving/renaming a heading changes its displayed path."],
+      ["Usage","Select a particular posting ledger in Cash/Bank to associate a transaction with its complete account path."],
+    ]);
+    note["!cols"]=[{wch:24},{wch:100}];
+    XLSX.utils.book_append_sheet(book,note,"Read Me");
+    const buffer=XLSX.write(book,{type:"buffer",bookType:"xlsx"});
+    res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition",`attachment; filename="ledger-account-report-${financialYear}.xlsx"`);
+    return res.send(buffer);
+  }catch(e){return fail(res,e.message||"Could not download account report",500);}
+});
+
+router.post("/users/ledger-accounts/bulk", async (req,res) => {
+  if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
+  const tenantKey=req.auth.role==="MASTER" && req.body.tenantKey?await resolveTenantKeyAlias(req.body.tenantKey):req.auth.tenantKey;
+  const input=req.body?.rows;
+  if(!Array.isArray(input)||!input.length||input.length>200)return fail(res,"Add between 1 and 200 account rows",400);
+  const profile=await CompanyProfile.findOne({tenantKey}).select("_id financialYear").lean();
+  const tenantId=req.auth.tenantId||String(profile?._id||"");
+  const fyDefault=String(profile?.financialYear||"").trim();
+  const normalizeName=value=>String(value||"").trim().replace(/\s+/g," ");
+  const keys=new Set(),prepared=[];
+  try {
+    for(let i=0;i<input.length;i++){
+      const row=input[i]||{},name=normalizeName(row.name),key=String(row.clientKey||"").trim();
+      if(!name||name.length>160)throw new Error(`Row ${i+1}: Enter a name (maximum 160 characters)`);
+      if(!key||keys.has(key))throw new Error(`Row ${i+1}: Invalid or duplicate row reference`);
+      keys.add(key);
+      const tally=await resolveTallyAccountType(row.tallyAccountTypeCode,{required:true});
+      if(!isStandaloneLedgerAccount(tally))throw new Error(`Row ${i+1}: Invalid accounting classification`);
+      const nodeKind=String(row.ledgerNodeKind||"LEDGER").toUpperCase();
+      const level=Number(row.ledgerNodeLevel|| (nodeKind==="LEDGER"?4:1));
+      if(!["GROUP","LEDGER"].includes(nodeKind)||!Number.isInteger(level)||level<1||level>4)
+        throw new Error(`Row ${i+1}: Invalid hierarchy level`);
+      if(nodeKind==="GROUP"&&level>3)throw new Error(`Row ${i+1}: Groups may have only three levels`);
+      const amount=Number(row.openingBalance||0);
+      if(!Number.isFinite(amount)||amount<0)throw new Error(`Row ${i+1}: Opening balance must be zero or positive`);
+      if(nodeKind==="GROUP"&&amount!==0)throw new Error(`Row ${i+1}: Groups cannot have an opening balance. Set the balance on the ledger.`);
+      const balanceType=String(row.openingBalanceType||"DR").toUpperCase();
+      if(!["DR","CR"].includes(balanceType))throw new Error(`Row ${i+1}: Opening type must be DR or CR`);
+      const fy=String(row.openingFinancialYear||fyDefault).trim();
+      if(!/^\d{4}-\d{2}$/.test(fy)||Number(fy.slice(-2))!==(Number(fy.slice(2,4))+1)%100)
+        throw new Error(`Row ${i+1}: Financial year must be like 2026-27`);
+      const existingParentId=String(row.parentLedgerAccountId||"").trim();
+      const parentKey=String(row.parentClientKey||"").trim();
+      if(existingParentId&&parentKey)throw new Error(`Row ${i+1}: Select only one parent account`);
+      prepared.push({name,key,tally,amount,balanceType,fy,existingParentId,parentKey,nodeKind,level});
+    }
+    const parentIds=[...new Set(prepared.map(x=>x.existingParentId).filter(Boolean))];
+    if(parentIds.some(x=>!mongoose.isValidObjectId(x)))throw new Error("Invalid parent account selected");
+    const [existingAccounts,parentDocs]=await Promise.all([
+      User.find({tenantKey,role:"LEDGER_ACCOUNT"}).select("_id name tallyAccountTypeCode parentLedgerAccountId ledgerNodeKind ledgerNodeLevel status").lean(),
+      User.find({_id:{$in:parentIds},tenantKey,role:"LEDGER_ACCOUNT",status:"ACTIVE"})
+        .select("_id name tallyAccountTypeCode parentLedgerAccountId ledgerNodeKind ledgerNodeLevel").lean()
+    ]);
+    if(parentDocs.length!==parentIds.length)throw new Error("One or more parent groups are unavailable or inactive");
+    const byParentId=new Map(parentDocs.map(x=>[String(x._id),x]));
+    const byKey=new Map(prepared.map(x=>[x.key,x]));
+    const knownIds=new Map(existingAccounts.map(x=>[String(x._id),x]));
+    const seenSiblings=new Set(existingAccounts.map(x=>ledgerSiblingKey(x.name,x.tallyAccountTypeCode,x.parentLedgerAccountId)));
+    const resolvedLevel=new Map();
+    const visiting=new Set();
+    const levelFor=(row)=>{
+      if(resolvedLevel.has(row.key))return resolvedLevel.get(row.key);
+      if(visiting.has(row.key))throw new Error(`${row.name}: Circular parent hierarchy is not allowed`);
+      visiting.add(row.key);
+      const parent=row.parentKey?byKey.get(row.parentKey):byParentId.get(row.existingParentId);
+      if((row.parentKey||row.existingParentId)&&!parent)throw new Error(`${row.name}: Parent account not found`);
+      if(!parent){
+        if(row.nodeKind==="GROUP"&&row.level!==1)throw new Error(`${row.name}: Main account must be the first level`);
+        if(row.nodeKind==="LEDGER"&&row.level!==4)throw new Error(`${row.name}: Standalone ledgers use Ledger level`);
+      }else{
+        const parentType=String(parent.tally?.systemCode||parent.tallyAccountTypeCode);
+        if(parentType!==row.tally.systemCode)throw new Error(`${row.name}: Parent must belong to the same Accounting Type`);
+        if(ledgerNodeKind(parent)!=="GROUP")throw new Error(`${row.name}: Only an account GROUP can contain children`);
+        const parentLevel=row.parentKey?levelFor(parent):Number(parent.ledgerNodeLevel||1);
+        const desiredLevel=row.nodeKind==="GROUP"?parentLevel+1:4;
+        if(row.nodeKind==="GROUP"&&desiredLevel>3)throw new Error(`${row.name}: Maximum three group levels before the ledger`);
+        if(row.level!==desiredLevel)throw new Error(`${row.name}: Expected hierarchy level ${desiredLevel}`);
+      }
+      const parentToken=row.parentKey?`new:${row.parentKey}`:row.existingParentId||"root";
+      const sibling=ledgerSiblingKey(row.name,row.tally.systemCode,parentToken);
+      if(seenSiblings.has(sibling))throw new Error(`${row.name}: An account with this name already exists under the selected parent`);
+      seenSiblings.add(sibling);
+      visiting.delete(row.key);resolvedLevel.set(row.key,row.level);return row.level;
+    };
+    for(const row of prepared)levelFor(row);
+    const planCode=req.auth.planCode||"COMPLETE";
+    const passwordHash=await bcrypt.hash(crypto.randomBytes(32).toString("hex"),12);
+    const docs=prepared.map(row=>new User({
+      tenantKey,tenantId,name:row.name,role:"LEDGER_ACCOUNT",
+      email:`ledger-${makeId("USR").toLowerCase()}@no-login.rupio.invalid`,passwordHash,loginEnabled:false,
+      accountType:row.tally.name,tallyAccountTypeCode:row.tally.systemCode,
+      tallyAccountTypeName:row.tally.name,tallyAccountNature:row.tally.nature||"",
+      ledgerNodeKind:row.nodeKind,ledgerNodeLevel:row.level,
+      openingFinancialYear:row.fy,openingBalance:row.nodeKind==="GROUP"?0:row.amount,
+      openingBalanceType:row.balanceType,
+      apps:[],permissions:[],planCode,status:"ACTIVE",approvalLimits:{},
+      ...(row.nodeKind==="LEDGER"
+        ?buildPrimaryUserAccounting({name:row.name,tally:row.tally,openingBalance:row.amount,openingBalanceType:row.balanceType,openingFinancialYear:row.fy,ledgerName:row.name})
+        :{accountingRequired:false,accountingMappings:[]})
+    }));
+    const idsByKey=new Map(prepared.map((r,i)=>[r.key,docs[i]._id]));
+    for(let i=0;i<docs.length;i++){
+      const row=prepared[i];
+      docs[i].parentLedgerAccountId=row.parentKey?idsByKey.get(row.parentKey):(row.existingParentId||undefined);
+    }
+    let inserted;
+    try {
+      inserted=await User.insertMany(docs,{ordered:true});
+      for(const item of inserted)if(ledgerNodeKind(item)==="LEDGER")await syncPrimaryUserAccounting(item);
+    } catch(error) {
+      const newIds=docs.map(x=>String(x._id));
+      try {
+        await CompanyLedger.deleteMany({tenantKey,ownerType:"USER",ownerId:{$in:newIds}});
+        await User.deleteMany({_id:{$in:docs.map(x=>x._id)},tenantKey});
+      } catch(rollbackError) {
+        return fail(res,`Account creation failed; cleanup needs review: ${rollbackError.message}`,500);
+      }
+      throw error;
+    }
+    return ok(res,{created:inserted.length,groups:prepared.filter(x=>x.nodeKind==="GROUP").length,
+      ledgers:prepared.filter(x=>x.nodeKind==="LEDGER").length,
+      items:inserted.map(x=>({id:String(x._id),name:x.name,ledgerNodeKind:x.ledgerNodeKind,ledgerNodeLevel:x.ledgerNodeLevel,parentLedgerAccountId:String(x.parentLedgerAccountId||"")}))},`${inserted.length} accounts created`,201);
+  }catch(error){return fail(res,error.message||"Could not create ledger hierarchy",error.code===11000?409:400)}
+});
+
+// Reorganise group nodes without modifying historical ledger ownership or postings.
+router.put("/users/ledger-accounts/:id/group", async(req,res)=>{
+  if(!canManageAccess(req))return fail(res,"Access administration permission required",403);
+  const tenantKey=req.auth.role==="MASTER"&&req.body.tenantKey?await resolveTenantKeyAlias(req.body.tenantKey):req.auth.tenantKey;
+  if(!mongoose.isValidObjectId(req.params.id))return fail(res,"Invalid group ID",400);
+  const account=await User.findOne({_id:req.params.id,tenantKey,role:"LEDGER_ACCOUNT"});
+  if(!account)return fail(res,"Group not found",404);
+  if(ledgerNodeKind(account)!=="GROUP")return fail(res,"Only group headings can be edited here. Use Edit Ledger for posting ledgers.",400);
+  const name=String(req.body.name||"").trim().replace(/\s+/g," ");
+  if(!name||name.length>160)return fail(res,"Enter a group name (maximum 160 characters)",400);
+  const parentId=String(req.body.parentLedgerAccountId||"").trim();
+  let parent=null,level=1;
+  if(parentId){
+    if(!mongoose.isValidObjectId(parentId)||parentId===String(account._id))return fail(res,"Invalid parent group",400);
+    parent=await User.findOne({_id:parentId,tenantKey,role:"LEDGER_ACCOUNT",status:"ACTIVE"}).lean();
+    if(!parent||ledgerNodeKind(parent)!=="GROUP"||parent.tallyAccountTypeCode!==account.tallyAccountTypeCode)
+      return fail(res,"Parent must be an active group of the same Accounting Type",400);
+    level=Number(parent.ledgerNodeLevel||1)+1;
+    if(level>3)return fail(res,"Maximum three levels of groups are supported",400);
+    const visited=new Set([String(account._id)]);
+    let cursor=parent;
+    while(cursor){
+      const id=String(cursor._id);
+      if(visited.has(id))return fail(res,"Circular account hierarchy is not allowed",409);
+      visited.add(id);
+      cursor=cursor.parentLedgerAccountId?await User.findOne({_id:cursor.parentLedgerAccountId,tenantKey,role:"LEDGER_ACCOUNT"}).lean():null;
+    }
+  }
+  if(level!==Number(account.ledgerNodeLevel||1))return fail(res,"Moving groups across levels is not supported. Move its children first.",409);
+  const siblings=await User.find({tenantKey,role:"LEDGER_ACCOUNT",tallyAccountTypeCode:account.tallyAccountTypeCode,
+    parentLedgerAccountId:parent?parent._id:{$in:[null]}}).select("_id name").lean();
+  if(siblings.some(x=>String(x._id)!==String(account._id)&&x.name.trim().toLocaleLowerCase("en-IN")===name.toLocaleLowerCase("en-IN")))
+    return fail(res,"A group with that name already exists under this parent",409);
+  account.name=name;
+  account.parentLedgerAccountId=parent?parent._id:undefined;
+  await account.save();
+  return ok(res,{item:{id:String(account._id),name:account.name,parentLedgerAccountId:String(account.parentLedgerAccountId||"")}},"Group updated");
+});
+
 router.post("/users", async (req,res) => {
   if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
   const tenantKey=req.auth.role==="MASTER" && req.body.tenantKey ? await resolveTenantKeyAlias(req.body.tenantKey) : req.auth.tenantKey;
@@ -1378,18 +1669,26 @@ router.post("/users", async (req,res) => {
   const explicitLedgerMode=Boolean(String(req.body.ledgerLibraryMainHead||"").trim());
   if(explicitLedgerMode&&!tally) return fail(res,"Accounting Type is required when creating a standalone Ledger Account",400);
   const ledgerOnly=explicitLedgerMode||isStandaloneLedgerAccount(tally);
+  let parentLedgerAccountId;
+  if(ledgerOnly && req.body.parentLedgerAccountId){
+    if(!mongoose.isValidObjectId(req.body.parentLedgerAccountId))return fail(res,"Invalid parent ledger",400);
+    const parent=await User.findOne({_id:req.body.parentLedgerAccountId,tenantKey,role:"LEDGER_ACCOUNT",status:"ACTIVE"}).lean();
+    if(!parent||parent.tallyAccountTypeCode!==tally?.systemCode)return fail(res,"Parent must be an active ledger of the same Accounting Type",400);
+    parentLedgerAccountId=parent._id;
+  }
 
   let roleDoc=null,department=null,hierarchyAssignment=null;
   if(!ledgerOnly){
     roleDoc=await Role.findOne({_id:req.body.roleId,tenantKey,status:"ACTIVE"});
     if(!roleDoc) return fail(res,"Select a valid active Role",400);
-    if(!roleDoc.departmentId) return fail(res,"Assign this Role to a MASTER department before creating users",409);
-    if(Number(roleDoc.hierarchyOrder||0)<=0) return fail(res,"Set the Role rank in Department Role Assignment before creating users",409);
+    const collectorRole = isCollectionExecutiveRole(roleDoc.code);
+    if(!collectorRole && !roleDoc.departmentId) return fail(res,"Assign this Role to a MASTER department before creating users",409);
+    if(!collectorRole && Number(roleDoc.hierarchyOrder||0)<=0) return fail(res,"Set the Role rank in Department Role Assignment before creating users",409);
     if(String(roleDoc.code||"").trim().toUpperCase()==="CUSTOMER") return fail(res,"CUSTOMER is a structural hierarchy node and cannot be assigned to a person/user",409);
-    department=await Department.findOne({_id:roleDoc.departmentId,tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).lean();
-    if(!department) return fail(res,"The Role's department is not active",409);
-    try{hierarchyAssignment=await resolveUserHierarchyAssignment({tenantKey,roleDoc,assignedToUserId:req.body.assignedToUserId});}
-    catch(e){return fail(res,e.message,e.statusCode||409);}
+    if (roleDoc.departmentId) department=await Department.findOne({_id:roleDoc.departmentId,tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).lean();
+    if(!collectorRole && !department) return fail(res,"The Role's department is not active",409);
+    if(!collectorRole) { try{hierarchyAssignment=await resolveUserHierarchyAssignment({tenantKey,roleDoc,assignedToUserId:req.body.assignedToUserId});}
+    catch(e){return fail(res,e.message,e.statusCode||409);} }
   }
 
   const pan=ledgerOnly?"":normalizePersonPan(req.body.pan);
@@ -1446,6 +1745,7 @@ router.post("/users", async (req,res) => {
     tallyAccountTypeCode:tally?.systemCode||"",tallyAccountTypeName:tally?.name||"",tallyAccountNature:tally?.nature||"",
     openingBalance:Number(req.body.openingBalance||0),openingBalanceType:String(req.body.openingBalanceType||"DR").toUpperCase()==="CR"?"CR":"DR",openingFinancialYear,
     role:ledgerOnly?"LEDGER_ACCOUNT":roleDoc.code,
+    parentLedgerAccountId:ledgerOnly?parentLedgerAccountId:undefined,
     apps:ledgerOnly?[]:apps,permissions:ledgerOnly?[]:(roleDoc.permissions||[]),planCode,
     approvalLimits:ledgerOnly?{}:(roleDoc.approvalLimits||{}),status:req.body.status||"ACTIVE",userOverrides:req.body.userOverrides||{},
     ...accounting
@@ -1465,11 +1765,15 @@ router.post("/users", async (req,res) => {
       salary:Number(req.body.salary||0),designation:String(req.body.designation||"").trim(),address:String(req.body.address||"").trim(),pan:pan||undefined,
       aadhaarHash:aadhaar?personHashAadhaar(aadhaar):undefined,aadhaarMasked:aadhaar?personMaskAadhaar(aadhaar):"",
       ...location,
-      roleId:roleDoc._id,departmentId:department._id,department:department.name,
+      roleId:roleDoc._id,departmentId:department?._id,department:department?.name||"",
       employeeId:req.body.employeeId||"",branch:branchDoc?.name||"",warehouseId:req.body.warehouseId||""
     });
   }
 
+  if (!ledgerOnly && isCollectionExecutiveRole(roleDoc?.code)) {
+    try { base.collectorCustomerIds = await validateCollectorCustomerIds(tenantKey, req.body.collectorCustomerIds); }
+    catch (e) { return fail(res, e.message, e.statusCode || 400); }
+  }
   const user=await User.create(base);
   if(!ledgerOnly){
     try{await replaceSalesRolePincodes({tenantKey,user,roleDoc,pincodes:req.body.pincodes,actorId:req.auth.sub});}
@@ -1482,6 +1786,7 @@ router.post("/users", async (req,res) => {
 router.put("/users/:id", async (req,res) => {
   if(!canManageAccess(req)) return fail(res,"Access administration permission required",403);
   const user=await User.findById(req.params.id); if(!user) return fail(res,"User not found",404);
+  if(user.role==="LEDGER_ACCOUNT"&&ledgerNodeKind(user)==="GROUP") return fail(res,"Edit account group headings from the hierarchy editor",409);
   if(req.auth.role!=="MASTER" && user.tenantKey!==req.auth.tenantKey) return fail(res,"User not found",404);
   if(isSystemCashRecord(user)) return fail(res,"CASH is a system-managed account and cannot be edited, assigned or deleted",409);
   const oldDepartmentId=user.departmentId?String(user.departmentId):"";
@@ -1540,17 +1845,19 @@ router.put("/users/:id", async (req,res) => {
   if(!ledgerOnlyMode&&req.body.roleId){
     const roleDoc=await Role.findOne({_id:req.body.roleId,tenantKey:user.tenantKey,status:"ACTIVE"});
     if(!roleDoc)return fail(res,"Selected Role does not belong to this company",409);
-    if(!roleDoc.departmentId)return fail(res,"Assign this Role to a MASTER department before assigning users",409);
-    if(Number(roleDoc.hierarchyOrder||0)<=0)return fail(res,"Set the Role rank in Department Role Assignment before assigning users",409);
+    const collectorRole=isCollectionExecutiveRole(roleDoc.code);
+    if(!collectorRole&&!roleDoc.departmentId)return fail(res,"Assign this Role to a MASTER department before assigning users",409);
+    if(!collectorRole&&Number(roleDoc.hierarchyOrder||0)<=0)return fail(res,"Set the Role rank in Department Role Assignment before assigning users",409);
     if(String(roleDoc.code||"").trim().toUpperCase()==="CUSTOMER")return fail(res,"CUSTOMER is a structural hierarchy node and cannot be assigned to a person/user",409);
-    const department=await Department.findOne({_id:roleDoc.departmentId,tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).lean();
-    if(!department)return fail(res,"The Role's department is not active",409);
-    payload.roleId=roleDoc._id;payload.role=roleDoc.code;payload.accountType=roleDoc.name;payload.departmentId=department._id;payload.department=department.name;payload.permissions=roleDoc.permissions||[];payload.apps=roleDoc.apps||[];payload.approvalLimits=roleDoc.approvalLimits||{};
+    const department=roleDoc.departmentId?await Department.findOne({_id:roleDoc.departmentId,tenantKey:MASTER_DEPARTMENT_TENANT,status:"ACTIVE"}).lean():null;
+    if(!collectorRole&&!department)return fail(res,"The Role's department is not active",409);
+    payload.roleId=roleDoc._id;payload.role=roleDoc.code;payload.accountType=roleDoc.name;payload.departmentId=department?._id;payload.department=department?.name||"";payload.permissions=roleDoc.permissions||[];payload.apps=roleDoc.apps||[];payload.approvalLimits=roleDoc.approvalLimits||{};
   }
 
   if(!ledgerOnlyMode&&(req.body.roleId!==undefined||req.body.assignedToUserId!==undefined)){
     const effectiveRole=await Role.findOne({_id:payload.roleId||user.roleId,tenantKey:user.tenantKey,status:"ACTIVE"});
-    if(effectiveRole){try{const hierarchy=await resolveUserHierarchyAssignment({tenantKey:user.tenantKey,roleDoc:effectiveRole,assignedToUserId:req.body.assignedToUserId!==undefined?req.body.assignedToUserId:user.assignedToUserId});payload.assignedToUserId=hierarchy.parentUser?._id||undefined;}catch(e){return fail(res,e.message,e.statusCode||409);}}
+    if(isCollectionExecutiveRole(effectiveRole?.code))payload.assignedToUserId=undefined;
+    else if(effectiveRole){try{const hierarchy=await resolveUserHierarchyAssignment({tenantKey:user.tenantKey,roleDoc:effectiveRole,assignedToUserId:req.body.assignedToUserId!==undefined?req.body.assignedToUserId:user.assignedToUserId});payload.assignedToUserId=hierarchy.parentUser?._id||undefined;}catch(e){return fail(res,e.message,e.statusCode||409);}}
   }
 
   const shouldRefreshAccounting=["tallyAccountTypeCode","openingBalance","openingBalanceType","openingFinancialYear","ledgerName","name"].some(k=>req.body[k]!==undefined);
@@ -1595,6 +1902,36 @@ router.put("/users/:id", async (req,res) => {
   if(payload.apps && req.auth.role!=="MASTER"){
     const plan=await Plan.findOne({code:user.planCode}).lean();if(plan)payload.apps=payload.apps.filter(k=>Boolean(plan.apps?.[k]));
   }
+  const nextRoleCode = String(payload.role || user.role || "").toUpperCase();
+  if (!ledgerOnlyMode && isCollectionExecutiveRole(nextRoleCode)) {
+    if (req.body.collectorCustomerIds !== undefined || !isCollectionExecutiveRole(user.role)) {
+      try { payload.collectorCustomerIds = await validateCollectorCustomerIds(user.tenantKey, req.body.collectorCustomerIds); }
+      catch (e) { return fail(res, e.message, e.statusCode || 400); }
+    }
+  } else { payload.collectorCustomerIds = []; }
+  if(ledgerOnlyMode){
+    const newCode=String(payload.tallyAccountTypeCode||user.tallyAccountTypeCode||"");
+    if(req.body.parentLedgerAccountId!==undefined){
+      const parentId=String(req.body.parentLedgerAccountId||"").trim();
+      if(parentId){
+        if(!mongoose.isValidObjectId(parentId)||parentId===String(user._id))return fail(res,"Select a different valid parent ledger",400);
+        const parent=await User.findOne({_id:parentId,tenantKey:user.tenantKey,role:"LEDGER_ACCOUNT",status:"ACTIVE"}).lean();
+        if(!parent||parent.tallyAccountTypeCode!==newCode)return fail(res,"Parent must use the same Accounting Type",400);
+        let current=parent;const seen=new Set([String(user._id)]);
+        while(current){
+          const id=String(current._id);if(seen.has(id))return fail(res,"Circular account hierarchy is not allowed",400);
+          seen.add(id);
+          if(!current.parentLedgerAccountId)break;
+          current=await User.findOne({_id:current.parentLedgerAccountId,tenantKey:user.tenantKey,role:"LEDGER_ACCOUNT"}).lean();
+        }
+      }
+      payload.parentLedgerAccountId=parentId||undefined;
+    }
+    if(newCode!==user.tallyAccountTypeCode){
+      const hasChildren=await User.exists({tenantKey:user.tenantKey,parentLedgerAccountId:user._id});
+      if(hasChildren)return fail(res,"Change or remove child accounts before changing the parent's Accounting Type",409);
+    }
+  }
   Object.assign(user,payload);await user.save();
   await syncPrimaryUserAccounting(user);
   if(oldDepartmentId) await reconcilePincodeAssignmentsForDepartment(user.tenantKey,oldDepartmentId,CustomerLink);
@@ -1611,6 +1948,8 @@ router.delete("/users/:id", async (req,res) => {
   if(isSystemCashRecord(user))return fail(res,"CASH is a protected system account and cannot be deleted",409);
   if(String(user._id)===String(req.auth.sub))return fail(res,"You cannot delete the user account you are currently signed in with",409);
   if(String(user.role||"").toUpperCase()==="SUPERADMIN")return fail(res,"SUPERADMIN accounts must be managed from Superadmin administration, not User Master",409);
+  if(await User.exists({tenantKey:user.tenantKey,parentLedgerAccountId:user._id}))
+    return fail(res,"This ledger has subaccounts. Reassign or delete its subaccounts first.",409);
   const userId=String(user._id),userPartyRef=`USER:${userId}`;
   const references=await userReferenceDetails(user.tenantKey,userId);
   const removableSetupRefs=new Set(["user hierarchy","pincode assignments","customer assignments"]);

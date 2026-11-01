@@ -8,6 +8,8 @@ import { makeId } from "../utils/ids.js";
 import { resolveFinancialYear, financialYearFromDate } from "../utils/financialYear.js";
 import { allocateDocumentNoteNumber } from "../services/documentNumberService.js";
 import { syncSalesInvoiceCreditState, validateCreditNoteAgainstInvoice } from "../services/creditNoteRulesService.js";
+import { warehouseStockSnapshot,ensureWarehouseMonthlyClosing,previousMonth } from "../services/warehouseStockService.js";
+import { orderItemInvoicePrice } from "../services/orderInvoicePricing.js";
 
 const router = express.Router();
 
@@ -18,6 +20,15 @@ router.get("/health", (_req, res) =>
 );
 
 router.use(requireAuth);
+// Warehouse tokens are scoped to their app and a fixed set of order/stock actions.
+router.use((req,res,next)=>{
+  if (upper(req.auth?.role) !== "WAREHOUSE") return next();
+  const path=req.path;
+  const allowed = (req.method==="GET" && (/^\/orders$/.test(path) || /^\/orders\/[^/]+$/.test(path) || ["/delivery-boys","/warehouse-stock","/transfers","/monthly-closings"].includes(path)))
+    || (req.method==="POST" && (/^\/orders\/[^/]+\/packing\/complete$/.test(path) || /^\/orders\/[^/]+\/assign-delivery$/.test(path) || /^\/orders\/[^/]+\/packing\/confirm$/.test(path) || ["/transfers","/monthly-closings"].includes(path) || /^\/transfers\/[^/]+\/receive$/.test(path)));
+  if(!allowed)return fail(res,"Warehouse login cannot perform this Order Desk action",403);
+  next();
+});
 
 const clean = (v) => String(v ?? "").trim();
 const upper = (v) => clean(v).toUpperCase();
@@ -389,6 +400,25 @@ async function destinationForOrder(models, order) {
   };
 }
 
+function warehouseMaySee(req,order){
+  if (upper(req.auth.role)!=="WAREHOUSE") return true;
+  const id=clean(req.auth.warehouseId);
+  return id && (clean(order.mainWarehouseId)===id || (order.items||[]).some(x=>clean(x.warehouseId)===id || clean(x.currentWarehouseId)===id));
+}
+async function mainWarehouse(tenantKey){
+  return GenericRecord.findOne({tenantKey,app:"dms",resource:"warehouses",status:"ACTIVE","data.isMainWarehouse":true}).select("_id title").lean();
+}
+async function completePackingWhenReady(req,models,order){
+  const allPacked=(order.items||[]).length>0 && (order.items||[]).every(x=>upper(x.warehouseStatus)==="PACKED" && num(x.packedQty)>0 && (!order.mainWarehouseId || clean(x.currentWarehouseId||x.warehouseId)===clean(order.mainWarehouseId)));
+  if(!allPacked)return false;
+  if(!["SENT_TO_WAREHOUSE","PICKING","PACKING"].includes(upper(order.workflowStatus)))return false;
+  if(upper(order.workflowStatus)==="SENT_TO_WAREHOUSE")await transitionOrder({req,models,order,toStatus:"PICKING",note:"Packing in progress"});
+  if(upper(order.workflowStatus)==="PICKING")await transitionOrder({req,models,order,toStatus:"PACKING",note:"Packing in progress"});
+  order.packing.packedAt=new Date();await order.save();
+  await transitionOrder({req,models,order,toStatus:"PACKED",type:"PACKING_COMPLETED",note:"All warehouse packing and transfers confirmed"});
+  await transitionOrder({req,models,order,toStatus:"SENT_TO_ORDER_DESK",note:"Ready for invoice generation at Order Desk"});
+  return true;
+}
 function shapeOrder(order) {
   const row = order.toObject ? order.toObject() : order;
   const orderedQty = (row.items || []).reduce((s, x) => s + num(x.qty), 0);
@@ -396,6 +426,126 @@ function shapeOrder(order) {
   const invoicedQty = (row.items || []).reduce((s, x) => s + num(x.invoicedQty), 0);
   return { ...row, orderedQty, packedQty, invoicedQty, nextAction: row.nextAction || nextAction(row.workflowStatus), isOrderBased: true };
 }
+
+router.get("/warehouse-stock",async(req,res)=>{
+  try{
+    const fy=await getFy(req);
+    const warehouseId=upper(req.auth.role)==="WAREHOUSE"?clean(req.auth.warehouseId):clean(req.query.warehouseId);
+    if(!warehouseId)return fail(res,"Warehouse is required",400);
+    return ok(res,await warehouseStockSnapshot({tenantKey:req.auth.tenantKey,financialYear:fy,warehouseId}));
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+router.get("/monthly-closings",async(req,res)=>{
+  try{
+    if(upper(req.auth.role)!=="WAREHOUSE"&&!isAdmin(req.auth))return fail(res,"Only the warehouse or Superadmin can access warehouse reconciliation",403);
+    const monthKey=clean(req.query.monthKey)||previousMonth(),warehouseId=upper(req.auth.role)==="WAREHOUSE"?clean(req.auth.warehouseId):clean(req.query.warehouseId);
+    if(!warehouseId)return fail(res,"Select a warehouse",400);
+    const report=await ensureWarehouseMonthlyClosing({tenantKey:req.auth.tenantKey,warehouseId,monthKey});
+    return ok(res,report);
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+router.post("/monthly-closings",async(req,res)=>{
+  try{
+    if(upper(req.auth.role)!=="WAREHOUSE")return fail(res,"Warehouse login required to submit actual stock",403);
+    const warehouseId=clean(req.auth.warehouseId),monthKey=clean(req.body.monthKey)||previousMonth();
+    const report=await ensureWarehouseMonthlyClosing({tenantKey:req.auth.tenantKey,warehouseId,monthKey});
+    if(report.status!=="OPEN")return fail(res,"Monthly report was already submitted",409);
+    const supplied=new Map((Array.isArray(req.body.rows)?req.body.rows:[]).map(x=>[clean(x.productId),x]));
+    for(const row of report.rows){
+      const input=supplied.get(clean(row.productId));
+      if(!input||input.actual===""||input.actual===null||!Number.isFinite(Number(input.actual))||num(input.actual)<0)return fail(res,`Enter actual quantity for ${row.productName}`,400);
+      row.actual=num(input.actual);row.variance=money(row.actual-num(row.expected));row.reason=clean(input.reason);
+      if(Math.abs(row.variance)>0.0001&&!row.reason)return fail(res,`Reason for shortage/excess is required: ${row.productName}`,400);
+    }
+    report.status="SUBMITTED";report.submittedAt=new Date();report.submittedBy=req.auth.sub;
+    await report.save();return ok(res,report,"Closing report submitted to Superadmin");
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+router.post("/monthly-closings/:id/review",async(req,res)=>{
+  try{
+    if(!isAdmin(req.auth))return fail(res,"Superadmin review only",403);
+    const monthKey=clean(req.body.monthKey)||previousMonth();
+    const fy=financialYearFromDate(`${monthKey}-01`);
+    const report=await financialModels(req.auth.tenantKey,fy).WarehouseClosing.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear:fy});
+    if(!report||report.status!=="SUBMITTED")return fail(res,"Submitted report not found",404);
+    report.status="REVIEWED";report.reviewedAt=new Date();report.reviewedBy=req.auth.sub;report.reviewRemarks=clean(req.body.remarks);
+    await report.save();return ok(res,report,"Monthly stock report reviewed");
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+
+// Order-bound transfers. Origin warehouse sends; destination confirms physical receipt.
+router.get("/transfers",async(req,res)=>{
+  try{
+    const fy=await getFy(req),{WarehouseTransfer}=financialModels(req.auth.tenantKey,fy);
+    const filter={tenantKey:req.auth.tenantKey,financialYear:fy};
+    if(upper(req.auth.role)==="WAREHOUSE")filter.$or=[{fromWarehouseId:clean(req.auth.warehouseId)},{toWarehouseId:clean(req.auth.warehouseId)}];
+    if(req.query.orderId)filter.orderId=clean(req.query.orderId);
+    return ok(res,{items:await WarehouseTransfer.find(filter).sort({createdAt:-1}).limit(200).lean()});
+  }catch(e){return fail(res,e.message,500)}
+});
+router.post("/transfers",async(req,res)=>{
+  try{
+    const fy=await getFy(req),models=financialModels(req.auth.tenantKey,fy),order=await requireOrder(req,req.body.orderId,models);
+    if(!["SENT_TO_WAREHOUSE","PICKING","PACKING"].includes(upper(order.workflowStatus)))return fail(res,"This order is not available for packing transfers",409);
+    const mainId=clean(order.mainWarehouseId);
+    if(!mainId)return fail(res,"Permanent Main Warehouse is required",409);
+    const fromId=clean(req.body.fromWarehouseId||req.auth.warehouseId),toId=mainId;
+    if(!fromId||fromId===toId)return fail(res,"Transfer must originate from another warehouse",400);
+    if(upper(req.auth.role)==="WAREHOUSE"&&fromId!==clean(req.auth.warehouseId))return fail(res,"Only source warehouse can transfer these products",403);
+    const mode=upper(req.body.mode);
+    if(!["PACKED","UNPACKED"].includes(mode))return fail(res,"Select PACKED or UNPACKED transfer",400);
+    const rows=Array.isArray(req.body.items)?req.body.items:[];
+    if(!rows.length)return fail(res,"Select products with their packages and weight",400);
+    const productIds=new Set(),transferItems=[];
+    for(const r of rows){
+      const id=clean(r.productId),item=(order.items||[]).find(x=>clean(x.productId)===id);
+      if(!item||clean(item.warehouseId)!==fromId||clean(item.currentWarehouseId||item.warehouseId)!==fromId)return fail(res,"A selected product does not belong to the source warehouse",403);
+      if(productIds.has(id))return fail(res,"Duplicate product in transfer",400);
+      productIds.add(id);
+      if((mode==="PACKED"&&upper(item.warehouseStatus)!=="PACKED") || (mode==="UNPACKED"&&!['SENT_TO_WAREHOUSE','PICKING','PACKING'].includes(upper(item.warehouseStatus))))return fail(res,`${item.nameSnapshot}: unsuitable packing status for ${mode} transfer`,409);
+      if(!Number.isFinite(Number(r.packageCount))||num(r.packageCount)<=0||!Number.isFinite(Number(r.weight))||num(r.weight)<=0)return fail(res,"Product-wise packages and weight must both be greater than zero",400);
+      const qty=num(item.qty);
+      if(num(r.qty)!==qty)return fail(res,`${item.nameSnapshot}: transfer must contain the entire order-allocated quantity (${qty})`,409);
+      transferItems.push({productId:id,productName:item.nameSnapshot,qty,packageCount:num(r.packageCount),weight:num(r.weight)});
+    }
+    let transferNo=makeId("WTR");while(await models.WarehouseTransfer.exists({tenantKey:req.auth.tenantKey,financialYear:fy,transferNo}))transferNo=makeId("WTR");
+    const transfer=await models.WarehouseTransfer.create({tenantKey:req.auth.tenantKey,financialYear:fy,transferNo,orderId:String(order._id),orderNo:order.orderNo,fromWarehouseId:fromId,toWarehouseId:toId,mode,status:"REQUESTED",items:transferItems,requestedAt:new Date(),requestedBy:req.auth.sub});
+    for(const item of order.items||[])if(productIds.has(clean(item.productId)))item.warehouseStatus="TRANSFER_REQUESTED";
+    await order.save();
+    await createEvent({req,models,order,fromStatus:order.workflowStatus,toStatus:order.workflowStatus,type:"TRANSFER_REQUESTED",note:`${mode} transfer ${transferNo} requested`,meta:{transferNo,fromId,toId}});
+    return ok(res,transfer,"Stock transfer initiated",201);
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
+router.post("/transfers/:id/receive",async(req,res)=>{
+  try{
+    const fy=await getFy(req),models=financialModels(req.auth.tenantKey,fy);
+    const transfer=await models.WarehouseTransfer.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear:fy});
+    if(!transfer)return fail(res,"Stock transfer not found",404);
+    if(upper(req.auth.role)==="WAREHOUSE"&&clean(req.auth.warehouseId)!==clean(transfer.toWarehouseId))return fail(res,"Only receiving warehouse can confirm receipt",403);
+    if(transfer.status!=="REQUESTED")return fail(res,"Transfer is already received",409);
+    const order=await requireOrder(req,transfer.orderId,models);
+    if(!["SENT_TO_WAREHOUSE","PICKING","PACKING"].includes(upper(order.workflowStatus)))return fail(res,"Order is not in transfer stage",409);
+    for(const moved of transfer.items){
+      const item=(order.items||[]).find(x=>clean(x.productId)===clean(moved.productId));
+      if(!item||upper(item.warehouseStatus)!=="TRANSFER_REQUESTED")return fail(res,"Transfer item no longer awaiting receipt",409);
+    }
+    for(const moved of transfer.items){
+      const item=order.items.find(x=>clean(x.productId)===clean(moved.productId));
+      item.currentWarehouseId=clean(transfer.toWarehouseId);
+      item.transferReceivedAt=new Date();item.transferMode=transfer.mode;
+      item.packageCount=num(moved.packageCount);item.actualWeight=num(moved.weight);
+      item.warehouseStatus=transfer.mode==="PACKED"?"PACKED":"TRANSFER_RECEIVED_UNPACKED";
+      await models.StockMovement.create({tenantKey:req.auth.tenantKey,financialYear:fy,date:new Date(),productId:moved.productId,warehouseId:transfer.fromWarehouseId,type:"TRANSFER_OUT",qtyOut:moved.qty,qtyIn:0,referenceId:transfer.transferNo});
+      await models.StockMovement.create({tenantKey:req.auth.tenantKey,financialYear:fy,date:new Date(),productId:moved.productId,warehouseId:transfer.toWarehouseId,type:"TRANSFER_IN",qtyOut:0,qtyIn:moved.qty,referenceId:transfer.transferNo});
+    }
+    transfer.status="RECEIVED";transfer.receivedAt=new Date();transfer.receivedBy=req.auth.sub;
+    await transfer.save();await order.save();
+    // Do not auto-finalize a multi-warehouse order on receipt. The Main Warehouse
+    // must first acknowledge the completed collection/packing. No re-entry of
+    // packages or weights from earlier PACKED items is required.
+    return ok(res,{transfer,order:shapeOrder(order)},"Stock received. Main Warehouse must confirm final packing once all items are packed");
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
+});
 
 router.get("/orders", async (req, res) => {
   try {
@@ -407,9 +557,11 @@ router.get("/orders", async (req, res) => {
     if (req.query.salespersonId) filter.salespersonId = clean(req.query.salespersonId);
     if (req.query.customerGlobalId) filter.customerGlobalId = clean(req.query.customerGlobalId);
     // Warehouse-role users only see orders containing products routed to their warehouse.
-    if (req.auth?.dataScope === "WAREHOUSE" && req.auth?.warehouseId) filter["items.warehouseId"] = clean(req.auth.warehouseId);
+    if (upper(req.auth?.role) === "WAREHOUSE") {
+      filter.$or = [{"items.warehouseId":clean(req.auth.warehouseId)},{mainWarehouseId:clean(req.auth.warehouseId)},{"items.currentWarehouseId":clean(req.auth.warehouseId)}];
+    }
     const search = clean(req.query.search);
-    if (search) filter.$or = [{ orderNo: { $regex: search, $options: "i" } }, { customerNameSnapshot: { $regex: search, $options: "i" } }];
+    if (search) filter.$and=[{$or:[{orderNo:{$regex:search,$options:"i"}},{customerNameSnapshot:{$regex:search,$options:"i"}}]}];
     const [items, total] = await Promise.all([
       SalesOrder.find(filter).sort({ date: -1, createdAt: -1 }).skip((page - 1) * limit).limit(limit),
       SalesOrder.countDocuments(filter),
@@ -422,6 +574,7 @@ router.get("/orders/:id", async (req, res) => {
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
     const order = await requireOrder(req, req.params.id, models);
+    if (upper(req.auth.role)==="WAREHOUSE" && !warehouseMaySee(req,order)) return fail(res,"Order is not assigned to your warehouse",403);
     const events = await models.OrderEvent.find({ tenantKey: req.auth.tenantKey, financialYear, orderId: String(order._id) }).sort({ occurredAt: 1 }).lean();
     const creditNotes = await models.CreditNote.find({ tenantKey: req.auth.tenantKey, financialYear, orderId: String(order._id) }).sort({ createdAt: -1 }).lean();
     return ok(res, { order: shapeOrder(order), events, creditNotes });
@@ -491,6 +644,8 @@ router.post("/orders/:id/release-to-warehouse", async (req, res) => {
       .lean();
     if (warehouses.length !== warehouseIds.length) return fail(res, "One or more selected warehouses are not active", 400);
     const whMap = new Map(warehouses.map((w) => [String(w._id), clean(w.title || w.reference || w.name || w.value || "Warehouse")]));
+    const designatedMain = await mainWarehouse(req.auth.tenantKey);
+    if (warehouseIds.length>1 && !designatedMain) return fail(res,"Set the permanent Main Warehouse before forwarding multi-warehouse orders",409);
 
     // Customer App orders may already be atomically reserved at order placement.
     // Legacy/DMS orders are reserved here before warehouse routing.
@@ -505,9 +660,11 @@ router.post("/orders/:id/release-to-warehouse", async (req, res) => {
       item.warehouseId = warehouseId;
       item.warehouseNameSnapshot = whMap.get(warehouseId) || "Warehouse";
       item.warehouseStatus = "SENT_TO_WAREHOUSE";
+      item.currentWarehouseId = warehouseId;
       assignedIds.push(warehouseId);
     }
     const uniqueAssigned = [...new Set(assignedIds)];
+    order.mainWarehouseId = uniqueAssigned.length>1 ? clean(designatedMain?._id) : uniqueAssigned[0];
     order.warehouseId = uniqueAssigned.length === 1 ? uniqueAssigned[0] : "";
     order.warehouseNameSnapshot = uniqueAssigned.length === 1 ? whMap.get(uniqueAssigned[0]) : "MULTIPLE WAREHOUSES";
     await order.save();
@@ -579,8 +736,11 @@ router.get("/orders/:id/invoice-draft", async (req, res) => {
       const available = Math.max(0, num(x.packedQty) - num(x.invoicedQty));
       return {
         productId: x.productId, sku: x.sku, nameSnapshot: x.nameSnapshot, qty: available,
-        unit: x.unit, packingUnit: x.packingUnit, qtyInBag: x.qtyInBag, saleRate: x.rate,
-        basicRate: x.rate, discountPct: x.discountPct, gstRate: x.gstRateSnapshot,
+        unit: x.unit, packingUnit: x.packingUnit, qtyInBag: x.qtyInBag,
+        saleRate: x.rate, // retain the previous field for existing API consumers
+        // Grade and optional Disc are independent. The basic rate sent to
+        // Invoice already reflects the grade exactly once.
+        ...orderItemInvoicePrice(x), gstRate: x.gstRateSnapshot,
       };
     }).filter((x) => x.qty > 0);
     if (!items.length) return fail(res, "No newly packed quantity is available to invoice", 409);
@@ -588,7 +748,7 @@ router.get("/orders/:id/invoice-draft", async (req, res) => {
       financialYear,
       orderId: String(order._id), orderNo: order.orderNo,
       customerGlobalId: order.customerGlobalId, customerName: order.customerNameSnapshot,
-      warehouseId: clean(order.warehouseId), warehouseName: clean(order.warehouseNameSnapshot),
+      warehouseId: clean(order.mainWarehouseId||order.warehouseId), warehouseName: clean(order.warehouseNameSnapshot),
       packageCount: num(order.packing?.packageCount), actualWeight: num(order.packing?.actualWeight),
       items,
     });
@@ -611,7 +771,10 @@ router.post("/orders/:id/customer-otp", async (req, res) => {
 router.post("/orders/:id/customer-otp/verify", async (req, res) => {
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear), order = await requireOrder(req, req.params.id, models);
-    await verifyChallenge({ otpId: req.body.otpId || order.customerOtpId, code: req.body.code, transactionId: String(order._id), allowedActions: ["ORDER_CUSTOMER_CONFIRM"] });
+    if (!isAdmin(req.auth) && (upper(req.auth.role) !== "SALESPERSON" && upper(req.auth.role) !== "SALES_PERSON" || clean(order.salespersonId) !== clean(req.auth.sub)))
+      return fail(res,"Only the assigned Salesperson or Superadmin can verify this order OTP",403);
+    if (req.body.otpId && clean(req.body.otpId)!==clean(order.customerOtpId)) return fail(res,"This OTP was replaced; ask the customer for their latest code",409);
+    await verifyChallenge({ otpId: order.customerOtpId, code: req.body.code, transactionId: String(order._id), allowedActions: ["ORDER_CUSTOMER_CONFIRM"] });
     order.customerOtpVerifiedAt = new Date(); order.customerOtpId = req.body.otpId || order.customerOtpId; await order.save();
     await transitionOrder({ req, models, order, toStatus: "ORDER_PLACED", note: "Customer verified the order by OTP", type: "CUSTOMER_OTP_VERIFIED" });
     return ok(res, shapeOrder(order), "Customer order verification completed");
@@ -636,8 +799,12 @@ router.post("/orders/:id/transition", async (req, res) => {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear), order = await requireOrder(req, req.params.id, models);
     const to = upper(req.body.toStatus);
     if (!to) return fail(res, "toStatus is required", 400);
+    if (to === "CANCELLED") return fail(res,"Use Order Cancellation (Phase 2) to enforce OTP, stock handover, Credit Note and ledger credit",409);
     if (to === "CANCELLED") {
       if (["DELIVERED", "CLOSED"].includes(upper(order.workflowStatus))) return fail(res, "A delivered/completed order cannot be cancelled", 409);
+      if (order.deliveryRunId || ["DELIVERY_ASSIGNED","OUT_FOR_DELIVERY","DELIVERY_FAILED","RETURN_IN_TRANSIT"].includes(upper(order.workflowStatus))) return fail(res,"Delivery Boy handover and cancellation OTP are required; this cancellation stage is not enabled yet",409);
+      const transferredStock = await models.WarehouseTransfer.exists({tenantKey:req.auth.tenantKey,financialYear,orderId:String(order._id),status:{$in:["REQUESTED","RECEIVED"]}});
+      if(transferredStock)return fail(res,"This order has warehouse transfers. Reverse transfer and verified cancellation must be completed before cancelling; this stage is not enabled yet",409);
 
       // If Order Desk has already posted an invoice but it has NOT been delivered,
       // cancel it safely: reverse accounting + stock, retain the invoice as a
@@ -662,23 +829,9 @@ router.post("/orders/:id/transition", async (req, res) => {
         for (const invoice of linkedInvoices) {
           if (upper(invoice.status) !== "CANCELLED") {
             await reversePostedTransaction({ tenantKey: req.auth.tenantKey, financialYear, transactionId: invoice.invoiceNo, reason: `Order ${order.orderNo} cancelled` });
-            for (const item of invoice.items || []) {
-              const qty = Math.max(0, num(item.qty));
-              if (!qty) continue;
-              await Product.updateOne({ _id: item.productId, tenantKey: req.auth.tenantKey }, { $inc: { currentStock: qty } });
-              await models.StockMovement.create({
-                tenantKey: req.auth.tenantKey,
-                financialYear,
-                date: new Date(),
-                productId: String(item.productId),
-                warehouseId: clean((order.items || []).find((x) => String(x.productId) === String(item.productId))?.warehouseId) || clean(invoice.warehouseId),
-                type: "ORDER_CANCEL_REVERSAL",
-                qtyIn: qty,
-                qtyOut: 0,
-                landedCost: num(item.landedCostSnapshot),
-                referenceId: invoice.invoiceNo,
-              });
-            }
+            // The order-linked invoice did not reduce physical stock at posting.
+            // Therefore cancelling it BEFORE delivery must not increase stock.
+            // Physical return handling and CN workflow are a separate later phase.
             invoice.status = "CANCELLED";
             invoice.workflowStatus = "CANCELLED";
             await invoice.save();
@@ -718,6 +871,8 @@ router.post("/orders/:id/packing/complete", async (req, res) => {
       await transitionOrder({ req, models, order, toStatus: "PACKING", note: "Warehouse packing started" });
     }
     if (upper(order.workflowStatus) !== "PACKING") return fail(res, `Order must be in warehouse packing status`, 409);
+    // Main Warehouse may pack its OWN products while other warehouse transfers
+    // are still in transit. The final order-wide confirmation is a later action.
 
     const rows = Array.isArray(req.body.items) ? req.body.items : [];
     if (!rows.length) return fail(res, "At least one packed product is required", 400);
@@ -731,15 +886,21 @@ router.post("/orders/:id/packing/complete", async (req, res) => {
     for (const item of order.items || []) {
       const row = supplied.get(clean(item.productId));
       if (!row) continue; // Products routed to another warehouse stay untouched.
-      if (scopedWarehouseId && clean(item.warehouseId) !== scopedWarehouseId) {
-        return fail(res, `${item.nameSnapshot || item.sku} is assigned to another warehouse`, 403);
+      if (scopedWarehouseId && clean(item.currentWarehouseId||item.warehouseId) !== scopedWarehouseId) {
+        return fail(res, `${item.nameSnapshot || item.sku} is physically assigned to another warehouse`, 403);
       }
+      if (["TRANSFER_REQUESTED","PACKED"].includes(upper(item.warehouseStatus))) return fail(res,`${item.nameSnapshot||item.sku} is already packed/in transfer`,409);
       if (!clean(item.warehouseId)) return fail(res, `${item.nameSnapshot || item.sku} has no warehouse assignment`, 409);
 
       const packed = clamp(row.packedQty, num(item.invoicedQty), num(item.qty));
       if (packed > num(item.reservedQty)) return fail(res, `${item.nameSnapshot || item.sku}: packed quantity cannot exceed reserved quantity`, 409);
       item.packedQty = packed;
       item.shortageReason = clean(row?.shortageReason);
+      if (!Number.isFinite(Number(row.packageCount)) || num(row.packageCount)<0 || !Number.isFinite(Number(row.actualWeight)) || num(row.actualWeight)<0) return fail(res,"Valid product-wise packages and weight are required",400);
+      if (num(row.damagedQty)>0 && !clean(row.shortageReason)) return fail(res,"Damaged/short product requires a remark",400);
+      item.packageCount = num(row.packageCount);
+      item.actualWeight = num(row.actualWeight);
+      item.damagedQty = num(row.damagedQty);
       item.warehouseStatus = "PACKED";
       item.warehousePackedAt = now;
       item.warehousePackedBy = req.auth.sub;
@@ -748,8 +909,8 @@ router.post("/orders/:id/packing/complete", async (req, res) => {
     }
     if (changedPacked <= 0) return fail(res, "At least one product must have a packed quantity", 400);
 
-    order.packing.packageCount = Math.max(0, num(req.body.packageCount ?? order.packing?.packageCount));
-    order.packing.actualWeight = Math.max(0, num(req.body.actualWeight ?? order.packing?.actualWeight));
+    order.packing.packageCount = (order.items||[]).reduce((s,x)=>s+num(x.packageCount),0);
+    order.packing.actualWeight = (order.items||[]).reduce((s,x)=>s+num(x.actualWeight),0);
     order.packing.remarks = clean(req.body.remarks) || clean(order.packing?.remarks);
     order.packing.startedAt = order.packing.startedAt || now;
     order.packing.packedBy = req.auth.sub;
@@ -758,12 +919,13 @@ router.post("/orders/:id/packing/complete", async (req, res) => {
     // Multi-warehouse orders stay in PACKING until every routed product is marked
     // PACKED. The last warehouse to finish automatically sends it to Order Desk.
     const allWarehousePacked = (order.items || []).length > 0 && (order.items || []).every((item) =>
-      clean(item.warehouseId) && upper(item.warehouseStatus) === "PACKED"
+      clean(item.warehouseId) && upper(item.warehouseStatus) === "PACKED" &&
+      (!order.mainWarehouseId || clean(item.currentWarehouseId||item.warehouseId)===clean(order.mainWarehouseId))
     );
-    if (allWarehousePacked) order.packing.packedAt = now;
+    if (allWarehousePacked && new Set((order.items||[]).map(x=>clean(x.warehouseId))).size===1) order.packing.packedAt = now;
     await order.save();
 
-    if (allWarehousePacked) {
+    if (allWarehousePacked && new Set((order.items||[]).map(x=>clean(x.warehouseId))).size===1) {
       const totalPacked = (order.items || []).reduce((sum, item) => sum + num(item.packedQty), 0);
       await transitionOrder({
         req, models, order, toStatus: "PACKED",
@@ -779,16 +941,95 @@ router.post("/orders/:id/packing/complete", async (req, res) => {
       return ok(res, shapeOrder(order), "Packing completed and sent to Order Desk");
     }
 
-    return ok(res, shapeOrder(order), "Warehouse packing saved; waiting for the remaining warehouse(s)");
+    return ok(res, shapeOrder(order), allWarehousePacked ? "All packed. Confirm at Main Warehouse to send the order to Order Desk" : "Warehouse packing saved; waiting for remaining packing / transfers");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+// No re-packing and no duplicated packages/weights: an order-wide confirmation
+// after all incoming PACKED transfers have physically reached Main Warehouse.
+router.post("/orders/:id/packing/confirm",async(req,res)=>{
+  try{
+    const fy=await getFy(req),models=financialModels(req.auth.tenantKey,fy);
+    const order=await requireOrder(req,req.params.id,models);
+    const mainId=clean(order.mainWarehouseId);
+    if(!mainId)return fail(res,"Main Warehouse is not configured",409);
+    if(upper(req.auth.role)==="WAREHOUSE" && clean(req.auth.warehouseId)!==mainId)
+      return fail(res,"Only the Main Warehouse can confirm packing",403);
+    if(upper(req.auth.role)!=="WAREHOUSE"&&!isAdmin(req.auth))return fail(res,"Main Warehouse authorization required",403);
+    const origins=new Set((order.items||[]).map(x=>clean(x.warehouseId)));
+    if(origins.size<2)return fail(res,"Packing confirmation without re-entry is for multi-warehouse orders",409);
+    if((order.items||[]).some(x=>clean(x.currentWarehouseId||x.warehouseId)!==mainId || upper(x.warehouseStatus)!=="PACKED" || num(x.packedQty)<=0))
+      return fail(res,"Every product must be received at Main Warehouse and marked packed before confirmation",409);
+    const waiting=await models.WarehouseTransfer.exists({tenantKey:req.auth.tenantKey,financialYear:fy,orderId:String(order._id),status:"REQUESTED"});
+    if(waiting)return fail(res,"Receive every pending stock transfer first",409);
+    const changed=await completePackingWhenReady(req,models,order);
+    if(!changed)return fail(res,"Order is not in a confirmable packing stage",409);
+    return ok(res,shapeOrder(order),"All previously packed items confirmed. Order returned to Order Desk for invoicing");
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
 });
 
 router.get("/delivery-boys", async (req, res) => {
   try {
-    const rx = /delivery|driver|dispatch/i;
-    const items = await User.find({ tenantKey: req.auth.tenantKey, status: "ACTIVE", $or: [{ designation: rx }, { accountType: rx }, { role: rx }, { department: rx }] }).select("_id name mobile designation role warehouseId branchId").sort({ name: 1 }).lean();
+    const items = await User.find({tenantKey:req.auth.tenantKey,status:"ACTIVE",loginEnabled:{$ne:false},role:"DELIVERY_BOY"}).select("_id name mobile designation role roleId warehouseId branchId").sort({name:1}).lean();
     return ok(res, { items });
   } catch (error) { return fail(res, error.message, 500); }
+});
+
+router.post("/orders/:id/assign-delivery",async(req,res)=>{
+  try{
+    const fy=await getFy(req),models=financialModels(req.auth.tenantKey,fy),order=await requireOrder(req,req.params.id,models);
+    if(upper(order.workflowStatus)!=="INVOICED")return fail(res,"Order must have its complete invoice before delivery assignment",409);
+    if(order.deliveryRunId)return fail(res,"This order is already assigned",409);
+    const mainId=clean(order.mainWarehouseId);
+    if(!mainId)return fail(res,"Order has no designated dispatch warehouse",409);
+    if(upper(req.auth.role)==="WAREHOUSE" && clean(req.auth.warehouseId)!==mainId)return fail(res,"Only the Main/dispatch Warehouse can assign delivery",403);
+    if(!["MASTER","SUPERADMIN","WAREHOUSE"].includes(upper(req.auth.role)))return fail(res,"Delivery assignment requires warehouse or admin access",403);
+    if((order.items||[]).some(x=>upper(x.warehouseStatus)!=="PACKED" || clean(x.currentWarehouseId||x.warehouseId)!==mainId))return fail(res,"All packed products must be received by the dispatch Warehouse",409);
+    const boy=await User.findOne({_id:clean(req.body.deliveryBoyId),tenantKey:req.auth.tenantKey,status:"ACTIVE",loginEnabled:{$ne:false},role:"DELIVERY_BOY"}).select("_id name mobile").lean();
+    if(!boy)return fail(res,"Select an active user having Delivery Boy role",400);
+    // A warehouse assignment is not route optimization: coordinates are optional.
+    // Do not block Delivery Boy assignment because an address lacks GPS details.
+    const {customer,invoice}=await customerAndInvoice(models,order);
+    if(!invoice)return fail(res,"The full order invoice must be posted first",409);
+    const remote=upper(invoice.transportAssignment?.mode||customer?.regionType||order.deliveryType||"LOCAL")!=="LOCAL";
+    const {address,point}=localCustomerPoint(customer||{});
+    const stop={
+      stopId:makeId("DST"),orderId:String(order._id),orderNo:order.orderNo,
+      invoiceId:String(invoice._id),invoiceNo:invoice.invoiceNo,
+      customerGlobalId:order.customerGlobalId,customerNameSnapshot:order.customerNameSnapshot,
+      mobileSnapshot:clean(customer?.companyContactNumber||customer?.ownerMobile||customer?.contacts?.[0]?.mobile),
+      salespersonId:order.salespersonId||"",warehouseId:mainId,
+      destinationType:remote?"TRANSPORTER":"CUSTOMER",
+      destinationNameSnapshot:remote?(invoice.transportAssignment?.transporterNameSnapshot||"Transporter"):order.customerNameSnapshot,
+      addressSnapshot:remote?(invoice.transportAssignment?.bookingStationAddressSnapshot||""):clean(address?.address||invoice.addressSnapshot),
+      citySnapshot:remote?(invoice.transportAssignment?.bookingStationCitySnapshot||""):clean(address?.city),
+      pincodeSnapshot:remote?(invoice.transportAssignment?.bookingStationPincodeSnapshot||""):clean(address?.pincode),
+      ...(point&&!remote?{location:point}:{}),
+      transporterId:remote?clean(invoice.transportAssignment?.transporterId):"",
+      transporterNameSnapshot:remote?clean(invoice.transportAssignment?.transporterNameSnapshot):"",
+      transporterStationId:remote?clean(invoice.transportAssignment?.bookingStationId):"",
+      transporterStationNameSnapshot:remote?clean(invoice.transportAssignment?.bookingStationNameSnapshot):"",
+      packageCount:num(order.packing?.packageCount||invoice.noOfPackages),
+      actualWeight:num(order.packing?.actualWeight),status:"PENDING"
+    };
+    let runNo=makeId("RUN");while(await models.DeliveryRun.exists({tenantKey:req.auth.tenantKey,financialYear:fy,runNo}))runNo=makeId("RUN");
+    const run=await models.DeliveryRun.create({tenantKey:req.auth.tenantKey,financialYear:fy,runNo,date:new Date(),deliveryBoyId:String(boy._id),deliveryBoyNameSnapshot:boy.name,status:"PLANNED",stops:[stop],createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+    // Physical stock leaves Main Warehouse custody at assignment; invoice remains Pending.
+    // Delivery then settles custody and records SALES OUTWARD exactly once.
+    if(!order.dispatchCustody?.recordedAt){
+      for(const it of order.items||[]){
+        const qty=num(it.packedQty)||num(it.qty);
+        if(qty>0)await models.StockMovement.create({tenantKey:req.auth.tenantKey,financialYear:fy,date:new Date(),productId:it.productId,warehouseId:mainId,type:"DELIVERY_CUSTODY_OUT",qtyIn:0,qtyOut:qty,referenceId:order.orderNo});
+      }
+      order.dispatchCustody={recordedAt:new Date()};
+    }
+    order.deliveryRunId=String(run._id);
+    order.deliveryType=stop.destinationType==="TRANSPORTER"?"TRANSPORTER":"LOCAL";
+    await order.save();
+    await transitionOrder({req,models,order,toStatus:"READY_FOR_DISPATCH",type:"READY_FOR_DISPATCH",note:"Invoice returned to Main Warehouse for delivery assignment"});
+    await transitionOrder({req,models,order,toStatus:"DELIVERY_ASSIGNED",type:"DELIVERY_ASSIGNED",note:`Assigned to ${boy.name}`,meta:{deliveryBoyId:String(boy._id),runNo}});
+    return ok(res,{order:shapeOrder(order),run},"Delivery Boy assigned successfully");
+  }catch(e){return fail(res,e.message,e.statusCode||500)}
 });
 
 router.get("/warehouse-users", async (req, res) => {
@@ -805,6 +1046,9 @@ router.get("/warehouse-users", async (req, res) => {
 
 router.post("/delivery-runs", async (req, res) => {
   try {
+    // New order-linked invoices are assigned only from the Main Warehouse App.
+    // Legacy optimized-route creation cannot bypass the custody handoff.
+    return fail(res,"Assign Delivery Boy in the Main Warehouse App",409);
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
     const orderIds = [...new Set((Array.isArray(req.body.orderIds) ? req.body.orderIds : []).map(clean).filter(Boolean))];
     if (!orderIds.length) return fail(res, "Select at least one invoiced order", 400);
@@ -937,6 +1181,7 @@ router.post("/delivery-runs/:id/stops/:stopId/arrive", async (req, res) => {
 });
 
 router.post("/delivery-runs/:id/stops/:stopId/complete", async (req, res) => {
+  return fail(res,"Use Phase 2 delivery/cancellation endpoints; legacy delivery route disabled to prevent incorrect stock or Credit Note posting",409);
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
     const run = await models.DeliveryRun.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear });
@@ -974,6 +1219,7 @@ router.post("/delivery-runs/:id/stops/:stopId/complete", async (req, res) => {
 });
 
 router.post("/delivery-runs/:id/stops/:stopId/fail", async (req, res) => {
+  return fail(res,"Use Phase 2 delivery/cancellation endpoints; legacy delivery route disabled to prevent incorrect stock or Credit Note posting",409);
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
     const run = await models.DeliveryRun.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear }); if (!run) return fail(res, "Delivery run not found", 404);
@@ -998,6 +1244,7 @@ router.post("/delivery-runs/:id/stops/:stopId/fail", async (req, res) => {
 });
 
 router.post("/delivery-runs/:id/stops/:stopId/return-to-warehouse", async (req, res) => {
+  return fail(res,"Use Phase 2 delivery/cancellation endpoints; legacy delivery route disabled to prevent incorrect stock or Credit Note posting",409);
   try {
     const financialYear = await getFy(req), models = financialModels(req.auth.tenantKey, financialYear);
     const run = await models.DeliveryRun.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey, financialYear }); if (!run) return fail(res, "Delivery run not found", 404);

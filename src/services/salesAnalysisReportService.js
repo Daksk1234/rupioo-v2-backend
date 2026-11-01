@@ -256,7 +256,7 @@ export async function buildSalesAnalysisReport({
       tenantKey,
       financialYear,
       date: dateFilter,
-      status: { $nin: ["DELETED", "CANCELLED"] },
+      status: { $in: ["POSTED", "COMPLETED"] },
     })
       .select("_id date invoiceNo customerGlobalId customerNameSnapshot gstinSnapshot items subtotal taxableTotal taxTotal roundOff grandTotal noOfPackages delivery assignedTo gstType creditNoteAmount netInvoiceAmount")
       .sort({ date: 1, createdAt: 1 })
@@ -517,7 +517,7 @@ export async function buildSalesPartyProductReport({
       tenantKey,
       financialYear,
       date: dateFilter,
-      status: { $nin: ["DELETED", "CANCELLED"] },
+      status: { $in: ["POSTED", "COMPLETED"] },
     })
       .select("_id date invoiceNo customerGlobalId customerNameSnapshot gstinSnapshot items subtotal billDiscount otherCharges taxableTotal taxTotal roundOff grandTotal assignedTo warehouseId warehouseNameSnapshot gstType")
       .sort({ date: 1, createdAt: 1 })

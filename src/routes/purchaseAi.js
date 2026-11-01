@@ -119,7 +119,7 @@ async function salesMetrics(tenantKey, financialYear) {
   for (const fy of fys) {
     const { SalesInvoice } = financialModels(tenantKey, fy);
     const rows = await SalesInvoice.aggregate([
-      { $match: { tenantKey, date: { $gte: since90 }, status: { $ne: "DELETED" } } },
+      { $match: { tenantKey, date: { $gte: since90 }, status: { $in: ["POSTED", "COMPLETED"] } } },
       { $unwind: "$items" },
       { $group: {
         _id: "$items.productId",

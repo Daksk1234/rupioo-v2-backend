@@ -44,13 +44,17 @@ router.get("/registrations", async (req, res) => {
 });
 
 router.get("/tickets", async (req, res) => {
+  if (!isAdminAuth(req.auth)) return fail(res, "Superadmin permission required", 403);
   const filter = { tenantKey: req.auth.tenantKey };
   if (req.query.status) filter.status = upper(req.query.status);
   if (req.query.type) filter.type = upper(req.query.type);
   const items = await CustomerSupportTicket.find(filter).sort({ createdAt: -1 }).limit(500).lean();
-  return ok(res, { items });
+  const links = await CustomerLink.find({ tenantKey: req.auth.tenantKey, globalCustomerId: { $in: items.map(x => x.globalCustomerId) } }).select("globalCustomerId localName displayIdentifier mobile").lean();
+  const names = new Map(links.map(x => [x.globalCustomerId, x]));
+  return ok(res, { items: items.map(x => ({ ...x, customerName: names.get(x.globalCustomerId)?.localName || names.get(x.globalCustomerId)?.displayIdentifier || x.globalCustomerId })) });
 });
 router.patch("/tickets/:id", async (req, res) => {
+  if (!isAdminAuth(req.auth)) return fail(res, "Superadmin permission required", 403);
   const ticket = await CustomerSupportTicket.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey });
   if (!ticket) return fail(res, "Complaint not found", 404);
   if (req.body.status) ticket.status = upper(req.body.status);
@@ -62,12 +66,16 @@ router.patch("/tickets/:id", async (req, res) => {
 });
 
 router.get("/damage-claims", async (req, res) => {
+  if (!isAdminAuth(req.auth)) return fail(res, "Superadmin permission required", 403);
   const filter = { tenantKey: req.auth.tenantKey };
   if (req.query.status) filter.status = upper(req.query.status);
   const items = await CustomerDamageClaim.find(filter).sort({ createdAt: -1 }).limit(500).lean();
-  return ok(res, { items });
+  const links = await CustomerLink.find({ tenantKey: req.auth.tenantKey, globalCustomerId: { $in: items.map(x => x.globalCustomerId) } }).select("globalCustomerId localName displayIdentifier").lean();
+  const names = new Map(links.map(x => [x.globalCustomerId, x]));
+  return ok(res, { items: items.map(x => ({ ...x, customerName: names.get(x.globalCustomerId)?.localName || names.get(x.globalCustomerId)?.displayIdentifier || x.globalCustomerId })) });
 });
 router.patch("/damage-claims/:id", async (req, res) => {
+  if (!isAdminAuth(req.auth)) return fail(res, "Superadmin permission required", 403);
   const claim = await CustomerDamageClaim.findOne({ _id: req.params.id, tenantKey: req.auth.tenantKey });
   if (!claim) return fail(res, "Damage claim not found", 404);
   if (req.body.status) claim.status = upper(req.body.status);

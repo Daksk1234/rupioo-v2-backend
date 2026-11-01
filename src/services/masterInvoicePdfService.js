@@ -373,8 +373,12 @@ export async function buildMasterSalesInvoicePdf({ invoice = {}, company = {}, c
   const ledgerStr = ledgerSigned === null || Number.isNaN(Number(ledgerSigned)) ? "" : `${Math.abs(Number(ledgerSigned)).toFixed(2)} ${Number(ledgerSigned) >= 0 ? "DR" : "CR"}`;
   const lastPaymentText = lastPayment ? `${dateOnly(lastPayment.date)}${n(lastPayment.amount) ? ` — INR ${f2(lastPayment.amount)}` : ""}` : "";
   const transport = invoice.transportAssignment || {};
+  const isPerforma =
+    String(invoice.invoiceType || "").toUpperCase() === "PERFORMA" ||
+    /^Performa\s+Invoice-/i.test(String(invoice.invoiceNo || ""));
   const ctx = {
     invoice,
+    isPerforma,
     companyName,
     companyAddress: company.registeredAddress || "",
     companyCity: company.city || "",
@@ -423,7 +427,16 @@ export async function buildMasterSalesInvoicePdf({ invoice = {}, company = {}, c
 
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ size: "A4", margin: 0, autoFirstPage: true, info: { Title: `Invoice ${ctx.invoiceNo}`, Author: ctx.companyName, Subject: "Tax Invoice" } });
+      const doc = new PDFDocument({
+        size: "A4",
+        margin: 0,
+        autoFirstPage: true,
+        info: {
+          Title: ctx.isPerforma ? `Performa Invoice ${ctx.invoiceNo}` : `Invoice ${ctx.invoiceNo}`,
+          Author: ctx.companyName,
+          Subject: ctx.isPerforma ? "Performa Invoice" : "Tax Invoice",
+        },
+      });
       const chunks = [];
       doc.on("data", (chunk) => chunks.push(chunk));
       doc.on("end", () => resolve(Buffer.concat(chunks)));
@@ -435,6 +448,17 @@ export async function buildMasterSalesInvoicePdf({ invoice = {}, company = {}, c
         doc.rotate(-18, { origin: [A4_W / 2, A4_H / 2] });
         doc.text("CANCELLED", 110, A4_H / 2 - 30, { width: 380, align: "center" });
         doc.restore();
+      }
+
+      if (ctx.isPerforma) {
+        // Keep the regular invoice layout unchanged; Performa gets only the
+        // requested top-most document title and its independent invoice number.
+        doc.font("Helvetica-Bold").fontSize(14).fillColor("#000");
+        doc.text("PERFORMA INVOICE", M, 8, {
+          width: W,
+          align: "center",
+          lineBreak: false,
+        });
       }
 
       let y = M;

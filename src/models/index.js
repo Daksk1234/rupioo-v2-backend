@@ -70,6 +70,12 @@ const userSchema = new Schema({
   tallyAccountTypeCode: { type: String, uppercase: true, trim: true, index: true },
   tallyAccountTypeName: String,
   tallyAccountNature: String,
+  // Hierarchy within standalone ledger accounts; does not alter transaction ownership.
+  parentLedgerAccountId: { type: Schema.Types.ObjectId, ref: "User", index: true },
+  // Non-posting hierarchy nodes organise accounts; only LEDGER nodes post to books.
+  // Historical standalone ledger accounts have no kind field and remain posting ledgers.
+  ledgerNodeKind: { type: String, enum: ["GROUP", "LEDGER"], default: "LEDGER" },
+  ledgerNodeLevel: { type: Number, min: 1, max: 4, default: 4 },
   dateOfBirth: Date,
   fatherName: String,
   fatherMobile: String,
@@ -92,6 +98,8 @@ const userSchema = new Schema({
   // Sales hierarchy geography. Sales Heads keep their territory/coverage here;
   // Sales Person customer ownership continues to use PincodeAssignment.
   coveragePincodes: { type: [String], default: [] },
+  // Explicit customer assignments for Collector mobile role (tenant-scoped).
+  collectorCustomerIds: { type: [String], default: [] },
   branchId: { type: Schema.Types.ObjectId, ref: "BranchOffice", index: true },
   salary: { type: Number, default: 0 },
   openingBalance: { type: Number, default: 0 },
@@ -688,12 +696,18 @@ const companyProfileSchema = new Schema({
   // financialYear is retained as the default/current FY for legacy transaction flows.
   financialYear:String,
   financialYears:{type:[String],default:[]},
+  firstCashFinancialYear:{type:String,default:""},
+  firstCashOpeningBalance:{type:Number,default:0},
   // Sales invoice number series configured by the company Superadmin.
   // Final format: PREFIX-NUMBER-SUFFIX. nextNumber is consumed atomically.
   salesInvoicePrefix:{type:String,default:""},
   salesInvoiceSuffix:{type:String,default:""},
   salesInvoiceStartingNumber:{type:Number,default:1,min:1},
   salesInvoiceNextNumber:{type:Number,default:1,min:1},
+  // Performa invoices use one permanent company-wide numeric series that is
+  // independent of the financial-year Sales Invoice prefix/suffix series.
+  // Example: Performa Invoice-1, Performa Invoice-2, Performa Invoice-3...
+  performaInvoiceNextNumber:{type:Number,default:1,min:1},
   // Central invoice print assets/settings used by the Master Invoice Template.
   logoFileId:{type:String,default:""},
   signatureFileId:{type:String,default:""},
@@ -1374,6 +1388,8 @@ export const BranchOffice = mongoose.model("BranchOffice", branchOfficeSchema);
 export const Employee = mongoose.model("Employee", employeeSchema);
 export const JobOpening = mongoose.model("JobOpening", jobOpeningSchema);
 export const Candidate = mongoose.model("Candidate", candidateSchema);
+// Guarantees only one permanent main warehouse even during simultaneous requests.
+genericRecordSchema.index({tenantKey:1,app:1,resource:1}, {unique:true,partialFilterExpression:{app:"dms",resource:"warehouses","data.isMainWarehouse":true},name:"one_main_warehouse_per_tenant"});
 export const GenericRecord = mongoose.model("GenericRecord", genericRecordSchema);
 export const GlobalCustomer = mongoose.model("GlobalCustomer", globalCustomerSchema);
 export const CustomerLink = mongoose.model("CustomerLink", customerLinkSchema);

@@ -26,13 +26,30 @@ export function readRows(buffer, options = {}) {
     type: "buffer",
     cellDates: false,
     ...(preserveText ? { raw: true } : {}),
+    ...(options?.formattedDates ? { cellNF: true } : {}),
   });
   const first = workbook.Sheets[workbook.SheetNames[0]];
   if (!first) return [];
-  return XLSX.utils.sheet_to_json(first, {
+  const rows = XLSX.utils.sheet_to_json(first, {
     defval: "",
     raw: preserveText ? true : false,
   });
+  if (options?.formattedDates) {
+    // Excel dates are numeric internally. Only accept a number if the cell
+    // actually has an Excel date number-format; use exactly what Excel shows.
+    // CSV values remain untouched, including DD-MM-YYYY ambiguity.
+    const headers = XLSX.utils.sheet_to_json(first, {header:1,raw:true})[0] || [];
+    const columnMap = headers.map((key,index)=>({key,col:index}));
+    rows.forEach((row,index)=>{
+      columnMap.forEach(({key,col})=>{
+        const address=XLSX.utils.encode_cell({r:Number.isInteger(row.__rowNum__)?row.__rowNum__:index+1,c:col});
+        const cell=first[address];
+        if (cell?.t==="n" && typeof cell.z==="string" && XLSX.SSF.is_date(cell.z))
+          row[key]=XLSX.utils.format_cell(cell);
+      });
+    });
+  }
+  return rows;
 }
 
 export function resolveColumns(firstRow = {}, fields = []) {

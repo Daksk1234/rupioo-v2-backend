@@ -85,6 +85,7 @@ const productionAll = () => permissionCodes({ apps:["production"] });
 const allOperational = () => permissionCodes({ apps:["dms","hr","production"] });
 
 export const defaultRoleTemplates = [
+  role({name:"Delivery Boy",code:"DELIVERY_BOY",description:"Order delivery app role. Assignment is made by the Main Warehouse.",apps:["dms"],dataScope:"SELF",permissions:permissionCodes({apps:["dms"],categoryContains:["sales"],actions:VIEW_ACTIONS})}),
   role({
     name:"Company Administrator",
     code:"COMPANY_ADMIN",

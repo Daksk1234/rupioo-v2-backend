@@ -1,5 +1,6 @@
 import express from "express";
 import multer from "multer";
+import bcrypt from "bcryptjs";
 import { GenericRecord } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
@@ -34,6 +35,44 @@ function normalizedPayload(body = {}) {
     tags: body.tags,
     data
   };
+}
+
+const warehouseRoute = (req) => req.params.module === "dms" && req.params.resource === "warehouses";
+const isMain = (v) => v === true || String(v || "").toUpperCase() === "YES" || String(v || "").toLowerCase() === "true";
+const managerAllowed = (req) => ["MASTER","SUPERADMIN"].includes(String(req.auth?.role || "").toUpperCase());
+const publicWarehouse = (row) => {
+  const obj = row?.toObject ? row.toObject() : { ...row };
+  obj.data = { ...(obj.data || {}) };
+  delete obj.data.passwordHash;
+  delete obj.data.loginPassword;
+  delete obj.data.password;
+  return obj;
+};
+async function validateWarehouseWrite(req, payload, existing = null) {
+  if (!warehouseRoute(req)) return;
+  if (!managerAllowed(req)) throw Object.assign(new Error("Only Superadmin can manage warehouse credentials and the Main Warehouse"),{statusCode:403});
+  const data = payload.data || {};
+  const wantMain = isMain(data.isMainWarehouse);
+  const wasMain = existing && isMain(existing.data?.isMainWarehouse);
+  if (existing && wasMain && !wantMain) throw Object.assign(new Error("The permanent Main Warehouse cannot be unset"),{statusCode:409});
+  if (existing && wasMain && String(payload.status || existing.status).toUpperCase() !== "ACTIVE") throw Object.assign(new Error("The permanent Main Warehouse cannot be deactivated"),{statusCode:409});
+  if (wantMain && !wasMain) {
+    const other = await GenericRecord.findOne({tenantKey:req.auth.tenantKey,app:"dms",resource:"warehouses","data.isMainWarehouse":true,_id:{$ne:existing?._id || null}}).lean();
+    if (other) throw Object.assign(new Error(`Main Warehouse is permanently set to ${other.title}. It cannot be changed.`),{statusCode:409});
+  }
+  const pass = String(data.loginPassword || data.password || "");
+  delete data.loginPassword; delete data.password;
+  delete data.passwordHash; // Never accept a client-supplied hash.
+  if (pass) {
+    if (pass.length < 8) throw Object.assign(new Error("Warehouse password must be at least 8 characters"),{statusCode:400});
+    data.passwordHash = await bcrypt.hash(pass,12);
+  } else if (existing?.data?.passwordHash) data.passwordHash = existing.data.passwordHash;
+  data.loginEmail = String(data.loginEmail || data.contactEmail || existing?.data?.loginEmail || "").trim().toLowerCase();
+  if (!data.loginEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.loginEmail)) throw Object.assign(new Error("A valid warehouse app login email is required"),{statusCode:400});
+  if (!data.passwordHash) throw Object.assign(new Error("Set an app login password for the warehouse"),{statusCode:400});
+  if (wantMain) data.isMainWarehouse = true; else data.isMainWarehouse = false;
+  const duplicate = await GenericRecord.findOne({app:"dms",resource:"warehouses","data.loginEmail":data.loginEmail,_id:{$ne:existing?._id || null}}).lean();
+  if (duplicate) throw Object.assign(new Error("Warehouse app login email must be unique across all companies"),{statusCode:409});
 }
 
 function selectionFilter(req, selection = {}) {
@@ -82,7 +121,7 @@ router.get("/:module/:resource", async (req, res) => {
     GenericRecord.find(f).sort({ updatedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     GenericRecord.countDocuments(f)
   ]);
-  ok(res, { module: req.params.module, resource: req.params.resource, items, meta: pageMeta(page, limit, total) });
+  ok(res, { module: req.params.module, resource: req.params.resource, items: warehouseRoute(req) ? items.map(publicWarehouse) : items, meta: pageMeta(page, limit, total) });
 });
 
 router.post("/:module/:resource", async (req, res) => {
@@ -90,6 +129,7 @@ router.post("/:module/:resource", async (req, res) => {
   const title = String(req.body.title || req.body.name || req.body.reference || "").trim();
   if (!title) return fail(res, "Name / title is required");
   const p = normalizedPayload(req.body);
+  try { await validateWarehouseWrite(req,p); } catch (e) { return fail(res,e.message,e.statusCode||500); }
   const item = await GenericRecord.create({
     tenantKey: req.auth.tenantKey,
     app: req.params.module,
@@ -107,11 +147,12 @@ router.post("/:module/:resource", async (req, res) => {
     createdBy: req.auth.sub,
     updatedBy: req.auth.sub
   });
-  ok(res, item, "Record created", 201);
+  ok(res, warehouseRoute(req) ? publicWarehouse(item) : item, "Record created", 201);
 });
 
 // Generic spreadsheet import for all normal MASTER / DMS / HR / Production lists.
 router.post("/:module/:resource/bulk-upload", upload.single("file"), async (req, res) => {
+  if (warehouseRoute(req)) return fail(res,"Create warehouses using the secured form; bulk imports cannot set credentials or main status",403);
   if (!req.file?.buffer) return fail(res, "Excel/CSV file is required", 400);
   let rows;
   try { rows = readRows(req.file.buffer); } catch { return fail(res, "Unable to read Excel/CSV file", 400); }
@@ -167,6 +208,7 @@ router.post("/:module/:resource/bulk-upload", upload.single("file"), async (req,
 });
 
 router.post("/:module/:resource/bulk-edit", async (req, res) => {
+  if (warehouseRoute(req)) return fail(res,"Warehouse changes must use the verified Warehouse form (main warehouse / credentials are protected)",403);
   const filter = selectionFilter(req, req.body.selection);
   if (!filter) return fail(res, "Select at least one record or choose all filtered records", 400);
   const raw = req.body.changes || {};
@@ -182,11 +224,13 @@ router.post("/:module/:resource/bulk-edit", async (req, res) => {
 });
 
 router.post("/:module/:resource/bulk-delete", async (req, res) => {
+  if (warehouseRoute(req)) return fail(res,"Warehouse changes must use the verified Warehouse form (main warehouse / credentials are protected)",403);
   const filter = selectionFilter(req, req.body.selection);
   if (!filter) return fail(res, "Select at least one record or choose all filtered records", 400);
   if (req.params.module === "dms" && req.params.resource === "warehouses") {
-    const rows = await GenericRecord.find(filter).select("_id title").lean();
+    const rows = await GenericRecord.find(filter).select("_id title data").lean();
     for (const row of rows) {
+      if (isMain(row.data?.isMainWarehouse)) return fail(res,"Main Warehouse cannot be deleted",409);
       const references = await warehouseReferenceDetails(req.auth.tenantKey, String(row._id));
       if (references.length) return fail(res, `${row.title || "Warehouse"} is already involved in ${references.slice(0,5).join(", ")} and cannot be deleted.`, 409);
     }
@@ -199,11 +243,12 @@ router.put("/:module/:resource/:id", async (req, res) => {
   const item = await GenericRecord.findOne({ _id: req.params.id, ...baseFilter(req) });
   if (!item) return fail(res, "Record not found", 404);
   const p = normalizedPayload(req.body);
+  try { await validateWarehouseWrite(req,p,item); } catch (e) { return fail(res,e.message,e.statusCode||500); }
   const allowed = ["reference", "title", "status", "date", "amount", "quantity", "assignedTo", "notes", "tags", "data"];
   for (const k of allowed) if (p[k] !== undefined) item[k] = p[k];
   item.updatedBy = req.auth.sub;
   await item.save();
-  ok(res, item, "Record updated");
+  ok(res, warehouseRoute(req) ? publicWarehouse(item) : item, "Record updated");
 });
 
 router.delete("/:module/:resource/:id", async (req, res) => {
@@ -211,6 +256,7 @@ router.delete("/:module/:resource/:id", async (req, res) => {
   const existing = await GenericRecord.findOne(filter).lean();
   if (!existing) return fail(res, "Record not found", 404);
   if (req.params.module === "dms" && req.params.resource === "warehouses") {
+    if (isMain(existing?.data?.isMainWarehouse)) return fail(res,"Main Warehouse cannot be deleted",409);
     const references = await warehouseReferenceDetails(req.auth.tenantKey, String(existing._id));
     if (references.length) return fail(res, `${existing.title || "Warehouse"} is already involved in ${references.slice(0,5).join(", ")} and cannot be deleted.`, 409);
   }
@@ -225,6 +271,10 @@ router.post("/:module/:resource/:id/status", async (req, res) => {
     if (!existing) return fail(res, "Record not found", 404);
     const references = await warehouseReferenceDetails(req.auth.tenantKey, String(existing._id));
     if (references.length) return fail(res, `${existing.title || "Warehouse"} is already involved in ${references.slice(0,5).join(", ")} and cannot be deactivated.`, 409);
+  }
+  if (warehouseRoute(req)) {
+    const existingMain = await GenericRecord.findOne({ _id:req.params.id,...baseFilter(req) }).lean();
+    if (isMain(existingMain?.data?.isMainWarehouse) && String(nextStatus).toUpperCase() !== "ACTIVE") return fail(res,"The permanent Main Warehouse cannot be deactivated",409);
   }
   const item = await GenericRecord.findOneAndUpdate({ _id: req.params.id, ...baseFilter(req) }, { status: nextStatus, updatedBy: req.auth.sub }, { new: true });
   if (!item) return fail(res, "Record not found", 404);

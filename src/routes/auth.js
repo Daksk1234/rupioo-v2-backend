@@ -178,9 +178,12 @@ router.post("/app-login", async (req, res) => {
     ? await Role.findOne({ _id: user.roleId, tenantKey: user.tenantKey, status: "ACTIVE" }).lean()
     : await Role.findOne({ tenantKey: user.tenantKey, code: String(user.role || "").toUpperCase(), status: "ACTIVE" }).lean();
   const appRoleCode = String(roleDoc?.code || user.role || "").toUpperCase();
+  const loginApp = String(req.body.appType || "SALES").trim().toUpperCase();
   const allowedMobileSalesRoles = new Set(["SALES_PERSON", "SALES_HEAD", "SALES_MANAGER"]);
-  if (!allowedMobileSalesRoles.has(appRoleCode)) {
-    return fail(res, "Only Sales Person, Sales Manager or Sales Head users created by the Superadmin can log in to this app.", 403);
+  const collectionExecutiveRoles = new Set(["COLLECTION_EXECUTIVE", "COLLECTOR"]);
+  const collectionExecutiveApp = collectionExecutiveRoles.has(loginApp);
+  if (collectionExecutiveApp ? !collectionExecutiveRoles.has(appRoleCode) : !allowedMobileSalesRoles.has(appRoleCode)) {
+    return fail(res, collectionExecutiveApp ? "Only an active Collection Executive user may access the Collection Executive app." : "Only Sales Person, Sales Manager or Sales Head users can access this app.", 403);
   }
   if (!String(user.tenantKey || "").trim()) {
     return fail(res, "This Sales Person is not linked to a Superadmin company tenant.", 403);

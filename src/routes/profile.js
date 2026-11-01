@@ -1,6 +1,6 @@
 import express from "express";
 import bcrypt from "bcryptjs";
-import { CompanyProfile, Group, Plan, PlatformPayment, User } from "../models/index.js";
+import { CompanyProfile, CompanyLedger, Group, Plan, PlatformPayment, User } from "../models/index.js";
 import { MailConnection } from "../models/mailConnection.model.js";
 import { requireAuth } from "../middleware/auth.js";
 import { fail, ok } from "../utils/http.js";
@@ -145,6 +145,8 @@ router.put("/", async (req, res) => {
   const user = await User.findById(req.auth.sub);
   const company = await CompanyProfile.findOne({ tenantKey: req.auth.tenantKey });
   if (!user || !company) return fail(res, "Superadmin/company profile not found", 404);
+  const previousCashYear=String(company.firstCashFinancialYear||"");
+  const previousCashAmount=Number(company.firstCashOpeningBalance||0);
 
   const requestedGstin = normalizeCompanyGstin(req.body.gstin ?? company.gstin ?? company.tenantKey);
   let tenantMigration = null;
@@ -225,6 +227,22 @@ router.put("/", async (req, res) => {
     if (years.length && !years.includes(company.financialYear)) company.financialYear = years[0];
   }
 
+  // First-year cash opening: company-wide, not per cashier or per user.
+  // Validate BEFORE saving anything. Cashbook and finance reports both read SYS_CASH.
+  const cashOpeningChanged = req.body.firstCashFinancialYear !== undefined || req.body.firstCashOpeningBalance !== undefined;
+  if(cashOpeningChanged){
+    const firstYear=clean(req.body.firstCashFinancialYear ?? company.firstCashFinancialYear);
+    const amount=Number(req.body.firstCashOpeningBalance ?? company.firstCashOpeningBalance ?? 0);
+    const match=/^(\d{4})-(\d{2})$/.exec(firstYear);
+    if(!match || Number(match[2])!==((Number(match[1])+1)%100))return fail(res,"First Cash Financial Year must use YYYY-YY, e.g. 2025-26",400);
+    if(!Number.isFinite(amount) || amount<0 || amount>1e14)return fail(res,"Cash opening must be a valid non-negative amount",400);
+    const configured=[...(company.financialYears||[])].filter(Boolean);
+    if(configured.length && !configured.includes(firstYear))return fail(res,"Cash opening FY must be one of the enabled financial years",400);
+    if(configured.length && firstYear!==configured.sort()[0])return fail(res,"Cash opening must be set against the company's first financial year",400);
+    company.firstCashFinancialYear=firstYear;
+    company.firstCashOpeningBalance=Math.round(amount*100)/100;
+  }
+
   const previousStartingNumber = Number(company.salesInvoiceStartingNumber || 1);
   for (const key of ["salesInvoicePrefix", "salesInvoiceSuffix"]) {
     if (req.body[key] !== undefined) company[key] = clean(req.body[key]);
@@ -273,6 +291,24 @@ router.put("/", async (req, res) => {
     });
   }
 
+  if(cashOpeningChanged){
+    // Synchronize the existing company cash ledger for Cashbook + P&L/Balance Sheet.
+    // Do not create duplicate ledger rows. Skip if a ledger isn't provisioned yet:
+    // Cashbook still uses the profile value directly in that case.
+    const cashLedger=await CompanyLedger.findOne({tenantKey:company.tenantKey,systemAccountCode:"SYS_CASH",ownerType:"COMPANY",status:{$ne:"INACTIVE"}})
+      || await CompanyLedger.findOne({tenantKey:company.tenantKey,systemAccountCode:"SYS_CASH",status:{$ne:"INACTIVE"}});
+    if(cashLedger){
+      const previous=(cashLedger.openingBalances||[]).filter(x=>{
+        const y=String(x.financialYear||"");
+        if(y===String(company.firstCashFinancialYear))return false;
+        // Do not leave the old profile-created opening behind when the first FY changes.
+        if(y===previousCashYear && previousCashYear!==company.firstCashFinancialYear && Number(x.amount||0)===previousCashAmount && String(x.type||"DR")==="DR")return false;
+        return true;
+      });
+      cashLedger.openingBalances=[...previous,{financialYear:company.firstCashFinancialYear,amount:company.firstCashOpeningBalance,type:"DR"}];
+      await cashLedger.save();
+    }
+  }
   const data = await loadProfile(req);
   return ok(res, {
     ...data,

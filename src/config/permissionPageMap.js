@@ -68,13 +68,22 @@ export const PAGE_PERMISSION_MAP = {
   "/dms/closing-stock": p("dms.stock.closing_stock", "dms.stock_reports.closing_stock_report"),
   "/dms/stock-ageing": p("dms.stock_reports.dead_stock_report", "dms.stock.dead_party"),
 
+  // Customer-facing issue dashboards reuse existing customer-management
+  // permissions. Both routes enforce administrator scope on the API itself.
+  // Keep this mapping in sync with frontend/src/config/permissionPageMap.js.
+  "/dms/customer-complaints": p("dms.users.create_customer"),
+  "/dms/damage-claims": p("dms.users.create_customer"),
   "/dms/receipts": p("dms.transaction.receipt"),
   "/dms/cashier": p("dms.transaction.receipt", "dms.transaction.cashbook", "dms.transaction.cashaccount"),
   "/dms/payments": p("dms.transaction.payment"),
+  "/dms/cashbook": p("dms.transaction.cashbook", "dms.transaction.cashaccount", "dms.transaction.receipt", "dms.transaction.payment"),
   "/dms/banking": p("dms.finance_reports.bank_statement", "dms.transaction.cashbook", "dms.transaction.cashaccount"),
   "/dms/bank-accounts": p("dms.finance_reports.bank_statement"),
   "/dms/expenses": p("dms.users.expense_accounts"),
   "/dms/ledger": p("dms.transaction.party_ledger", "dms.finance_reports.party_ledger_report", "dms.finance_reports.partywiseledger_report"),
+  "/dms/trading": p("dms.finance_reports.profit_and_loss_report"),
+  "/dms/cma": p("dms.finance_reports.profit_and_loss_report", "dms.finance_reports.balancesheet"),
+  "/dms/proposed-balance-sheet": p("dms.finance_reports.balancesheet"),
   "/dms/pnl": p("dms.finance_reports.profit_and_loss_report"),
   "/dms/balance-sheet": p("dms.finance_reports.balancesheet"),
 

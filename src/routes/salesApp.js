@@ -27,6 +27,10 @@ import { buildCustomerReceivableLedger } from "../services/customerReceivableLed
 import { dmsAvailableStockMap } from "../services/dmsAvailableStockService.js";
 import { createOtp, verifyOtp } from "../services/otpService.js";
 import { finalizeSalespersonReceipt } from "../services/salespersonReceiptWorkflowService.js";
+import { isReceiptLedgerPosted } from "../services/receiptAccountingRules.js";
+import { getIfscMaster, normalizeIfsc } from "../services/ifscMasterService.js";
+import { syncChequeForReceipt } from "../services/collectionHubService.js";
+import { assertReceiptCustomerLink, assertReceiptOtpParty } from "../utils/collectorReceiptIdentity.js";
 
 const router = express.Router();
 const COLLECTION_EXECUTIVE_ROLES = ["COLLECTION_EXECUTIVE", "COLLECTOR"];
@@ -53,7 +57,7 @@ router.use(async (req, res, next) => {
     if(!active)return fail(res,"Collection Executive account has been deactivated",403);
   } catch(e) { return fail(res,"Collection Executive access validation failed",403); }
   const path = req.path;
-  const allowed = /^\/cash\/(?:assigned-customers|summary|collections|deposit-preview|handover|handovers(?:\/.*)?|day-closing(?:\/.*)?)\/?$/.test(path)
+  const allowed = /^\/cash\/(?:cashier-pickups|assigned-customers|summary|collections|deposit-preview|handover|handovers(?:\/.*)?|day-closing(?:\/.*)?)\/?$/.test(path)
     || /^\/customers\/[^/]+\/(?:receipts|receipt-form)\/?$/.test(path)
     || /^\/receipts\/[^/]+\/customer-otp\/(?:verify|resend)\/?$/.test(path)
     || /^\/collector\/(?:receipts|day-wise|assigned-customers)\/?$/.test(path);
@@ -108,9 +112,18 @@ async function visibleCustomerFilter(req, extra = {}) {
   return { filter, scope };
 }
 
-async function requireVisibleCustomer(req, globalId, { activeOnly = true } = {}) {
+async function requireVisibleCustomer(req, globalId, { activeOnly = true, customerLinkId = "" } = {}) {
   const { filter } = await visibleCustomerFilter(req, { globalCustomerId: clean(globalId) });
   if (activeOnly) filter.status = "ACTIVE";
+  // Resolve the exact tenant-local CustomerLink the collector selected.
+  // Without this, a stale/duplicate global identifier can select a different
+  // company while the mobile UI continues to display the chosen party.
+  if (customerLinkId) {
+    if (!objectIdText(customerLinkId)) {
+      const err = new Error("Invalid selected customer record ID"); err.statusCode = 400; throw err;
+    }
+    filter._id = customerLinkId;
+  }
   const customer = await CustomerLink.findOne(filter).lean();
   if (!customer) {
     const err = new Error("Customer not found or is outside your assigned sales hierarchy");
@@ -1668,11 +1681,7 @@ function receiptForClient(doc) {
   const out = typeof doc.toObject === "function" ? doc.toObject() : { ...doc };
   delete out.customerOtpCode;
   delete out.cashierOtpCode;
-  const workflow = upper(out.receiptWorkflowStatus);
-  const cashierVerified = upper(out.cashierOtpStatus) === "VERIFIED" || Boolean(out.cashierOtpVerifiedAt);
-  out.paymentStatus = upper(out.status) === "POSTED" && (
-    upper(out.collectionSource) !== "SALESPERSON_APP" || cashierVerified || workflow === "READY_FOR_CASHIER_COUNT"
-  ) ? "PAID" : "UNPAID";
+  out.paymentStatus = isReceiptLedgerPosted(out) ? "PAID" : "UNPAID";
   return out;
 }
 
@@ -1897,12 +1906,13 @@ async function receiptFormContext({ tenantKey, financialYear, customer }) {
 
 router.get("/customers/:globalId/receipt-form", async (req, res) => {
   try {
-    const customer = await requireVisibleCustomer(req, req.params.globalId);
+    const customer = await requireVisibleCustomer(req, req.params.globalId, { customerLinkId: clean(req.query.customerLinkId) });
+    assertReceiptCustomerLink(customer, { globalId: req.params.globalId, linkId: clean(req.query.customerLinkId) });
     const financialYear = fyOf(req);
     const form = await receiptFormContext({ tenantKey: req.auth.tenantKey, financialYear, customer });
     return ok(res, {
       ...form,
-      customer: { id: customer.globalCustomerId, name: customerName(customer) },
+      customer: { id: customer.globalCustomerId, linkId: String(customer._id), name: customerName(customer) },
     });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
@@ -1931,7 +1941,13 @@ router.get("/customers/:globalId/receipts", async (req, res) => {
 router.post("/customers/:globalId/receipts", upload.single("paymentImage"), async (req, res) => {
   let receipt = null;
   try {
-    const customer = await requireVisibleCustomer(req, req.params.globalId);
+    const customer = await requireVisibleCustomer(req, req.params.globalId, { customerLinkId: clean(req.body.customerLinkId) });
+    // Reject wrong-party saves BEFORE generating any receipt or OTP.
+    assertReceiptCustomerLink(customer, {
+      globalId: req.params.globalId,
+      linkId: clean(req.body.customerLinkId),
+      expectedName: clean(req.body.expectedCustomerName),
+    });
     const date = req.body.date ? new Date(req.body.date) : new Date();
     if (Number.isNaN(date.getTime())) return fail(res, "Invalid receipt date", 400);
     const financialYear = financialYearFromDate(date) || fyOf(req);
@@ -1939,8 +1955,21 @@ router.post("/customers/:globalId/receipts", upload.single("paymentImage"), asyn
     const mode = upper(req.body.paymentMode || req.body.mode || "CASH");
     if (!["CASH", "BANK"].includes(mode)) return fail(res, "Payment mode must be Cash or Bank", 400);
     const receiptType = mode === "CASH" ? "CASH" : upper(req.body.receiptType);
-    if (mode === "BANK" && !["CHEQUE", "UPI"].includes(receiptType)) return fail(res, "Bank receipt type must be Cheque or UPI", 400);
+    if (mode === "BANK" && !["CHEQUE", "UPI", "NEFT", "RTGS", "IMPS"].includes(receiptType)) return fail(res, "Bank receipt type must be Cheque, UPI, NEFT, RTGS or IMPS", 400);
 
+    const clientMutationId = clean(req.body.clientMutationId);
+    if (clientMutationId && !/^[a-zA-Z0-9:_-]{12,96}$/.test(clientMutationId)) return fail(res, "Invalid collection request ID", 400);
+    // Unique collection request ID protects against mobile retries after network timeouts.
+    if (clientMutationId) {
+      const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
+      await Receipt.init();
+      const previous = await Receipt.findOne({ tenantKey:req.auth.tenantKey, financialYear, clientMutationId });
+      if (previous) {
+        if (clean(previous.collectedBySalespersonId)!==clean(req.auth.sub) || clean(previous.customerGlobalId)!==clean(customer.globalCustomerId))
+          return fail(res,"Collection request ID is already used for another customer",409);
+        return ok(res,{receipt:receiptForClient(previous),reused:true},"Existing collection returned; verify its original OTP");
+      }
+    }
     const form = await receiptFormContext({ tenantKey: req.auth.tenantKey, financialYear, customer });
     const selectedKeys = new Set(jsonArray(req.body.invoiceIds || req.body.againstInvoiceIds).map(clean).filter(Boolean));
     let allocationType = upper(req.body.allocationType || (form.hasUnpaidInvoices ? "INVOICE" : "ADVANCE"));
@@ -2005,6 +2034,18 @@ router.post("/customers/:globalId/receipts", upload.single("paymentImage"), asyn
       return fail(res, "Enter UPI payment text/reference or upload the UPI payment image", 400);
     }
 
+    const payerIfsc = receiptType === "CHEQUE" ? normalizeIfsc(req.body.ifsc || req.body.payerIfsc) : "";
+    let payerBankName = "";
+    if (receiptType === "CHEQUE") {
+      if (!payerIfsc) return fail(res, "IFSC required for cheque collection", 400);
+      const bankMaster = await getIfscMaster(payerIfsc);
+      payerBankName = clean(bankMaster.bank);
+      const chequeDate = clean(req.body.chequeDate);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(chequeDate) || Number.isNaN(new Date(chequeDate + 'T00:00:00Z').getTime()))
+        return fail(res, "Valid cheque date required (YYYY-MM-DD)", 400);
+    }
+    if (mode === "BANK" && receiptType !== "CHEQUE" && !clean(req.body.upiPaymentText))
+      return fail(res, "Transaction reference or UTR required for online payment", 400);
     const cashDenominations = mode === "CASH" ? parseDenominations(req.body.cashDenominations) : [];
     if (mode === "CASH") assertDenominationsMatch(cashDenominations, amount, "receipt cash");
 
@@ -2031,8 +2072,12 @@ router.post("/customers/:globalId/receipts", upload.single("paymentImage"), asyn
       financialYear,
       receiptNo,
       sourceKey: `SALESPERSON:${receiptNo}`,
+      clientMutationId: clientMutationId || undefined,
+      collectedByRole: upper(req.auth.role),
+      payerIfsc, payerBankName,
       date,
       customerGlobalId: customer.globalCustomerId,
+      customerLinkId: String(customer._id),
       partyNameSnapshot: customerName(customer),
       amount,
       mode,
@@ -2042,10 +2087,10 @@ router.post("/customers/:globalId/receipts", upload.single("paymentImage"), asyn
       payerAccountNumber: receiptType === "CHEQUE" ? payerAccountNumber : "",
       paymentProofFileId,
       paymentProofKind: req.file ? receiptType : "",
-      upiPaymentText: receiptType === "UPI" ? upiPaymentText : "",
-      reference: receiptType === "CHEQUE" ? chequeNumber : receiptType === "UPI" ? upiPaymentText : "",
+      upiPaymentText: mode === "BANK" && receiptType !== "CHEQUE" ? upiPaymentText : "",
+      reference: receiptType === "CHEQUE" ? chequeNumber : mode === "BANK" ? upiPaymentText : "",
       chequeNumber: receiptType === "CHEQUE" ? chequeNumber : "",
-      chequeIssueDate: receiptType === "CHEQUE" ? date : undefined,
+      chequeIssueDate: receiptType === "CHEQUE" ? new Date(clean(req.body.chequeDate)+"T00:00:00Z") : undefined,
       chequeStatus: receiptType === "CHEQUE" ? "PENDING_VERIFICATION" : undefined,
       bounceStatus: receiptType === "CHEQUE" ? "PENDING" : "CLEAR",
       remarks: clean(req.body.remarks),
@@ -2080,6 +2125,16 @@ router.post("/customers/:globalId/receipts", upload.single("paymentImage"), asyn
     await receipt.save();
     return ok(res, { receipt: receiptForClient(receipt) }, "Receipt saved; verify customer OTP", 201);
   } catch (error) {
+    if (error?.code === 11000 && clean(req.body.clientMutationId)) {
+      try {
+        const fy = financialYearFromDate(req.body.date || new Date()) || fyOf(req);
+        const { Receipt } = financialModels(req.auth.tenantKey, fy);
+        const previous = await Receipt.findOne({tenantKey:req.auth.tenantKey,financialYear:fy,clientMutationId:clean(req.body.clientMutationId)});
+        if (previous && clean(previous.collectedBySalespersonId) === clean(req.auth.sub)
+          && clean(previous.customerGlobalId) === clean(req.params.globalId))
+          return ok(res,{receipt:receiptForClient(previous),reused:true},'Original collection returned after simultaneous retry');
+      } catch (_) { /* expose original failure below */ }
+    }
     if (receipt?._id && receipt.status !== "POSTED") await receipt.deleteOne().catch(() => {});
     return fail(res, error.message, error.statusCode || 500);
   }
@@ -2089,6 +2144,7 @@ router.post("/receipts/:receiptId/customer-otp/resend", async (req, res) => {
   try {
     const financialYear = clean(req.body.financialYear || req.query.financialYear) || fyOf(req);
     const receipt = await salespersonReceiptById(req, financialYear, req.params.receiptId, { includeSecrets: true });
+    assertReceiptOtpParty(receipt, { expectedGlobalId: req.body.expectedCustomerGlobalId, expectedLinkId: req.body.expectedCustomerLinkId, expectedName: req.body.expectedCustomerName });
     if (receipt.customerOtpStatus === "VERIFIED") return fail(res, "Customer OTP is already verified", 409);
     const otp = await newReceiptOtp({ tenantKey: req.auth.tenantKey, receipt, type: "CUSTOMER" });
     receipt.customerOtpId = otp.otpId;
@@ -2105,6 +2161,8 @@ router.post("/receipts/:receiptId/customer-otp/verify", async (req, res) => {
   try {
     const financialYear = clean(req.body.financialYear || req.query.financialYear) || fyOf(req);
     const receipt = await salespersonReceiptById(req, financialYear, req.params.receiptId, { includeSecrets: true });
+    // A different party can never be finalized even with an otherwise valid OTP.
+    assertReceiptOtpParty(receipt, { expectedGlobalId: req.body.expectedCustomerGlobalId, expectedLinkId: req.body.expectedCustomerLinkId, expectedName: req.body.expectedCustomerName });
     if (receipt.customerOtpStatus !== "VERIFIED") {
       const code = clean(req.body.code);
       if (!code) return fail(res, "Enter customer OTP", 400);
@@ -2140,13 +2198,25 @@ router.post("/receipts/:receiptId/customer-otp/verify", async (req, res) => {
       actorId: req.auth.sub,
       actorName: req.auth.name || "",
     });
-    const customer = await requireVisibleCustomer(req, posted.customerGlobalId);
+    // One original OTP-verified receipt drives both Cashier and cheque register.
+    // The link never posts a second customer receipt/journal. On failure the
+    // verified payment remains committed, with a retriable admin link repair.
+    let chequeLink = null, collectionLinkWarning = "";
+    if (upper(posted.receiptType) === "CHEQUE") {
+      try { chequeLink = await syncChequeForReceipt(posted, req.auth); }
+      catch (linkError) {
+        collectionLinkWarning = linkError.message;
+        console.error("Cheque register sync needs review:", posted.receiptNo, linkError.message);
+      }
+    }
+    const customer = await requireVisibleCustomer(req, posted.customerGlobalId, { customerLinkId: clean(posted.customerLinkId) });
     const ledger = await buildCustomerReceivableLedger({ tenantKey: req.auth.tenantKey, financialYear, customer });
     const cash = upper(posted.mode) === "CASH"
       ? await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: posted.collectedBySalespersonId || req.auth.sub })
       : null;
     return ok(res, {
       receipt: receiptForClient(posted),
+      chequeRegister: chequeLink, collectionLinkWarning,
       customerMessage: { title: customerMessage.title, body: customerMessage.body },
       partyName: posted.partyNameSnapshot || customerName(customer),
       outstanding: money(ledger.closingSigned),
@@ -2198,7 +2268,7 @@ router.post("/receipts/:receiptId/cashier-otp/verify", async (req, res) => {
       actorId: req.auth.sub,
       actorName: req.auth.name || "",
     });
-    const customer = await requireVisibleCustomer(req, posted.customerGlobalId);
+    const customer = await requireVisibleCustomer(req, posted.customerGlobalId, { customerLinkId: clean(posted.customerLinkId) });
     const ledger = await buildCustomerReceivableLedger({ tenantKey: req.auth.tenantKey, financialYear, customer });
     const cash = upper(posted.mode) === "CASH"
       ? await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: posted.collectedBySalespersonId || req.auth.sub })
@@ -2303,7 +2373,7 @@ router.get("/cash/collections", async (req, res) => {
         createdByName: r.collectedBySalespersonNameSnapshot || r.createdByNameSnapshot || "",
         isMine: receiptOwnerId(r) === clean(req.auth.sub),
         canDeposit: receiptOwnerId(r) === clean(req.auth.sub),
-        mode: upper(r.mode), receiptType: upper(r.receiptType), amount: money(r.amount),
+        mode: upper(r.receiptType)==="CHEQUE"||upper(r.mode)==="CHEQUE" ? "CHEQUE" : upper(r.mode), receiptType: upper(r.receiptType), amount: money(r.amount),
         cashDepositStatus: upper(r.cashDepositStatus) === "NOT_APPLICABLE" && upper(r.mode) === "BANK" ? "PENDING_TO_DEPOSIT" : (upper(r.cashDepositStatus) || "PENDING_TO_DEPOSIT"),
         ageDays: Math.max(0, Math.floor((startOfDay(new Date()).getTime() - startOfDay(new Date(r.date)).getTime()) / 86400000)),
         cashDepositBatchId: r.cashDepositBatchId || "", cashDepositedAt: r.cashDepositedAt || null, issue,
@@ -2352,6 +2422,9 @@ async function releaseUnverifiedCashHandovers({ tenantKey, financialYear, salesp
         cashDepositStatus: "HANDOVER_PENDING", cashDepositBatchId: String(movement._id) },
       { $set: { cashDepositStatus: "PENDING_TO_DEPOSIT", cashDepositBatchId: "" } },
     );
+    await GenericRecord.updateMany({tenantKey,app:'dms',resource:'cheque-control-received','data.cashierHandoverId':String(movement._id),
+      'data.status':'HANDOVER_REQUESTED'},{$set:{'data.status':'PENDING_WITH_COLLECTOR','data.custodyStatus':'PENDING_WITH_COLLECTOR'},
+        $unset:{'data.cashierHandoverId':''}});
     // Even if the physical OTP is still inside its TTL, it is now unusable.
     if (movement.handoverOtpId) await OtpChallenge.updateOne(
       { tenantKey, otpId: movement.handoverOtpId, transactionId: String(movement._id), status: "PENDING" },
@@ -2396,14 +2469,13 @@ router.get("/cash/deposit-preview", async (req, res) => {
     const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
     const filter = {
       tenantKey: req.auth.tenantKey, financialYear, status: "POSTED",
-      mode: { $in: ["CASH", "BANK"] }, collectionSource: "SALESPERSON_APP",
+      // Collector owns both physical instruments until cashier handover.
+      // Online / UPI / NEFT never enter the physical handover queue.
+      collectionSource: "SALESPERSON_APP", customerOtpStatus: "VERIFIED",
+      disputeStatus: { $ne: "HOLD" },
       $and: [collectionOwnerFilter(req.auth.sub), {
-        $or: [
-          { cashDepositStatus: "PENDING_TO_DEPOSIT" },
-          bankReceiptPendingFilter(),
-          { mode: "CASH", cashDepositStatus: { $in: [null, "", "NOT_APPLICABLE"] } },
-        ],
-      }],
+        $or: [{ mode: "CASH" }, { receiptType: "CHEQUE" }, { mode: "CHEQUE" }],
+      }, { cashDepositStatus: { $in: ["PENDING_TO_DEPOSIT", null, "", "NOT_APPLICABLE"] } }],
     };
     const range = collectionRange(period, new Date(), financialYear, req.query);
     if (range) filter.date = { $gte: range.from, $lt: range.to };
@@ -2411,11 +2483,14 @@ router.get("/cash/deposit-preview", async (req, res) => {
     const items = receipts.map(r => ({
       _id: String(r._id), receiptNo: r.receiptNo, date: r.date,
       customerGlobalId: r.customerGlobalId, partyName: r.partyNameSnapshot || "",
-      mode: upper(r.mode), receiptType: upper(r.receiptType),
+      // Cheques normally use BANK as their accounting mode. Handing over the
+      // physical cheque must still appear as CHEQUE in the collector app.
+      mode: upper(r.receiptType) === "CHEQUE" || upper(r.mode) === "CHEQUE" ? "CHEQUE" : "CASH",
+      receiptType: upper(r.receiptType),
       amount: money(r.amount), cashDenominations: r.cashDenominations || [],
     }));
     const totalCash = money(items.filter(x => x.mode === "CASH").reduce((sum,x)=>sum+num(x.amount),0));
-    const totalBank = money(items.filter(x => x.mode === "BANK").reduce((sum,x)=>sum+num(x.amount),0));
+    const totalBank = money(items.filter(x => x.mode === "CHEQUE").reduce((sum,x)=>sum+num(x.amount),0));
     const partyMap = new Map();
     for (const row of items) {
       const key = `${row.mode}:${clean(row.customerGlobalId || row.partyName)}`;
@@ -2538,6 +2613,9 @@ router.get("/cash/movements", async (req, res) => {
 router.post("/cash/handover", async (req, res) => {
   try {
     const financialYear = fyOf(req);
+    // Collector initiates ONE handover for physical CASH and CHEQUE receipts.
+    // Customer OTP proves the customer's payment, not company possession.
+    // No online payment is eligible for a cashier physical handover.
     // The salesperson no longer selects a receiver. Route new handovers to the
     // company's active DMS cashier, with an administrator as a safe fallback.
     // Preserve explicit recipients for older app versions still in use.
@@ -2572,14 +2650,11 @@ router.post("/cash/handover", async (req, res) => {
     const { Receipt, SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
     const requestedIds = new Set(jsonArray(req.body.receiptIds).map(clean).filter(Boolean));
     const receiptFilter = {
-      tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", mode: { $in: ["CASH", "BANK"] }, collectionSource: "SALESPERSON_APP",
-      $and: [
-        collectionOwnerFilter(req.auth.sub),
-        { $or: [
-          { cashDepositStatus: "PENDING_TO_DEPOSIT" },
-          bankReceiptPendingFilter(),
-          { mode: "CASH", cashDepositStatus: { $in: [null, "", "NOT_APPLICABLE"] } },
-        ] },
+      tenantKey: req.auth.tenantKey, financialYear, status: "POSTED", collectionSource: "SALESPERSON_APP",
+      customerOtpStatus: "VERIFIED", disputeStatus: { $ne: "HOLD" },
+      $and: [collectionOwnerFilter(req.auth.sub),
+        { $or: [{ mode: "CASH" }, { receiptType: "CHEQUE" }, { mode: "CHEQUE" }] },
+        { cashDepositStatus: { $in: ["PENDING_TO_DEPOSIT", null, "", "NOT_APPLICABLE"] } },
       ],
     };
     if (requestedIds.size) {
@@ -2593,8 +2668,18 @@ router.post("/cash/handover", async (req, res) => {
     if (!receipts.length) return fail(res, "There is no undeposited verified receipt to forward", 409);
     if (requestedIds.size && receipts.length !== requestedIds.size) return fail(res, "Some selected receipts are no longer available for deposit; refresh selection", 409);
     const amount = money(receipts.reduce((sum, r) => sum + num(r.amount), 0));
-    const cashAmount = money(receipts.filter(r => upper(r.mode) === "CASH").reduce((sum,r)=>sum+num(r.amount),0));
-    const bankAmount = money(amount-cashAmount);
+    const chequeReceipts=receipts.filter(r=>upper(r.receiptType)==="CHEQUE"||upper(r.mode)==="CHEQUE");
+    const cashAmount = money(receipts.filter(r=>upper(r.mode)==="CASH" && upper(r.receiptType)!=="CHEQUE").reduce((sum,r)=>sum+num(r.amount),0));
+    const bankAmount = money(chequeReceipts.reduce((sum,r)=>sum+num(r.amount),0));
+    if (Math.abs(amount-cashAmount-bankAmount)>0.009) return fail(res,"Only physical cash and cheques can be handed over",409);
+    // All cheques must have an exact linked control record BEFORE the bundle is reserved.
+    for(const r of chequeReceipts){
+      const cheque=await syncChequeForReceipt(r,req.auth);
+      if(!cheque) return fail(res,`Cheque ${r.receiptNo} cannot be registered`,409);
+      const doc=await GenericRecord.findOne({_id:cheque.id,tenantKey:req.auth.tenantKey,app:'dms',resource:'cheque-control-received'}).lean();
+      if(!doc||!['PENDING_WITH_COLLECTOR','PENDING_WITH_SALESPERSON','HANDOVER_REQUESTED'].includes(upper(doc.data?.status)))
+        return fail(res,`Cheque ${r.receiptNo} is already in another custody workflow`,409);
+    }
     const denominations = cashAmount > 0 ? parseDenominations(req.body.denominations) : [];
     if (cashAmount > 0) assertDenominationsMatch(denominations, cashAmount, "cash handover");
 
@@ -2612,8 +2697,9 @@ router.post("/cash/handover", async (req, res) => {
       reference: clean(req.body.reference), remarks: clean(req.body.remarks), denominations,
       receiptBreakdown: receipts.map((r) => ({
         receiptId: String(r._id), receiptNo: r.receiptNo, customerGlobalId: r.customerGlobalId,
-        customerNameSnapshot: r.partyNameSnapshot || "", amount: money(r.amount), mode: upper(r.mode), receiptType: upper(r.receiptType),
-        receiptDenominations: r.cashDenominations || [],
+        customerNameSnapshot: r.partyNameSnapshot || "", amount: money(r.amount),
+        mode: upper(r.receiptType)==="CHEQUE"||upper(r.mode)==="CHEQUE"?"CHEQUE":"CASH", receiptType: upper(r.receiptType),
+        receiptDenominations: r.cashDenominations || [], collectedAt:r.customerOtpVerifiedAt||r.createdAt||r.date,
       })),
       handoverWorkflowStatus: "PENDING_SALESPERSON_OTP",
       handoverOtpStatus: "PENDING",
@@ -2630,10 +2716,29 @@ router.post("/cash/handover", async (req, res) => {
     movement.handoverOtpExpiresAt = otp.expiresAt;
     await movement.save();
 
-    await Receipt.updateMany(
-      { _id: { $in: receipts.map((r) => r._id) } },
-      { $set: { cashDepositStatus: "HANDOVER_PENDING", cashDepositBatchId: String(movement._id) } },
-    );
+    const claimed=[];
+    try {
+      for(const r of receipts){
+        const updated=await Receipt.updateOne({_id:r._id,tenantKey:req.auth.tenantKey,financialYear,
+          customerOtpStatus:'VERIFIED',disputeStatus:{$ne:'HOLD'},cashDepositStatus:{$in:['PENDING_TO_DEPOSIT',null,'','NOT_APPLICABLE']}},
+          {$set:{cashDepositStatus:'HANDOVER_PENDING',cashDepositBatchId:String(movement._id)}});
+        if(updated.modifiedCount!==1)throw Object.assign(new Error('A receipt was already reserved for handover. Refresh.'),{statusCode:409});
+        claimed.push(r._id);
+      }
+      for(const r of chequeReceipts){
+        const changed=await GenericRecord.updateOne({tenantKey:req.auth.tenantKey,app:'dms',resource:'cheque-control-received',
+          'data.linkedReceiptNo':r.receiptNo,'data.linkedReceiptFy':financialYear,
+          'data.status':{$in:['PENDING_WITH_COLLECTOR','PENDING_WITH_SALESPERSON','HANDOVER_REQUESTED']}},
+          {$set:{'data.status':'HANDOVER_REQUESTED','data.custodyStatus':'HANDOVER_REQUESTED','data.cashierHandoverId':String(movement._id)}});
+        if(changed.modifiedCount!==1)throw Object.assign(new Error('Cheque custody changed during handover. Please retry.'),{statusCode:409});
+      }
+    }catch(error){
+      await Receipt.updateMany({_id:{$in:claimed},cashDepositBatchId:String(movement._id)},{$set:{cashDepositStatus:'PENDING_TO_DEPOSIT',cashDepositBatchId:''}});
+      await GenericRecord.updateMany({tenantKey:req.auth.tenantKey,app:'dms',resource:'cheque-control-received','data.cashierHandoverId':String(movement._id)},
+        {$set:{'data.status':'PENDING_WITH_COLLECTOR','data.custodyStatus':'PENDING_WITH_COLLECTOR'},$unset:{'data.cashierHandoverId':''}});
+      await SalespersonCashMovement.updateOne({_id:movement._id},{$set:{status:'CANCELLED',handoverWorkflowStatus:'CANCELLED',handoverOtpStatus:'CANCELLED'}});
+      throw error;
+    }
 
     return ok(res, {
       movement: {
@@ -2643,6 +2748,35 @@ router.post("/cash/handover", async (req, res) => {
       },
     }, "Receipt(s) forwarded to cashier; enter the OTP shown on the cashier page", 201);
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+// Cashier-initiated pickup: private OTP is visible ONLY to the collector whose
+// receipts the cashier selected. Cashier must enter this OTP in DMS.
+router.get('/cash/cashier-pickups',async(req,res)=>{
+ try{
+  const financialYear=clean(req.query.financialYear)||req.defaultFinancialYear;
+  const {SalespersonCashMovement}=financialModels(req.auth.tenantKey,financialYear);
+  const rows=await SalespersonCashMovement.find({tenantKey:req.auth.tenantKey,financialYear,salespersonId:clean(req.auth.sub),
+    type:'HANDOVER',status:'PENDING',handoverWorkflowStatus:'CASHIER_REQUESTED'}).select('+handoverOtpCode').sort({createdAt:-1}).limit(25).lean();
+  return ok(res,{items:rows.map(r=>({id:String(r._id),movementNo:r.movementNo,amount:r.amount,receiptCount:r.receiptBreakdown?.length||0,
+    cashierName:r.recipientName,otp:r.handoverOtpExpiresAt&&new Date(r.handoverOtpExpiresAt)>new Date()?r.handoverOtpCode||'':'',expiresAt:r.handoverOtpExpiresAt}))});
+ }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
+// Resume the collector's unverified handover rather than silently cancelling
+// it when the mobile screen reloads or returns from the background.
+router.get("/cash/handovers/pending-otp", async (req,res) => {
+  try {
+    const financialYear=fyOf(req);
+    const {SalespersonCashMovement}=financialModels(req.auth.tenantKey,financialYear);
+    const rows=await SalespersonCashMovement.find({tenantKey:req.auth.tenantKey,financialYear,
+      salespersonId:req.auth.sub,type:'HANDOVER',status:'PENDING',handoverOtpStatus:'PENDING',
+      handoverWorkflowStatus:'PENDING_SALESPERSON_OTP'}).sort({createdAt:-1}).limit(5).lean();
+    const items=rows.map(m=>({_id:String(m._id),movementNo:m.movementNo,amount:money(m.amount),
+      cashAmount:money(m.cashAmount||0),bankAmount:money(m.bankAmount||0),
+      receiptCount:(m.receiptBreakdown||[]).length,recipientName:m.recipientName||'Cashier',
+      handoverOtpStatus:m.handoverOtpStatus,handoverOtpExpiresAt:m.handoverOtpExpiresAt}));
+    return ok(res,{items},items.length?'Unverified cashier handover can be resumed':'No pending cashier OTP handover');
+  }catch(error){return fail(res,error.message,error.statusCode||500);}
 });
 
 router.post("/cash/handovers/:movementId/otp/verify", async (req, res) => {
@@ -3504,7 +3638,7 @@ router.get("/collector/assigned-customers", async (req,res) => {
     if (!isCollectionExecutiveRole(req.auth.role)) return fail(res, "Collection Executive account required", 403);
     const { filter } = await visibleCustomerFilter(req);
     const rows = await CustomerLink.find(filter).select("globalCustomerId localName displayIdentifier creditDays creditLimit paymentType companyContactNumber ownerMobile").sort({ localName: 1 }).limit(5000).lean();
-    return ok(res, { items: rows.map(c => ({ id: c.globalCustomerId, name: customerName(c), creditDays: num(c.creditDays), creditLimit: num(c.creditLimit), paymentType: c.paymentType, mobile: customerMobile(c) })) });
+    return ok(res, { items: rows.map(c => ({ id: c.globalCustomerId, customerLinkId: String(c._id), name: customerName(c), creditDays: num(c.creditDays), creditLimit: num(c.creditLimit), paymentType: c.paymentType, mobile: customerMobile(c) })) });
   } catch(e) { return fail(res, e.message, e.statusCode || 500); }
 });
 

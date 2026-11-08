@@ -25,6 +25,7 @@ import { searchTaxpayer } from "../services/gstService.js";
 import { resolveCustomerSalesperson } from "../services/assignmentHierarchyService.js";
 import { financialModels } from "../services/accountingService.js";
 import { buildCustomerReceivableLedger } from "../services/customerReceivableLedgerService.js";
+import { isReceiptLedgerPosted } from "../services/receiptAccountingRules.js";
 import { dmsAvailableStockMap } from "../services/dmsAvailableStockService.js";
 import { createOtp, verifyOtp, getActiveCustomerOrderOtp } from "../services/otpService.js";
 import {
@@ -743,7 +744,9 @@ router.get("/home", async (req, res) => {
       SalesInvoice.aggregate([{ $match: invoiceFilter }, { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$grandTotal" } } }]),
       SalesOrder.find(orderFilter).sort({ date: -1 }).limit(3).lean(),
       SalesInvoice.find(invoiceFilter).sort({ date: -1 }).limit(3).select("invoiceNo date grandTotal workflowStatus delivery status").lean(),
-      Receipt.aggregate([{ $match: { ...baseFilter, status: "POSTED" } }, { $group: { _id: null, amount: { $sum: "$amount" } } }]),
+      Receipt.aggregate([{ $match: { ...baseFilter, status: "POSTED", $or: [
+        { collectionSource: { $ne: "SALESPERSON_APP" } }, { ledgerPostedAt: { $exists: true } },
+      ] } }, { $group: { _id: null, amount: { $sum: "$amount" } } }]),
       buildCustomerReceivableLedger({ tenantKey: ctx.tenantKey, financialYear, customer: ctx.link }),
       activePromotionFilter(ctx).then((filter) => CustomerPromotion.countDocuments(filter)),
     ]);
@@ -1111,7 +1114,7 @@ router.get("/financials", async (req, res) => {
       Receipt.find({ tenantKey: ctx.tenantKey, financialYear, customerGlobalId: ctx.link.globalCustomerId, status: { $nin: ["DELETED", "CANCELLED"] } }).sort({ date: -1, createdAt: -1 }).select("-customerOtpCode -cashierOtpCode").lean(),
       buildCustomerReceivableLedger({ tenantKey: ctx.tenantKey, financialYear, customer: ctx.link }),
     ]);
-    const paidReceipts = receipts.filter((r) => upper(r.status) === "POSTED");
+    const paidReceipts = receipts.filter(isReceiptLedgerPosted);
     let remainingReceipts = paidReceipts.reduce((sum, r) => sum + num(r.amount), 0);
     const invoiceStatus = invoices.map((inv) => {
       const net = num(inv.netInvoiceAmount || (num(inv.grandTotal) - num(inv.creditNoteAmount)));
@@ -1142,9 +1145,7 @@ router.get("/financials", async (req, res) => {
     // An unverified collection must not be labelled PAID simply because its accounting entry exists.
     const paymentRows = receipts.map((r) => {
       const isSalesperson = upper(r.collectionSource) === "SALESPERSON_APP";
-      const cashierVerified = upper(r.cashierOtpStatus) === "VERIFIED" || Boolean(r.cashierOtpVerifiedAt);
-      const readyForCount = upper(r.receiptWorkflowStatus) === "READY_FOR_CASHIER_COUNT";
-      const paymentStatus = upper(r.status) === "POSTED" && (!isSalesperson || cashierVerified || readyForCount) ? "PAID" : "UNPAID";
+      const paymentStatus = isReceiptLedgerPosted(r) ? "PAID" : "UNPAID";
       return { ...r, paymentStatus, customerOtpStatus: r.customerOtpStatus || (isSalesperson ? "PENDING" : "NOT_REQUIRED"), cashierOtpStatus: r.cashierOtpStatus || (isSalesperson ? "PENDING" : "NOT_REQUIRED") };
     });
     return ok(res, { financialYear, filters: { startDate: from, endDate: to }, summary: {
@@ -1227,8 +1228,8 @@ async function relationshipInsights(ctx, financialYear) {
   const rates = new Map(); for (const inv of invoices) for (const item of inv.items || []) { const id = clean(item.productId); if (!id) continue; const r = rates.get(id) || { name: item.nameSnapshot, recent: [], prior: [] }; const rate = num(item.effectiveRate || item.rate); const d = new Date(inv.date); if (d >= recentCut) r.recent.push(rate); else if (d >= priorCut) r.prior.push(rate); rates.set(id, r); }
   const priceTrends = [...rates.entries()].map(([productId, r]) => { const avg = (a) => a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0; const recent = avg(r.recent), prior = avg(r.prior); return { productId, name: r.name, recentAverageRate: money(recent), previousAverageRate: money(prior), changePct: prior > 0 ? money(((recent - prior) / prior) * 100) : 0, direction: prior <= 0 ? "NEW" : recent > prior * 1.01 ? "UP" : recent < prior * .99 ? "DOWN" : "STABLE" }; }).filter((x) => x.recentAverageRate > 0).sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct)).slice(0, 12);
   let orderedQty = 0, invoicedQty = 0, cycleDays = []; for (const order of orders) { for (const i of order.items || []) { orderedQty += num(i.qty); invoicedQty += num(i.invoicedQty); } if (order.invoice?.invoiceDate && order.date) cycleDays.push(Math.max(0, (new Date(order.invoice.invoiceDate) - new Date(order.date)) / 86400000)); }
-  const totalSales = invoices.reduce((s, x) => s + num(x.netInvoiceAmount || x.grandTotal), 0); const totalReceipts = receipts.reduce((s, x) => s + num(x.amount), 0); const lastInvoice = invoices[invoices.length - 1];
-  return { financialYear, sales: { invoiceCount: invoices.length, total: money(totalSales), averageInvoice: invoices.length ? money(totalSales / invoices.length) : 0, lastInvoiceAt: lastInvoice?.date || null }, payments: { receiptCount: receipts.length, total: money(totalReceipts), collectionVsSalesPct: totalSales > 0 ? money(totalReceipts / totalSales * 100) : 0 }, supply: { orderCount: orders.length, orderedQty: money(orderedQty), invoicedQty: money(invoicedQty), fillRatePct: orderedQty > 0 ? money(invoicedQty / orderedQty * 100) : null, averageOrderToInvoiceDays: cycleDays.length ? money(cycleDays.reduce((s, x) => s + x, 0) / cycleDays.length) : null }, priceTrends };
+  const totalSales = invoices.reduce((s, x) => s + num(x.netInvoiceAmount || x.grandTotal), 0); const totalReceipts = receipts.filter(isReceiptLedgerPosted).reduce((s, x) => s + num(x.amount), 0); const lastInvoice = invoices[invoices.length - 1];
+  return { financialYear, sales: { invoiceCount: invoices.length, total: money(totalSales), averageInvoice: invoices.length ? money(totalSales / invoices.length) : 0, lastInvoiceAt: lastInvoice?.date || null }, payments: { receiptCount: receipts.filter(isReceiptLedgerPosted).length, total: money(totalReceipts), collectionVsSalesPct: totalSales > 0 ? money(totalReceipts / totalSales * 100) : 0 }, supply: { orderCount: orders.length, orderedQty: money(orderedQty), invoicedQty: money(invoicedQty), fillRatePct: orderedQty > 0 ? money(invoicedQty / orderedQty * 100) : null, averageOrderToInvoiceDays: cycleDays.length ? money(cycleDays.reduce((s, x) => s + x, 0) / cycleDays.length) : null }, priceTrends };
 }
 
 router.get("/insights", async (req, res) => { try { const ctx = await supplierContext(req, res, { activeOnly: true }); if (!ctx) return; const financialYear = companyFinancialYear(ctx.company); return ok(res, { supplier: safeCompany(ctx.company), insights: await relationshipInsights(ctx, financialYear) }); } catch (error) { return fail(res, error.message, 500); } });

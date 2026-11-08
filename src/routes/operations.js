@@ -37,13 +37,20 @@ async function transporterPayloadWithCompanyBase(tenantKey,payload={}){
   const pins=[...new Set((Array.isArray(supplied.servicePincodes)?supplied.servicePincodes:[])
     .map(x=>String(x||"").replace(/\D/g,"").slice(0,6))
     .filter(x=>x.length===6))];
-  const serviceAreas=[];
-  for(const pin of pins){
-    const geo=await geoFromPincode(pin);
-    serviceAreas.push({pincode:pin,city:cleanText(geo.city),state:cleanText(geo.state)});
-  }
+  const geoRows=pins.length?await Pincode.find({pincode:{$in:pins},status:{$ne:"INACTIVE"}}).select("pincode city state area").lean():[];
+  const lookup=new Map();for(const row of geoRows){if(!lookup.has(row.pincode))lookup.set(row.pincode,[]);lookup.get(row.pincode).push(row);}
+  const serviceAreas=pins.map((pin,index)=>{
+    const candidates=lookup.get(pin)||[];
+    if(!candidates.length)throw Object.assign(new Error(`Service PIN ${pin} does not exist in Global PIN Master`),{statusCode:400});
+    const suppliedCity=cleanText((supplied.serviceCities||[])[index]);
+    const suppliedState=cleanText((supplied.serviceStates||[])[index]);
+    const match=candidates.find(r=>(!suppliedCity||cleanText(r.city).toLowerCase()===suppliedCity.toLowerCase())&&(!suppliedState||cleanText(r.state).toLowerCase()===suppliedState.toLowerCase()));
+    const geo=match||candidates[0];
+    return {pincode:pin,city:cleanText(geo.city||geo.area),state:cleanText(geo.state)};
+  });
   return {
     ...payload,
+    address:cleanText(payload.address), contactPerson:cleanText(payload.contactPerson), mobile:cleanText(payload.mobile),
     baseStation:{...base},
     stations:[{
       name:`${base.city} - ${base.pincode}`,
@@ -68,7 +75,7 @@ async function ensureGlobalTransporterFromCompany(payload={}){
     global=await GlobalTransporterMaster.findOne({$or:[{globalTransporterId:gid},{masterKey:key}]});
     if(!global)global=new GlobalTransporterMaster({masterKey:key,globalTransporterId:gid});
   }
-  global.name=name;global.address=cleanText(firstStation.address||global.address);global.pincode=cleanText(firstStation.pincode||global.pincode);global.contactPerson=cleanText(firstContact.name||global.contactPerson);global.mobile=cleanText(firstContact.phone||global.mobile);global.email=cleanText(firstContact.email||global.email).toLowerCase();
+  global.name=name;global.address=cleanText(payload.address||firstStation.address||global.address);global.pincode=cleanText(firstStation.pincode||global.pincode);global.contactPerson=cleanText(payload.contactPerson||firstContact.name||global.contactPerson);global.mobile=cleanText(payload.mobile||firstContact.phone||global.mobile);global.email=cleanText(firstContact.email||global.email).toLowerCase();
   const geo=await geoFromPincode(firstStation.pincode);const cat=[cleanText(firstStation.name),geo.city].filter(Boolean);global.categories=[...new Set([...(global.categories||[]),...cat])];global.directoryGroups=[...new Set([...(global.directoryGroups||[]),geo.state].filter(Boolean))];global.sourceName=global.sourceName||"Rupioo DMS";global.status="ACTIVE";await global.save();
   for(const st of payload.stations||[]){
     if(!cleanText(st.name)&&!cleanText(st.pincode))continue;const g=await geoFromPincode(st.pincode);const sid=stationIdFor(global.globalTransporterId,st.name||g.city||name,st.pincode);
@@ -76,6 +83,30 @@ async function ensureGlobalTransporterFromCompany(payload={}){
   }
   return global;
 }
+
+// Global PIN master is the only source of service cities/pincodes.
+router.get("/transporters/service-cities",async(req,res)=>{
+  const q=cleanText(req.query.q||"").slice(0,70);
+  if(q.length<2)return ok(res,{items:[]});
+  const items=await Pincode.aggregate([
+    {$match:{city:{$regex:regexSafe(q),$options:"i"},status:{$ne:"INACTIVE"}}},
+    {$group:{_id:{city:"$city",district:"$district",state:"$state"},pins:{$addToSet:"$pincode"}}},
+    {$sort:{"_id.city":1,"_id.state":1}},{$limit:50},
+    {$project:{_id:0,city:"$_id.city",district:"$_id.district",state:"$_id.state",count:{$size:"$pins"}}},
+  ]);
+  return ok(res,{items});
+});
+router.post("/transporters/service-city-pincodes",async(req,res)=>{
+  const city=cleanText(req.body?.city),district=cleanText(req.body?.district),state=cleanText(req.body?.state);
+  if(!city||!state)return fail(res,"Choose a city and state from the PIN master",400);
+  const filter={city:{$regex:`^${regexSafe(city)}$`,$options:"i"},state:{$regex:`^${regexSafe(state)}$`,$options:"i"},status:{$ne:"INACTIVE"}};
+  if(district)filter.district={$regex:`^${regexSafe(district)}$`,$options:"i"};
+  const rows=await Pincode.find(filter).select("pincode").lean();
+  const pincodes=[...new Set(rows.map(r=>String(r.pincode)).filter(pin=>/^\d{6}$/.test(pin)))].sort();
+  if(!pincodes.length)return fail(res,"No pincodes found for this city in Global PIN Master",404);
+  if(pincodes.length>10000)return fail(res,"City coverage is too large; split by district",400);
+  return ok(res,{city,district,state,pincodes,count:pincodes.length});
+});
 
 router.get("/transporters",async(req,res)=>{
   const page=Math.max(1,Number(req.query.page||1)),limit=Math.min(200,Math.max(10,Number(req.query.limit||50))),q=cleanText(req.query.q),filter={tenantKey:req.auth.tenantKey};

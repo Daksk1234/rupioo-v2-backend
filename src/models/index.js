@@ -543,6 +543,16 @@ const customerGradeSchema = new Schema({
 }, { timestamps: true });
 customerGradeSchema.index({ tenantKey: 1, code: 1 }, { unique: true });
 
+const priceDiscountRuleSchema = new Schema({
+  tenantKey: { type: String, required: true, index: true },
+  code: { type: String, required: true, uppercase: true, trim: true },
+  name: { type: String, required: true },
+  mode: { type: String, enum: ["FIXED", "VARIABLE"], default: "VARIABLE" },
+  defaultPct: { type: Number, default: 0, min: 0, max: 99.999 },
+  status: { type: String, enum: ["ACTIVE", "INACTIVE"], default: "ACTIVE" }
+}, { timestamps: true });
+priceDiscountRuleSchema.index({ tenantKey: 1, code: 1 }, { unique: true });
+
 const priceListSchema = new Schema({
   tenantKey: { type: String, required: true, index: true },
   code: { type: String, required: true, uppercase: true, index: true },
@@ -872,6 +882,7 @@ const productSchema = new Schema({
   maxGradeDiscountPct: { type: Number, default: 0 },
   profitColorCode: { type: String, default: "RED" },
   pricingScheme: { type: String, default: "STANDARD" },
+  priceListSettings: { type: Schema.Types.Mixed, default: null },
   barcode: String,
   barcodeSource: { type: String, default: "" },
   imageFileIds: [String],
@@ -884,7 +895,7 @@ const transporterSchema = new Schema({
   tenantKey: { type: String, required: true, index: true },
   globalTransporterId: { type: String, index: true },
   name: { type: String, required: true, index: true },
-  gstin: String, pan: String,
+  gstin: String, pan: String, address: String, contactPerson: String, mobile: String,
   stations: [{
     name: String,
     type: { type: String, default: "BOTH" },
@@ -1403,6 +1414,7 @@ export const Unit = mongoose.model("Unit", unitSchema);
 export const CompanyUnit = mongoose.model("CompanyUnit", companyUnitSchema);
 export const ProductCategory = mongoose.model("ProductCategory", productCategorySchema);
 export const CustomerGrade = mongoose.model("CustomerGrade", customerGradeSchema);
+export const PriceDiscountRule = mongoose.model("PriceDiscountRule", priceDiscountRuleSchema);
 export const PriceList = mongoose.model("PriceList", priceListSchema);
 export const PriceListItem = mongoose.model("PriceListItem", priceListItemSchema);
 export const AccountTemplate = mongoose.model("AccountTemplate", accountTemplateSchema);

@@ -1,4 +1,5 @@
 import express from "express";
+import mongoose from "mongoose";
 import PDFDocument from "pdfkit";
 import XLSX from "xlsx";
 import { createHash } from "node:crypto";
@@ -34,6 +35,7 @@ import {
 } from "../services/oldDmsPricingService.js";
 import {
   financialModels,
+  financialCollectionExists,
   postBalancedEntries,
   customerReceivableBalance,
   reversePostedTransaction,
@@ -46,6 +48,7 @@ import {
 } from "../utils/bulkSpreadsheet.js";
 import { requireAnyPermission } from "../middleware/permission.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
+import { canPageAction } from "../config/permissionPageMap.js";
 import { env } from "../config/env.js";
 import { sendBusinessEmail } from "../services/mailService.js";
 import { sendCompanyMail } from "../services/mail/mail.service.js";
@@ -67,6 +70,19 @@ import {
 } from "../utils/financialYear.js";
 import personalFinanceRoutes from "./personalFinance.js";
 import { recalculateBankRunningBalancesForVoucher } from "./banks.js";
+import { companyCashOpening } from "../services/companyCashOpeningService.js";
+import { buildCompanyCashbook } from "../services/companyCashbookEngine.js";
+import { loadCompanyCashbookSources } from "../services/companyCashbookSources.js";
+import { indexCashierReceipts, projectCashierHandover } from "../services/cashierReceiptProjection.js";
+import { companyCashbookYearOpening } from "../services/companyCashbookRolloverService.js";
+import { discoverFinancialYears, fiscalYearCandidates } from "../services/financialYearDiscoveryService.js";
+import { cashbookPeriodSnapshot } from "../services/cashbookPeriodService.js";
+import { buildBookMonthSummary } from "../services/bookMonthSummary.js";
+import { readCashbookRows, balancePreview } from "../services/cashbookImport.js";
+import {detectCashBulkParty,cashBulkMode,cashBulkAmount} from "../services/cashBulkPartyMatcher.js";
+import {isSuperadmin, cashKey, validateBookCorrection, applyCashCorrections, reclassifiedJournal} from "../services/superadminBookCorrectionRules.js";
+import {resolveSuperadminBookSource, originalBookJournal} from "../services/superadminBookSource.js";
+import { normalizeCashbookBulkVoidSelection } from "../services/cashbookBulkVoidSelection.js";
 import {
   allocateCashInvoiceNumber,
   cashInvoiceNumberFromSerial,
@@ -79,6 +95,8 @@ import {
 import { enrichSalesInvoicesWithCreditState } from "../services/creditNoteRulesService.js";
 import { createOtp, verifyOtp } from "../services/otpService.js";
 import { matchCustomerTransporters } from "../services/customerTransporterMatchingService.js";
+import {validateCashierLedgerConfirmation} from "../services/cashierLedgerConfirmRules.js";
+import {postCustodyApprovedReceipt} from "../services/salespersonReceiptWorkflowService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -523,7 +541,7 @@ router.get("/voucher-party-options", async (req, res) => {
   try {
     const tenantKey = req.auth.tenantKey;
     const [customers, users, transporters] = await Promise.all([
-      CustomerLink.find({tenantKey,status:"ACTIVE"}).select("globalCustomerId localName displayIdentifier partyType").lean(),
+      CustomerLink.find({tenantKey,status:"ACTIVE",systemKey:{$ne:"CASH"},"accountingProfile.systemAccountCode":{$ne:"SYS_CASH"}}).select("globalCustomerId localName displayIdentifier partyType").lean(),
       User.find({tenantKey,status:"ACTIVE",systemManaged:{$ne:true}}).select("_id name employeeId role ledgerNodeKind parentLedgerAccountId tallyAccountTypeName tallyAccountTypeCode").lean(),
       Transporter.find({tenantKey,status:"ACTIVE"}).select("_id name gstin pan").lean(),
     ]);
@@ -582,6 +600,12 @@ async function resolveVoucherPostingParty(tenantKey, rawReference, rawType = "")
   const unique=[...new Map(candidates.map(x=>[x.id,x])).values()];
   if (unique.length>1) throw Object.assign(new Error(`Party name "${reference}" matches multiple records. Select the specific party from the directory or provide Party Type and ID.`),{statusCode:400});
   if (!unique.length) throw Object.assign(new Error(`Party "${reference}" not found/active. Select a Customer, User or Transporter, or choose Party Type OTHER for an unmapped name.`),{statusCode:400});
+  // System-managed CASH exists in User and Customer masters for reporting,
+  // but can NEVER be the payee/payer on a normal receipt or payment.
+  // A Cash->Bank movement must use the Contra workflow instead.
+  if (unique[0].accountCode === "SYS_CASH") {
+    throw Object.assign(new Error("CASH / Cash-in-Hand cannot be selected as a Receipt or Payment party. Choose the actual person/supplier, or use Cash / Bank Contra for an internal transfer."),{statusCode:422});
+  }
   return unique[0];
 }
 
@@ -5041,6 +5065,105 @@ const canViewCompanyCashbook=auth=>{
   return granted.has("*")||["dms.transaction.cashbook","dms.transaction.cashaccount","dms.transaction.receipt","dms.transaction.payment"].some(p=>granted.has(`${p}.view`));
 };
 
+
+// SUPERADMIN BOOK CORRECTION — direct from BANK/CASH table. No separate
+// approval workflow. The original invoice/OTP/import evidence remains intact;
+// a balanced correction journal changes account/party balances, and the book
+// projection shows the effective amount. Every edit/delete is audited.
+router.post('/book-corrections',async(req,res)=>{
+ if(!isSuperadmin(req.auth))return fail(res,'Superadmin permission required',403);
+ const book=upper(req.body?.book),sourceKey=cleanText(req.body?.sourceKey);
+ if(!['BANK','CASH'].includes(book)||!sourceKey||sourceKey.length>160)
+   return fail(res,'Choose an actual BANK or CASH transaction row',400);
+ const reason=cleanText(req.body?.reason);
+ if(reason.length<5)return fail(res,'A correction reason of at least five characters is required for audit',400);
+ let session;
+ try{
+   const tenantKey=req.auth.tenantKey;
+   const financialYear=await resolveFinancialYear({tenantKey,requested:req.body.financialYear});
+   const source=await resolveSuperadminBookSource({tenantKey,financialYear,book,sourceKey});
+   const current=await originalBookJournal({tenantKey,financialYear,source});
+   const correction=validateBookCorrection({
+     date:req.body.deleted?new Date(source.originalDate).toISOString().slice(0,10):req.body.date,
+     debit:req.body.debit,credit:req.body.credit,remarks:req.body.remarks,
+     partyName:req.body.partyName,deleted:req.body.deleted,
+   },financialYear);
+   const {LedgerEntry,BookCorrection,BookCorrectionAudit}=financialModels(tenantKey,financialYear);
+   await Promise.all([BookCorrection.init(),BookCorrectionAudit.init()]);
+   const previous=await BookCorrection.findOne({tenantKey,financialYear,book,sourceKey}).lean();
+   if(req.body.version && previous && new Date(previous.updatedAt).getTime()!==new Date(req.body.version).getTime())
+     return fail(res,'Another Superadmin changed this row. Refresh before editing.',409);
+   const idPart=sourceKey.replace(/[^a-zA-Z0-9]/g,'-').slice(0,50);
+   const bookAccount={accountCode:source.accountCode,ledgerId:source.ledgerId||'',
+     bankAccountId:source.bankAccountId||'',partyGlobalId:''};
+   const originalNet=Number(current.net||0);
+   const targetNet=Number(correction.credit||0)-Number(correction.debit||0);
+   const oldDay=new Date(source.originalDate).toISOString().slice(0,10),newDay=correction.date.toISOString().slice(0,10);
+   const newId=()=>`ADMIN-${idPart}-${new mongoose.Types.ObjectId().toString()}`;
+   const requestedPartyId=cleanText(req.body.partyGlobalId);
+   const requestedPartyType=upper(req.body.partyType);
+   let newCounter=current.counter;
+   let partyName=correction.partyName;
+   if(requestedPartyId&&requestedPartyType){
+     const party=await resolveVoucherPostingParty(tenantKey,requestedPartyId,requestedPartyType);
+     if(party.accountCode==='SYS_CASH'||(book==='BANK'&&party.accountCode===source.accountCode))
+       return fail(res,'Choose an actual customer/supplier ledger, not the same Cash/Bank account',400);
+     newCounter={accountCode:party.accountCode,ledgerId:party.ledgerId||'',partyGlobalId:party.id,bankAccountId:''};
+     partyName=party.name;
+   }
+   const groups=reclassifiedJournal({oldNet:originalNet,targetNet,oldDate:source.originalDate,newDate:correction.date,
+     bookAccount,oldCounter:current.counter,newCounter,tenantKey,financialYear,reason,makeId:newId});
+   // Source records may remain statutory/OTP evidence, so corrections are
+   // balanced journal adjustments rather than orphaning invoice/cashier data.
+   session=await LedgerEntry.db.startSession();
+   await session.withTransaction(async()=>{
+     const currentCorrection=await BookCorrection.findOne({tenantKey,financialYear,book,sourceKey}).session(session);
+     if(String(currentCorrection?.updatedAt||'')!==String(previous?.updatedAt||''))
+       throw Object.assign(new Error('This row was corrected by another user; reload first'),{statusCode:409});
+     const oldIds=Array.isArray(currentCorrection?.activeJournalTransactionIds)?currentCorrection.activeJournalTransactionIds:[];
+     if(oldIds.length){
+       const old=await LedgerEntry.find({tenantKey,financialYear,transactionId:{$in:oldIds},status:'POSTED'}).session(session);
+       const broken=oldIds.some(id=>{
+         const group=old.filter(x=>x.transactionId===id);
+         return group.length<2||Math.abs(group.reduce((n,x)=>n+Number(x.debit||0)-Number(x.credit||0),0))>0.005;
+       });
+       if(broken)throw Object.assign(new Error('Prior correction journal is incomplete or unbalanced; no changes saved'),{statusCode:409});
+       for(const line of old){
+         const changed=await LedgerEntry.updateOne({_id:line._id,tenantKey,financialYear,status:'POSTED'},
+           {$set:{status:'VOIDED',archivedPostingKey:line.archivedPostingKey||line.postingKey||''},$unset:{postingKey:''}},{session});
+         if(changed.modifiedCount!==1)throw Object.assign(new Error('Correction journal changed; retry'),{statusCode:409});
+       }
+     }
+     for(const group of groups){
+       await LedgerEntry.insertMany(group.lines,{session,ordered:true});
+     }
+     const next={tenantKey,financialYear,book,sourceKey,bankAccountId:source.bankAccountId,
+       ...correction,partyName,partyGlobalId:requestedPartyId||'',partyType:requestedPartyType||'',originalJournalNet:originalNet,
+       originalSnapshot:{date:source.originalDate,credit:source.originalCredit,debit:source.originalDebit,
+         remarks:source.originalRemarks,partyName:source.originalPartyName,transactionId:source.transactionId,
+         transactionType:source.transactionType},
+       activeJournalTransactionIds:groups.map(x=>x.id),reason,editedBy:req.auth.sub,
+       editedByNameSnapshot:req.auth.name||''};
+     if(currentCorrection){
+       const update=await BookCorrection.updateOne({_id:currentCorrection._id,updatedAt:currentCorrection.updatedAt},{$set:next},{session});
+       if(update.matchedCount!==1)throw Object.assign(new Error('Correction changed; retry'),{statusCode:409});
+     }else await BookCorrection.create([next],{session});
+     await BookCorrectionAudit.create([{tenantKey,financialYear,book,sourceKey,
+       action:correction.deleted?'DELETE':'EDIT',previous:currentCorrection?.toObject()||null,next,
+       reason,correctionJournalId:groups.map(x=>x.id).join(','),editedBy:req.auth.sub,
+       editedByNameSnapshot:req.auth.name||''}],{session});
+   });
+   let rebuildWarning='';
+   if(book==='BANK'){
+     try{await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId:source.bankAccountId});}
+     catch(e){rebuildWarning=`Bank running-balance rebuild needs retry: ${e.message}`;}
+   }
+   return ok(res,{book,sourceKey,deleted:correction.deleted,adjusted:true,rebuildWarning},
+     correction.deleted?'Superadmin removed entry from active book; audit and balanced correction retained':'Book entry and accounting adjustment saved');
+ }catch(e){return fail(res,e.message||'Unable to save Superadmin book correction',e.statusCode||400);}
+ finally{if(session)await session.endSession();}
+});
+
 // Native Excel export (XLSX), authorized with the same ceilings as PDF.
 router.post("/export-table-xlsx",async(req,res)=>{
  try{
@@ -5103,97 +5226,83 @@ router.post("/export-table-pdf",async(req,res)=>{
  }catch(e){if(!res.headersSent)return fail(res,e.message||"PDF export failed",400);res.end();}
 });
 
-// Company CASH book: canonical posted SYS_CASH ledger movements, never BANK.
-// Running balance uses the financial-year opening balances and the complete FY
-// journal before the user's month/search filters are applied.
+// Company CASH book: source-voucher cash movement projection, never BANK.
+// FY closing rolls to the next year; date filters return their own opening
+// and closing after the complete FY movements have been projected.
 router.get("/cashbook/latest-month",async(req,res)=>{
   if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing cashbook view permission",403);
   try{
     const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
+    if(!await financialCollectionExists(req.auth.tenantKey,financialYear,"ledgerentries"))
+      return ok(res,{financialYear,month:null});
     const {LedgerEntry}=financialModels(req.auth.tenantKey,financialYear);
     const row=await LedgerEntry.findOne({tenantKey:req.auth.tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH"}).sort({date:-1,_id:-1}).select("date").lean();
     return ok(res,{financialYear,month:row?.date?new Date(row.date).getUTCMonth()+1:null});
   }catch(e){return fail(res,e.message||"Could not determine cash month",400);}
 });
 
-async function cashFyOpening({tenantKey,financialYear,ledgerOpenings}){
-  const rows=new Map();
-  for(const ledger of ledgerOpenings)for(const row of (ledger.openingBalances||[])){
-    const year=String(row.financialYear||"");
-    rows.set(year,(rows.get(year)||0)+(upper(row.type)==="CR"?-1:1)*num(row.amount));
-  }
-  const profile=await CompanyProfile.findOne({tenantKey}).select("firstCashFinancialYear firstCashOpeningBalance").lean();
-  const first=String(profile?.firstCashFinancialYear||"");
-  const firstAmt=money2(profile?.firstCashOpeningBalance||0);
-  if(first)rows.set(first,firstAmt);
-  if(rows.has(financialYear))return money2(rows.get(financialYear));
-  // Roll the first-year cash opening forward across FY boundaries; each year
-  // remains based on actual posted cash journal entries, not on the selected month.
-  const prior=[...rows.keys()].filter(y=>/^\d{4}-\d{2}$/.test(y)&&y<financialYear).sort();
-  if(!prior.length)return 0;
-  let current=prior[0],balance=money2(rows.get(current));
-  const targetYear=Number(financialYear.slice(0,4));
-  for(let y=Number(current.slice(0,4));y<targetYear && y<Number(current.slice(0,4))+25;y++){
-    const fy=`${y}-${String((y+1)%100).padStart(2,"0")}`;
-    if(rows.has(fy))balance=money2(rows.get(fy));
-    const {LedgerEntry:PriorEntry}=financialModels(tenantKey,fy);
-    const result=await PriorEntry.aggregate([{$match:{tenantKey,financialYear:fy,status:"POSTED",accountCode:"SYS_CASH"}},{$group:{_id:null,debit:{$sum:"$debit"},credit:{$sum:"$credit"}}}]);
-    balance=money2(balance+num(result[0]?.debit)-num(result[0]?.credit));
-  }
-  return balance;
-}
+
+router.get('/cashbook/financial-years',async(req,res)=>{
+  if(!canViewCompanyCashbook(req.auth))return fail(res,'Missing cashbook view permission',403);
+  try{
+    const tenantKey=req.auth.tenantKey;
+    const profile=await CompanyProfile.findOne({tenantKey})
+      .select('financialYears financialYear firstCashFinancialYear').lean();
+    const discovery=await discoverFinancialYears({tenantKey,configured:profile?.financialYears||[]});
+    return ok(res,{years:fiscalYearCandidates({
+      configured:[...(profile?.financialYears||[]),profile?.financialYear],
+      discovered:discovery.discovered,opening:profile?.firstCashFinancialYear,
+    }),firstDataFinancialYear:discovery.firstDataFinancialYear});
+  }catch(e){return fail(res,e.message||'Unable to load financial years',500);}
+});
 
 router.get("/cashbook", async (req, res) => {
-  if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing cashbook view permission",403);
-  try {
-    const tenantKey=req.auth.tenantKey;
-    const financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
-    const {LedgerEntry,Receipt,Payment}=financialModels(tenantKey,financialYear);
-    const [openings,lines]=await Promise.all([
-      CompanyLedger.find({tenantKey,systemAccountCode:"SYS_CASH",status:{$ne:"INACTIVE"}}).select("openingBalances").lean(),
-      LedgerEntry.find({tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH"})
-        .select("_id transactionId transactionType date partyGlobalId debit credit narration createdAt")
-        .sort({date:1,createdAt:1,_id:1}).lean(),
-    ]);
-    const openingBalance=await cashFyOpening({tenantKey,financialYear,ledgerOpenings:openings});
-    const receiptIds=[...new Set(lines.filter(x=>["RECEIPT","BANK_STATEMENT_RECEIPT"].includes(x.transactionType)).map(x=>x.transactionId))];
-    const paymentIds=[...new Set(lines.filter(x=>["PAYMENT","BANK_STATEMENT_PAYMENT"].includes(x.transactionType)).map(x=>x.transactionId))];
-    const [receipts,payments]=await Promise.all([
-      Receipt.find({tenantKey,financialYear,receiptNo:{$in:receiptIds}}).select("receiptNo partyNameSnapshot mode remarks").lean(),
-      Payment.find({tenantKey,financialYear,paymentNo:{$in:paymentIds}}).select("paymentNo partyNameSnapshot mode remarks").lean(),
-    ]);
-    const partyNames=new Map([
-      ...receipts.map(x=>[String(x.receiptNo),x.partyNameSnapshot||""]),
-      ...payments.map(x=>[String(x.paymentNo),x.partyNameSnapshot||""]),
-    ]);
-    let balance=openingBalance;
-    const all=lines.map(line=>{
-      balance=money2(balance+num(line.debit)-num(line.credit));
-      return {
-        _id:String(line._id),transactionId:line.transactionId||"",date:line.date,
-        transactionType:line.transactionType||"",type:num(line.debit)>0?"RECEIPT":"PAYMENT",
-        partyName:partyNames.get(String(line.transactionId))||line.partyGlobalId||"—",
-        partyGlobalId:line.partyGlobalId||"",
-        remarks:line.narration||"",mode:"CASH",debit:num(line.credit),credit:num(line.debit),
-        runningBalance:balance,
-      };
-    });
-    const closingBalance=money2(balance);
-    const from=String(req.query.fromDate||"");const to=String(req.query.toDate||"");
-    const dateRange=transactionQueryDateRange(req);
-    const type=upper(req.query.type);const q=cleanText(req.query.q).toLocaleLowerCase("en-IN");
-    const filtered=all.filter(x=>{
-      const day=new Date(x.date).toISOString().slice(0,10);
-      if(dateRange&&((from&&day<from)||(to&&day>to)))return false;
-      if((type==="RECEIPT"||type==="PAYMENT")&&x.type!==type)return false;
-      if(q&&!`${x.transactionId} ${x.transactionType} ${x.partyName} ${x.remarks}`.toLocaleLowerCase("en-IN").includes(q))return false;
-      return true;
-    }).reverse();
-    const page=Math.max(1,Number(req.query.page)||1);
-    const limit=Math.min(200,Math.max(1,Number(req.query.limit)||50));
-    return ok(res,{items:filtered.slice((page-1)*limit,page*limit),meta:pageMeta(page,limit,filtered.length),
-      openingBalance,closingBalance,financialYear});
-  } catch(e){return fail(res,e.message||"Unable to read Cashbook",e.statusCode||400);}
+ if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing cashbook view permission",403);
+ try{
+  const tenantKey=req.auth.tenantKey;
+  const financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
+  // Year opening comes from the preceding Cashbook closing, not merely the
+  // posted journal sum (some legacy cash vouchers cancelled themselves).
+  const carry=await companyCashbookYearOpening({tenantKey,financialYear});
+  const openingBalance=carry.openingBalance;
+  const from=String(req.query.fromDate||""),to=String(req.query.toDate||"");
+  const hasLedger=await financialCollectionExists(tenantKey,financialYear,"ledgerentries");
+  const fy=financialModels(tenantKey,financialYear),{LedgerEntry}=fy;
+  const lines=hasLedger?await LedgerEntry.find({tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH",transactionType:{$ne:"SUPERADMIN_BOOK_ADJUSTMENT"}})
+   .select("_id transactionId transactionType date createdAt partyGlobalId debit credit narration")
+   .sort({date:1,createdAt:1,_id:1}).lean():[];
+  const sources=await loadCompanyCashbookSources({tenantKey,financialYear,lines});
+  const book=buildCompanyCashbook({lines,...sources,openingBalance,enforceSourceDocuments:true});
+  const corrections=await fy.BookCorrection.find({tenantKey,financialYear,book:'CASH'}).lean();
+  const adjusted=applyCashCorrections(book.rows,corrections,openingBalance);
+  const period=cashbookPeriodSnapshot({rows:adjusted.rows,openingBalance,fromDate:from,toDate:to});
+  const type=upper(req.query.type),category=upper(req.query.category),q=cleanText(req.query.q).toLowerCase();
+  // Month date filtering happens BEFORE type/search filtering; that way
+  // period opening/closing always includes every real cash movement.
+  const filtered=period.periodRows.filter(x=>{
+   if(category && category!=="ALL" && upper(x.category)!==category)return false;
+   if(type==="REVIEW"&&!x.needsCorrection)return false;
+   if(["RECEIPT","PAYMENT"].includes(type)&&x.type!==type)return false;
+   if(q&&!`${x.particular} ${x.transactionId} ${x.remarks} ${x.partyName}`.toLowerCase().includes(q))return false;
+   return true;
+  }).reverse();
+  const page=Math.max(1,Number(req.query.page)||1),limit=Math.min(200,Math.max(1,Number(req.query.limit)||50));
+  const adminJournalLines=hasLedger?await LedgerEntry.find({tenantKey,financialYear,status:'POSTED',accountCode:'SYS_CASH',transactionType:'SUPERADMIN_BOOK_ADJUSTMENT'}).select('debit credit').lean():[];
+  const sumJournalMovement=[...lines,...adminJournalLines].reduce((n,x)=>n+Number(x.debit||0)-Number(x.credit||0),0);
+  return ok(res,{items:filtered.slice((page-1)*limit,page*limit),meta:pageMeta(page,limit,filtered.length),
+   financialYear,openingBalance,...Object.fromEntries(Object.entries(period).filter(([key])=>key!=="periodRows")),
+   monthlySummaries:req.query.groupByMonth==="1"?buildBookMonthSummary({financialYear,openingBalance,rows:adjusted.rows}):undefined,
+   closingBalance:adjusted.closingBalance,categoryTotals:adjusted.categoryTotals,
+   openingSource:carry.openingSource,openingNeedsSetup:carry.openingNeedsSetup,
+   journalOpeningBalance:carry.journalOpeningBalance,
+   journalClosingBalance:Math.round((carry.journalOpeningBalance+sumJournalMovement)*100)/100,
+   provisional:book.provisional||carry.provisional,
+   invalidCashVoucherCount:book.issues.length+carry.priorYearIssues,
+   invalidCashVouchers:book.issues.slice(0,30),rolloverIssues:carry.priorYearIssues,
+   manualOpeningConflicts:carry.mismatchedManualOpenings,
+   rolloverFromFY:carry.rolloverFromFY
+  });
+ }catch(e){return fail(res,e.message||"Unable to load cashbook",e.statusCode||400);}
 });
 
 // Channel-scoped direct vouchers. We enforce CASH/BANK on the server rather
@@ -5210,7 +5319,20 @@ async function postManualTransactionVoucher({auth,channel,input,recalculate=true
   const financialYear=financialYearFromDate(date);
   const amount=Number(input.amount);
   if(!Number.isFinite(amount)||amount<=0)throw Object.assign(new Error("Amount must be greater than zero"),{statusCode:400});
-  const party=await resolveVoucherPostingParty(tenantKey,input.partyGlobalId||input.party||input.partyName,input.partyType);
+  let party;
+  const rawParty=input.partyGlobalId||input.party||input.partyName;
+  try{party=await resolveVoucherPostingParty(tenantKey,rawParty,input.partyType);}
+  catch(error){
+    // Superadmin bulk uploads must post immediately. If a legitimate party
+    // cannot be identified uniquely, preserve the name and post the OTHER
+    // counter-entry to SYS_SUSPENSE rather than discarding a cash/bank row.
+    // Direct form entry and non-Superadmin uploads keep strict validation.
+    const canSuspend=auth.role==='SUPERADMIN'&&input.source==='SUPERADMIN_BULK'
+      && !input.partyGlobalId && cleanText(rawParty)&&upper(rawParty)!=='CASH'
+      && /not found|matches multiple/i.test(String(error.message||''));
+    if(!canSuspend)throw error;
+    party=await resolveVoucherPostingParty(tenantKey,rawParty,'OTHER');
+  }
   const bank=await resolveTransactionBank(tenantKey,mode,channel==="bank"?input.bankAccountId:"");
   if(channel==="bank"&&!bank.bankAccountId)throw Object.assign(new Error("Select an active Bank Account"),{statusCode:400});
   const {Receipt,Payment}=financialModels(tenantKey,financialYear);
@@ -5248,9 +5370,593 @@ router.post("/manual-entry/:channel",async(req,res)=>{
   try{
     const channel=String(req.params.channel||"").toLowerCase();
     if(!["cash","bank"].includes(channel))return fail(res,"Invalid transaction channel",400);
-    const result=await postManualTransactionVoucher({auth:req.auth,channel,input:req.body});
+    const result=await postManualTransactionVoucher({auth:req.auth,channel,input:{...req.body,source:undefined}});
     return ok(res,result,"Transaction posted",201);
   }catch(e){return fail(res,e.message||"Could not post transaction",e.statusCode||400);}
+});
+
+// Edit DMS DIRECT vouchers in-place atomically with their two posted journal
+// lines. Import rows, OTP-controlled collections and contra are not direct
+// vouchers and MUST NOT be silently reclassified from these screens.
+const voucherKindInfo=(name)=>({receipts:{number:"receiptNo",party:"customerGlobalId",type:"RECEIPT"},payments:{number:"paymentNo",party:"partyGlobalId",type:"PAYMENT"}})[String(name||"").toLowerCase()];
+const voucherDirectEditable=(record,kind)=>Boolean(record&&record.status==="POSTED"&&!record.statementImportId&&record.sourceKey&&
+  (kind==="payments"||(record.receiptWorkflowStatus==="DMS_DIRECT"&&!record.collectedBySalespersonId&&!record.cashCustodyMovementId)));
+const canViewVoucherEditor=(auth)=>{
+  const granted=new Set(auth?.permissions||[]);
+  if(auth?.role==="MASTER"||granted.has("*"))return true;
+  return granted.has("dms.transaction.voucher_edit.view") &&
+    granted.has("dms.transaction.voucher_edit.edit");
+};
+const canEditDirectVoucher=(auth,kind,mode)=>{
+  if(!canViewVoucherEditor(auth))return false;
+  const channel=mode==="CASH"?"cash":"bank";
+  // Require type/book-specific Edit, not generic admin status or unrelated View.
+  return canManualVoucherAction(auth,channel,kind==="receipts"?"RECEIPT":"PAYMENT","edit");
+};
+const voucherEditReject=(record,kind)=>{
+  if(!record)return "Voucher not found";
+  if(!voucherDirectEditable(record,kind))return "This voucher is imported, OTP-controlled, externally linked, or not a posted direct voucher. Reconcile it through its original workflow.";
+  return "";
+};
+
+// Delete in the books means VOID a DIRECT DMS voucher, retaining the source
+// document and its balanced journal for audit. An already-posted voucher must
+// never be removed on one side only. Imported statements, salesperson/OTP
+// receipts and internal contras must use their source workflows.
+// CASH BOOK: delete a checkbox selection in one MongoDB transaction. This is
+// deliberately a VOID (not a hard delete): financial reports, source vouchers
+// and journal history must not be orphaned. Nothing is changed if any selected
+// row is ineligible or changes concurrently.
+router.post("/cashbook/bulk-void",async(req,res)=>{
+  if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing Cashbook view permission",403);
+  const reason=cleanText(req.body?.reason);
+  if(reason.length<5)return fail(res,"Provide a deletion reason of at least 5 characters",400);
+  let selected;
+  try{selected=normalizeCashbookBulkVoidSelection(req.body?.items);}
+  catch(e){return fail(res,e.message,e.statusCode||400);}
+  let session;
+  try{
+    const tenantKey=req.auth.tenantKey;
+    const financialYear=await resolveFinancialYear({tenantKey,requested:req.body.financialYear});
+    const {Receipt,Payment,LedgerEntry}=financialModels(tenantKey,financialYear);
+    const verified=[];
+    // Preflight every selection before the first write (no partial success).
+    for(const item of selected){
+      const info=voucherKindInfo(item.kind);
+      const Model=item.kind==="receipts"?Receipt:Payment;
+      const record=await Model.findOne({_id:item.id,tenantKey,financialYear}).lean();
+      const rejection=voucherEditReject(record,item.kind);
+      if(rejection)return fail(res,`${item.kind}/${item.id}: ${rejection}`,record?409:404);
+      if(upper(record.mode)!=="CASH")return fail(res,`Voucher ${record[info.number]} is not a CASH transaction`,409);
+      if(!canManualVoucherAction(req.auth,"cash",info.type,"delete"))
+        return fail(res,`Missing delete permission for ${info.type}`,403);
+      if((record.againstInvoices||[]).length||record.cashDepositBatchId||record.cashCustodyMovementId)
+        return fail(res,`Voucher ${record[info.number]} has invoice or cash handover dependencies`,409);
+      const journal=await LedgerEntry.find({tenantKey,financialYear,transactionId:record[info.number],status:"POSTED"}).lean();
+      if(journal.length!==2||journal.some(line=>upper(line.transactionType)!==info.type)||
+        !journal.some(line=>line.accountCode==="SYS_CASH"))
+        return fail(res,`Voucher ${record[info.number]} must have two normal journal lines including Cash-in-Hand; reconcile it before deletion`,409);
+      verified.push({Model,info,record,journal});
+    }
+    session=await mongoose.startSession();
+    await session.withTransaction(async()=>{
+      for(const {Model,record,journal,info} of verified){
+        const changed=await Model.updateOne({_id:record._id,tenantKey,financialYear,status:"POSTED"},
+          {$set:{status:"VOIDED",voidReason:reason,voidedAt:new Date(),voidedBy:req.auth.sub,
+            voidedByNameSnapshot:req.auth.name||""}},{session});
+        if(changed.modifiedCount!==1)throw Object.assign(new Error(`Voucher ${record[info.number]} changed during deletion; none were voided`),{statusCode:409});
+        const result=await LedgerEntry.bulkWrite(journal.map(line=>({updateOne:{
+          filter:{_id:line._id,tenantKey,financialYear,status:"POSTED"},
+          update:{$set:{status:"VOIDED",archivedPostingKey:line.archivedPostingKey||line.postingKey||""},$unset:{postingKey:""}},
+        }})),{session,ordered:true});
+        if(result.modifiedCount!==journal.length)throw Object.assign(new Error(`Journal for ${record[info.number]} changed; none were voided`),{statusCode:409});
+      }
+    });
+    return ok(res,{voided:verified.length,deleted:verified.length,financialYear},`${verified.length} Cashbook voucher(s) voided; audit history retained`);
+  }catch(e){return fail(res,e.message||"Unable to bulk delete Cashbook vouchers",e.statusCode||400);}
+  finally{if(session)await session.endSession();}
+});
+
+router.post("/vouchers/:kind/:id/void",async(req,res)=>{
+  const kind=String(req.params.kind||"").toLowerCase(),info=voucherKindInfo(kind);
+  if(!info)return fail(res,"Unknown voucher type",400);
+  const reason=cleanText(req.body.reason);
+  if(reason.length<5)return fail(res,"Enter a deletion reason (at least 5 characters)",400);
+  let session;
+  try{
+    const tenantKey=req.auth.tenantKey;
+    const financialYear=await resolveFinancialYear({tenantKey,requested:req.body.financialYear});
+    const {Receipt,Payment,LedgerEntry}=financialModels(tenantKey,financialYear);
+    const Model=kind==="receipts"?Receipt:Payment;
+    const record=await Model.findOne({_id:req.params.id,tenantKey,financialYear}).lean();
+    const rejection=voucherEditReject(record,kind);
+    if(rejection)return fail(res,rejection,record?409:404);
+    const channel=upper(record.mode)==="CASH"?"cash":"bank";
+    if(!canManualVoucherAction(req.auth,channel,info.type,"delete"))return fail(res,"Missing delete permission for this transaction",403);
+    if((record.againstInvoices||[]).length || record.cashDepositBatchId || record.cashCustodyMovementId)
+      return fail(res,"Voucher has invoice allocation or cash handover dependencies. Reconcile through original workflow.",409);
+    const journal=await LedgerEntry.find({tenantKey,financialYear,transactionId:record[info.number],status:"POSTED"}).lean();
+    if(journal.length!==2||journal.some(line=>line.transactionType!==info.type))
+      return fail(res,"Voucher journal must contain exactly two normal posted lines. Reconcile before deletion.",409);
+    session=await mongoose.startSession();
+    await session.withTransaction(async()=>{
+      const changed=await Model.updateOne({_id:record._id,tenantKey,financialYear,status:"POSTED"},{$set:{
+        status:"VOIDED",voidReason:reason,voidedAt:new Date(),voidedBy:req.auth.sub,
+        voidedByNameSnapshot:req.auth.name||"",
+      }},{session});
+      if(changed.modifiedCount!==1)throw Object.assign(new Error("Voucher was already changed. Refresh and retry."),{statusCode:409});
+      const operations=journal.map(line=>({updateOne:{
+        filter:{_id:line._id,tenantKey,financialYear,status:"POSTED"},
+        update:{$set:{status:"VOIDED",archivedPostingKey:line.archivedPostingKey||line.postingKey||""},$unset:{postingKey:""}},
+      }}));
+      const updated=await LedgerEntry.bulkWrite(operations,{session,ordered:true});
+      if(updated.modifiedCount!==journal.length)throw Object.assign(new Error("Journal changed during deletion. Retry."),{statusCode:409});
+    });
+    if(channel==="bank"&&record.bankAccountId)
+      await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId:record.bankAccountId});
+    return ok(res,{voucherNo:record[info.number],voided:true},"Transaction voided and removed from active Bank/Cash books; audit retained");
+  }catch(e){return fail(res,e.message||"Unable to delete voucher safely",e.statusCode||400);}
+  finally{if(session)await session.endSession();}
+});
+
+router.get("/vouchers/:kind/:id/edit",async(req,res)=>{
+  try{
+    const kind=String(req.params.kind||"").toLowerCase(),info=voucherKindInfo(kind);
+    if(!info)return fail(res,"Unknown voucher type",400);
+    if(!canViewVoucherEditor(req.auth))return fail(res,"Edit Posted Voucher permission required",403);
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
+    const {Receipt,Payment,LedgerEntry}=financialModels(req.auth.tenantKey,financialYear);
+    const Model=kind==="receipts"?Receipt:Payment;
+    const record=await Model.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear}).lean();
+    const reason=voucherEditReject(record,kind);
+    if(reason)return fail(res,reason,record?409:404);
+    if(!canEditDirectVoucher(req.auth,kind,upper(record.mode)==="CASH"?"CASH":"BANK"))return fail(res,"Missing edit permission",403);
+    const journal=await LedgerEntry.find({tenantKey:req.auth.tenantKey,financialYear,transactionId:record[info.number],status:"POSTED"}).lean();
+    if(journal.length!==2||journal.some(line=>line.transactionType!==info.type))return fail(res,"Voucher journal is not a normal two-line DMS posting. Contact accounts administrator.",409);
+    return ok(res,{voucher:record,kind,financialYear});
+  }catch(e){return fail(res,e.message||"Unable to fetch voucher",e.statusCode||400);}
+});
+
+// Editing a voucher's calendar date is also allowed across financial years.
+// Every FY lives in a separate database. Therefore the voucher, both journal
+// lines and the immutable audit must move together in ONE MongoDB transaction.
+// Do not use a delete/recreate pair outside the transaction: it can leave an
+// orphaned payment or unbalanced cash/bank ledger if the server crashes.
+router.put("/vouchers/:kind/:id/edit",async(req,res)=>{
+  const kind=String(req.params.kind||"").toLowerCase(),info=voucherKindInfo(kind);
+  if(!info)return fail(res,"Unknown voucher type",400);
+  if(!canViewVoucherEditor(req.auth))return fail(res,"Edit Posted Voucher permission required",403);
+  const reason=cleanText(req.body.reason);
+  if(reason.length<5)return fail(res,"Enter a reason for this accounting correction (minimum 5 characters)",400);
+  let session;
+  try{
+    const tenantKey=req.auth.tenantKey;
+    // The source FY is only used to locate the existing voucher; it is not an
+    // editable field. The NEW financial year comes exclusively from its date.
+    const sourceFy=await resolveFinancialYear({tenantKey,requested:req.body.financialYear});
+    const date=parseStrictVoucherDate(req.body.date);
+    const destinationFy=financialYearFromDate(date);
+    const amount=Number(req.body.amount);
+    if(!Number.isFinite(amount)||amount<=0||Math.abs(Math.round(amount*100)-amount*100)>1e-7)
+      return fail(res,"Enter an amount greater than zero with at most 2 decimal places",400);
+
+    const source=financialModels(tenantKey,sourceFy);
+    const destination=destinationFy===sourceFy?source:financialModels(tenantKey,destinationFy);
+    const SourceModel=kind==="receipts"?source.Receipt:source.Payment;
+    const DestinationModel=kind==="receipts"?destination.Receipt:destination.Payment;
+    const original=await SourceModel.findOne({_id:req.params.id,tenantKey,financialYear:sourceFy}).lean();
+    const reject=voucherEditReject(original,kind);
+    if(reject)return fail(res,reject,original?409:404);
+    if(!canEditDirectVoucher(req.auth,kind,upper(original.mode)==="CASH"?"CASH":"BANK"))return fail(res,"Missing edit permission",403);
+
+    const nextMode=upper(req.body.mode||original.mode);
+    if(!["CASH","BANK","NEFT","RTGS","UPI","CHEQUE"].includes(nextMode))return fail(res,"Invalid payment mode",400);
+    if(!canEditDirectVoucher(req.auth,kind,nextMode==="CASH"?"CASH":"BANK"))return fail(res,"Missing edit permission for destination book",403);
+    const nextNumber=cleanText(req.body.voucherNo??original[info.number]);
+    if(!/^[a-z0-9][a-z0-9\/_-]{0,79}$/i.test(nextNumber))return fail(res,"Voucher Number must contain 1-80 letters, digits, /, _ or -",400);
+
+    const party=await resolveVoucherPostingParty(tenantKey,req.body.partyGlobalId||req.body.partyName,req.body.partyType||original.partyType);
+    const bank=await resolveTransactionBank(tenantKey,nextMode,req.body.bankAccountId);
+    const nextData={date,amount,mode:nextMode,partyType:party.type,partyNameSnapshot:party.name,
+      [info.number]:nextNumber,sourceKey:nextNumber,[info.party]:party.id,
+      bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,
+      remarks:cleanText(req.body.remarks),reference:cleanText(req.body.reference),
+      runningBalance:null};
+    const newLines=kind==="receipts"
+      ?[{accountCode:bank.accountCode,ledgerId:bank.ledgerId,bankAccountId:bank.bankAccountId,debit:amount,credit:0},
+        {accountCode:party.accountCode,ledgerId:party.ledgerId,bankAccountId:"",debit:0,credit:amount}]
+      :[{accountCode:party.accountCode,ledgerId:party.ledgerId,bankAccountId:"",debit:amount,credit:0},
+        {accountCode:bank.accountCode,ledgerId:bank.ledgerId,bankAccountId:bank.bankAccountId,debit:0,credit:amount}];
+    if(newLines[0].accountCode===newLines[1].accountCode&&String(newLines[0].ledgerId||"")===String(newLines[1].ledgerId||""))
+      return fail(res,"Counterparty cannot be the same Cash/Bank account; choose the actual party",400);
+
+    // Ensure indexes are present *before* entering the MongoDB transaction.
+    if(sourceFy!==destinationFy){
+      await Promise.all([DestinationModel.init(),destination.LedgerEntry.init(),destination.VoucherEditAudit.init()]);
+    }
+    session=await SourceModel.db.startSession();
+    await session.withTransaction(async()=>{
+      const record=await SourceModel.findOne({_id:req.params.id,tenantKey,financialYear:sourceFy}).session(session);
+      if(voucherEditReject(record,kind))throw Object.assign(new Error("Voucher status changed; reload and retry"),{statusCode:409});
+      if(!req.body.version||new Date(record.updatedAt).getTime()!==new Date(req.body.version).getTime())
+        throw Object.assign(new Error("Voucher changed since you opened it. Reload before saving"),{statusCode:409});
+      const oldLines=await source.LedgerEntry.find({tenantKey,financialYear:sourceFy,transactionId:record[info.number],status:"POSTED"}).sort({_id:1}).session(session);
+      if(oldLines.length!==2||oldLines.some(x=>x.transactionType!==info.type))
+        throw Object.assign(new Error("Non-standard or previously altered journal; editing blocked"),{statusCode:409});
+      const debitLine=oldLines.find(x=>Number(x.debit)>0),creditLine=oldLines.find(x=>Number(x.credit)>0);
+      if(!debitLine||!creditLine||Math.abs(Number(debitLine.debit)-Number(creditLine.credit))>0.005||
+        Math.abs(Number(debitLine.debit)-Number(record.amount))>0.005)
+        throw Object.assign(new Error("Voucher and journal do not reconcile; edit blocked"),{statusCode:409});
+
+      // A new FY or voucher number must not reuse another active voucher or
+      // journal's transactionId. The old record is excluded for same-FY edits.
+      if(destinationFy!==sourceFy||nextNumber!==record[info.number]){
+        const found=await DestinationModel.findOne({tenantKey,financialYear:destinationFy,[info.number]:nextNumber}).session(session).lean();
+        if(found&&String(found._id)!==String(record._id))
+          throw Object.assign(new Error("Voucher Number already exists for the selected date's financial year"),{statusCode:409});
+        const existingJournal=await destination.LedgerEntry.findOne({tenantKey,financialYear:destinationFy,transactionId:nextNumber,status:"POSTED"}).session(session).lean();
+        if(existingJournal && !(destinationFy===sourceFy && oldLines.some(x=>String(x._id)===String(existingJournal._id)))){
+          throw Object.assign(new Error("Voucher Number is already used by another posted journal in the selected financial year"),{statusCode:409});
+        }
+      }
+      const posting=[debitLine,creditLine];
+      const narration=nextData.remarks||`${info.type} ${nextNumber}`;
+      const newAuditLines=newLines.map((line,i)=>({
+        ...line,tenantKey,financialYear:destinationFy,transactionId:nextNumber,
+        partyGlobalId:party.id,date,narration,transactionType:info.type,status:"POSTED",
+      }));
+      // Keep deterministic journal posting keys consistent with the new FY/No.
+      const journalUpdates=newAuditLines.map((line,i)=>({
+        ...line,postingKey:createHash("sha256").update(
+          JSON.stringify([tenantKey,destinationFy,nextNumber,info.type,i]),
+        ).digest("hex"),
+      }));
+      const nextVersion={...record.toObject(),...nextData,financialYear:destinationFy};
+
+      if(destinationFy===sourceFy){
+        for(let i=0;i<posting.length;i++){
+          const line=journalUpdates[i];
+          await source.LedgerEntry.updateOne({_id:posting[i]._id,tenantKey,financialYear:sourceFy,status:"POSTED"},{$set:line},{session});
+        }
+        const result=await SourceModel.updateOne({_id:record._id,tenantKey,financialYear:sourceFy,updatedAt:record.updatedAt},{$set:nextData},{session,timestamps:true});
+        if(result.matchedCount!==1)throw Object.assign(new Error("Voucher changed; reload before saving"),{statusCode:409});
+      }else{
+        // Cross-database atomic move, preserving the voucher ID for any
+        // external references and preserving its original creation details.
+        await DestinationModel.create([{...nextVersion,updatedAt:new Date()}],{session});
+        await destination.LedgerEntry.insertMany(posting.map((old,i)=>({
+          ...old.toObject(),...journalUpdates[i],_id:old._id,
+        })),{session,ordered:true});
+        const removed=await SourceModel.deleteOne({_id:record._id,tenantKey,financialYear:sourceFy,updatedAt:record.updatedAt},{session});
+        if(removed.deletedCount!==1)throw Object.assign(new Error("Voucher changed; reload before saving"),{statusCode:409});
+        const removedJournal=await source.LedgerEntry.deleteMany({_id:{$in:posting.map(x=>x._id)},tenantKey,financialYear:sourceFy,status:"POSTED"},{session});
+        if(removedJournal.deletedCount!==2)throw Object.assign(new Error("Journal changed; edit aborted"),{statusCode:409});
+      }
+      const audit={tenantKey,financialYear:sourceFy,voucherKind:kind,voucherId:String(record._id),
+        voucherNo:record[info.number],previous:record.toObject(),next:nextVersion,
+        previousJournal:posting.map(x=>x.toObject()),nextJournal:newAuditLines,
+        reason,editedBy:req.auth.sub,editedByNameSnapshot:req.auth.name||"",editedAt:new Date()};
+      await source.VoucherEditAudit.create([audit],{session});
+      if(destinationFy!==sourceFy)await destination.VoucherEditAudit.create([{
+        ...audit,financialYear:destinationFy,voucherNo:nextNumber,
+      }],{session});
+    });
+
+    let balanceWarning="";
+    const affected=new Set([
+      [sourceFy,original.bankAccountId].join("|"),
+      [destinationFy,bank.bankAccountId].join("|"),
+    ]);
+    for(const item of affected){
+      const [fy,accountId]=item.split("|");
+      if(!accountId)continue;
+      try{await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear:fy,bankAccountId:accountId});}
+      catch(e){balanceWarning+=`${balanceWarning ? "; " : ""}Bank ${accountId} FY ${fy}: ${e.message}`;}
+    }
+    return ok(res,{financialYear:destinationFy,previousFinancialYear:sourceFy,
+      number:nextNumber,movedToDifferentYear:destinationFy!==sourceFy,balanceWarning},
+      "Posted voucher and accounting journal corrected");
+  }catch(e){
+    const unsupported=/Transaction numbers are only allowed on a replica set|replica set|mongos|does not support retryable writes|Transaction is not supported/i.test(e.message||"");
+    return fail(res,unsupported?"Safe editing requires MongoDB transactions (replica set or Atlas). No accounting changes were saved.":e.message||"Unable to update voucher",unsupported?503:e.statusCode||400);
+  }finally{if(session)await session.endSession();}
+});
+
+// Inter-bank transfer is ONE internal contra with a debit to the destination
+// bank ASSET ledger and a credit to the source bank ASSET ledger. Bank-book
+// display uses the opposite movement column convention (source=Debit/out,
+// destination=Credit/in). Never create customer receipts or payments here.
+router.post("/bank-transfer", async(req,res)=>{
+  try{
+    if(!isAdminAuth(req.auth) && !(canManualVoucherAction(req.auth,"bank","RECEIPT") && canManualVoucherAction(req.auth,"bank","PAYMENT")))
+      return fail(res,"Bank receipt and payment permissions are required for internal transfer",403);
+    const tenantKey=req.auth.tenantKey;
+    const date=parseStrictVoucherDate(req.body.date);
+    const financialYear=financialYearFromDate(date);
+    const amount=money2(req.body.amount);
+    if(!Number.isFinite(Number(req.body.amount))||amount<=0)return fail(res,"Transfer amount must be greater than zero",400);
+    if(Math.abs(Number(req.body.amount)-amount)>0.000001)return fail(res,"Amount cannot have more than two decimal places",400);
+    const fromInput=cleanText(req.body.fromBankAccountId),toInput=cleanText(req.body.toBankAccountId);
+    if(!fromInput||!toInput)return fail(res,"Select both source and destination bank accounts",400);
+    const [fromBank,toBank]=await Promise.all([
+      resolveTransactionBank(tenantKey,"BANK",fromInput),
+      resolveTransactionBank(tenantKey,"BANK",toInput),
+    ]);
+    if(fromBank.bankAccountId===toBank.bankAccountId)return fail(res,"Source and destination must be different bank accounts",400);
+    const transferNo=cleanText(req.body.transferNo)||makeId("BTR");
+    if(!/^[A-Za-z0-9_-]{4,80}$/.test(transferNo))return fail(res,"Invalid transfer reference",400);
+    const reference=cleanText(req.body.reference),remarks=cleanText(req.body.remarks)||"Transfer between company bank accounts";
+    const {BankTransfer,LedgerEntry}=financialModels(tenantKey,financialYear);
+    let record=await BankTransfer.findOne({tenantKey,financialYear,transferNo});
+    // Different transactions MAY share a bank, date and amount. For example,
+    // a returned cheque, its reversal and a subsequent fresh payment are three
+    // legitimate movements. Date+amount is not a transaction identity.
+    // Duplicate prevention is instead enforced by transferNo (unique for FY)
+    // and the immutable posted journal idempotency in postBalancedEntries().
+    if(record){
+      const equal=String(record.fromBankAccountId)===fromBank.bankAccountId && String(record.toBankAccountId)===toBank.bankAccountId &&
+        Math.abs(Number(record.amount)-amount)<0.005 &&
+        new Date(record.date).getTime()===date.getTime() &&
+        cleanText(record.reference)===reference && cleanText(record.remarks)===remarks;
+      if(!equal)return fail(res,"Transfer reference already exists with different details; no duplicate posted",409);
+      if(record.status==="POSTED")return ok(res,{transferNo,financialYear,alreadyPosted:true},"Transfer already posted; duplicate prevented");
+    }else{
+      try{
+        record=await BankTransfer.create({tenantKey,financialYear,transferNo,date,
+          fromBankAccountId:fromBank.bankAccountId,toBankAccountId:toBank.bankAccountId,
+          fromBankNameSnapshot:fromBank.bankName,toBankNameSnapshot:toBank.bankName,
+          amount,reference,remarks,status:"PENDING_POST",
+          createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+      }catch(e){if(e.code===11000)return fail(res,"Transfer reference already exists. Reload before retrying",409);throw e;}
+    }
+    try{
+      await postBalancedEntries({tenantKey,financialYear,transactionId:transferNo,
+        transactionType:"BANK_TRANSFER",date,partyGlobalId:"BANK:INTERNAL",narration:remarks,
+        entries:[
+          {accountCode:toBank.accountCode,ledgerId:toBank.ledgerId,bankAccountId:toBank.bankAccountId,debit:amount,credit:0},
+          {accountCode:fromBank.accountCode,ledgerId:fromBank.ledgerId,bankAccountId:fromBank.bankAccountId,debit:0,credit:amount},
+        ],
+      });
+      record.status="POSTED";
+      await record.save();
+    }catch(e){
+      const hasPosted=await LedgerEntry.exists({tenantKey,financialYear,transactionId:transferNo,status:"POSTED"});
+      if(!hasPosted && record?.status==="PENDING_POST")await BankTransfer.deleteOne({_id:record._id,status:"PENDING_POST"});
+      throw e;
+    }
+    const warnings=[];
+    for(const bankAccountId of [fromBank.bankAccountId,toBank.bankAccountId]){
+      try{await recalculateBankRunningBalancesForVoucher({tenantKey,financialYear,bankAccountId});}
+      catch(e){warnings.push(`${bankAccountId}: ${e.message}`);}
+    }
+    return ok(res,{transferNo,financialYear,amount,
+      fromBankAccountId:fromBank.bankAccountId,toBankAccountId:toBank.bankAccountId,
+      balanceWarning:warnings.join("; ")},"Internal bank transfer posted once in both bank books",201);
+  }catch(e){return fail(res,e.message||"Could not transfer between bank accounts",e.statusCode||400);}
+});
+
+// Transfers between Cash-in-Hand and the company's own bank are CONTRA
+// entries, not sales income, expenses, customer receipts or supplier payments.
+// One immutable balanced journal is the ONLY accounting movement. A matching
+// BANK receipt/payment document is a bank-book DISPLAY record, not another post.
+router.post("/contra", async (req, res) => {
+  try {
+    if (!isAdminAuth(req.auth) && !(canManualVoucherAction(req.auth,"cash","PAYMENT") && canManualVoucherAction(req.auth,"bank","RECEIPT")))
+      return fail(res,"Both Bank and Cash posting permissions are required for contra",403);
+    const direction=upper(req.body.direction);
+    if(!["DEPOSIT","WITHDRAWAL"].includes(direction))return fail(res,"Direction must be DEPOSIT or WITHDRAWAL",400);
+    const date=parseStrictVoucherDate(req.body.date);
+    const financialYear=financialYearFromDate(date);
+    const amount=money2(req.body.amount);
+    if(!Number.isFinite(Number(req.body.amount))||amount<=0)return fail(res,"Amount must be greater than zero",400);
+    if(!cleanText(req.body.bankAccountId))return fail(res,"Select one bank account",400);
+    const bank=await resolveTransactionBank(req.auth.tenantKey,"BANK",req.body.bankAccountId);
+    const {ContraVoucher,LedgerEntry}=financialModels(req.auth.tenantKey,financialYear);
+    const contraNo=cleanText(req.body.contraNo)||makeId("CTR");
+    if(!/^[A-Za-z0-9_-]{4,80}$/.test(contraNo))return fail(res,"Invalid contra reference",400);
+    const previous=await ContraVoucher.findOne({tenantKey:req.auth.tenantKey,financialYear,contraNo});
+    if(previous){
+      const existingLines=await LedgerEntry.find({tenantKey:req.auth.tenantKey,financialYear,transactionId:contraNo,transactionType:"CONTRA",status:"POSTED"}).lean();
+      // Crash-safe retry: once journal posting succeeded, recover the voucher
+      // status instead of posting the same cash movement a second time.
+      if(previous.status==="PENDING_POST"&&existingLines.length===2 &&
+         Math.abs(existingLines.reduce((n,l)=>n+Number(l.debit||0)-Number(l.credit||0),0))<0.005){
+        previous.status="POSTED";await previous.save();
+        try{await recalculateBankRunningBalancesForVoucher({tenantKey:req.auth.tenantKey,financialYear,bankAccountId:previous.bankAccountId});}catch{}
+        return ok(res,{contraNo,financialYear,alreadyPosted:true},"Existing contra posting recovered without duplication");
+      }
+      return fail(res,"This contra reference already exists; duplicate posting prevented",409);
+    }
+    if(await LedgerEntry.exists({tenantKey:req.auth.tenantKey,financialYear,transactionId:contraNo,status:"POSTED"}))
+      return fail(res,"This contra reference already has a posted journal",409);
+    const deposit=direction==="DEPOSIT";
+    // Same-date equal cash deposits/withdrawals may be separate real movements.
+    // Do not infer duplicate identity from amount and day. The contraNo and
+    // immutable journal ID enforce idempotency and protect genuine retries.
+    const remarks=cleanText(req.body.remarks)||(deposit?"Cash deposited into bank":"Cash withdrawn from bank");
+    const record=await ContraVoucher.create({tenantKey:req.auth.tenantKey,financialYear,contraNo,
+      date,direction,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,
+      amount,reference:cleanText(req.body.reference)||contraNo,remarks,
+      status:"PENDING_POST",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
+    const bankLine={accountCode:bank.accountCode,ledgerId:bank.ledgerId,bankAccountId:bank.bankAccountId};
+    try{
+      await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear,transactionId:contraNo,
+        transactionType:"CONTRA",date,partyGlobalId:"CASH:COMPANY",narration:remarks,
+        entries:deposit?[{...bankLine,debit:amount},{accountCode:"SYS_CASH",credit:amount}]
+          :[{accountCode:"SYS_CASH",debit:amount},{...bankLine,credit:amount}],
+      });
+      record.status="POSTED";await record.save();
+    }catch(e){
+      // A crash after journal posting but before status update is reconciled by
+      // the pending-voucher audit; never blindly delete an existing journal.
+      if(!(await LedgerEntry.exists({tenantKey:req.auth.tenantKey,financialYear,transactionId:contraNo,status:"POSTED"})))
+        await record.deleteOne();
+      throw e;
+    }
+    let balanceWarning="";
+    try{await recalculateBankRunningBalancesForVoucher({tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId});}
+    catch(e){balanceWarning=e.message;}
+    return ok(res,{contraNo,direction,amount,financialYear,bankAccountId:bank.bankAccountId,balanceWarning},
+      "Contra posted in Cashbook and Bank Book",201);
+  }catch(e){return fail(res,e.message||"Could not post contra",e.statusCode||400);}
+});
+
+// Read-only finance audit: never changes balances or classifies a cash sale
+// as collected merely because its customer is named CASH.
+router.get("/cash-unification-audit",async(req,res)=>{
+  try{
+    if(!isAdminAuth(req.auth))return fail(res,"Administrator permission required",403);
+    const tenantKey=req.auth.tenantKey;
+    const financialYear=await resolveFinancialYear({tenantKey,requested:req.query.financialYear});
+    const {LedgerEntry,Receipt,Payment,SalesInvoice,PurchaseInvoice,ContraVoucher}=financialModels(tenantKey,financialYear);
+    const [opening,cashTotals,cashReceipts,cashPayments,cashMasters,contras,contraJournal,cashCustomers]=await Promise.all([
+      companyCashOpening({tenantKey,financialYear}),
+      LedgerEntry.aggregate([{$match:{tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH"}},
+        {$group:{_id:null,debit:{$sum:"$debit"},credit:{$sum:"$credit"},count:{$sum:1}}}]),
+      Receipt.find({tenantKey,financialYear,status:"POSTED",mode:"CASH"}).select("receiptNo amount date").lean(),
+      Payment.find({tenantKey,financialYear,status:"POSTED",mode:"CASH"}).select("paymentNo amount date").lean(),
+      CompanyLedger.find({tenantKey,systemAccountCode:"SYS_CASH",status:{$ne:"INACTIVE"}}).select("_id ownerType ownerId openingBalances").lean(),
+      ContraVoucher.find({tenantKey,financialYear,status:"POSTED"}).select("contraNo amount direction date bankAccountId").lean(),
+      LedgerEntry.find({tenantKey,financialYear,status:"POSTED",transactionType:"CONTRA"}).select("transactionId accountCode debit credit bankAccountId").lean(),
+      CustomerLink.find({tenantKey,systemKey:"CASH"}).select("globalCustomerId").lean(),
+    ]);
+    const cashIds=cashCustomers.map(x=>x.globalCustomerId).filter(Boolean);
+    const [cashSales,unspecifiedPurchases]=await Promise.all([
+      cashIds.length?SalesInvoice.find({tenantKey,financialYear,customerGlobalId:{$in:cashIds},status:{$in:["POSTED","COMPLETED"]}})
+        .select("invoiceNo grandTotal date customerGlobalId").lean():[],
+      PurchaseInvoice.countDocuments({tenantKey,financialYear,status:{$in:["POSTED","COMPLETED"]}}),
+    ]);
+    const invoiceJournalIds=new Set((await LedgerEntry.find({tenantKey,financialYear,status:"POSTED",transactionType:"SALES_INVOICE",accountCode:"SYS_CASH"}).distinct("transactionId"))||[]);
+    const journalIds=new Set(contraJournal.map(x=>String(x.transactionId)));
+    const orphanContras=contras.filter(x=>!journalIds.has(String(x.contraNo))).map(x=>x.contraNo);
+    const receiptIds=cashReceipts.map(x=>x.receiptNo).filter(Boolean);
+    const paymentIds=cashPayments.map(x=>x.paymentNo).filter(Boolean);
+    const postedCashVoucherIds=new Set(await LedgerEntry.distinct("transactionId",{
+      tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH",
+      transactionId:{$in:[...receiptIds,...paymentIds]},
+    }));
+    const missingCashReceipt=receiptIds.filter(x=>!postedCashVoucherIds.has(x));
+    const missingCashPayment=paymentIds.filter(x=>!postedCashVoucherIds.has(x));
+    const suspiciousCash=await LedgerEntry.aggregate([
+      {$match:{tenantKey,financialYear,status:"POSTED",accountCode:"SYS_CASH"}},
+      {$group:{_id:"$transactionId",debit:{$sum:"$debit"},credit:{$sum:"$credit"},date:{$min:"$date"},lineCount:{$sum:1}}},
+      {$match:{debit:{$gt:0},credit:{$gt:0}}},
+      {$sort:{date:1,_id:1}},
+    ]);
+    const totals=cashTotals[0]||{};
+    const cashClosing=money2(opening+num(totals.debit)-num(totals.credit));
+    const unverifiedCashSales=cashSales.filter(x=>!invoiceJournalIds.has(x.invoiceNo));
+    return ok(res,{
+      financialYear,accountCode:"SYS_CASH",openingBalance:opening,
+      debit:num(totals.debit),credit:num(totals.credit),closingBalance:cashClosing,
+      totalCashJournalLines:num(totals.count),
+      selfOffsettingCashVoucherCount:suspiciousCash.length,
+      selfOffsettingCashVouchers:suspiciousCash.slice(0,100).map(x=>({
+        transactionId:x._id,date:x.date,cashDebit:money2(x.debit),cashCredit:money2(x.credit),lineCount:x.lineCount,
+      })),
+      companyCashMasterCount:cashMasters.filter(x=>x.ownerType==="COMPANY").length,
+      linkedCashUserMasters:cashMasters.filter(x=>x.ownerType==="USER").length,
+      contraVouchers:contras.length,orphanContras,
+      missingCashReceiptJournal:missingCashReceipt,
+      missingCashPaymentJournal:missingCashPayment,
+      cashInvoicesRequiringSettlementReview:unverifiedCashSales.slice(0,100).map(x=>({invoiceNo:x.invoiceNo,amount:x.grandTotal,date:x.date})),
+      reviewedCashInvoiceCount:cashSales.length,
+      purchaseInvoicesWithoutExplicitCashPaymentFlag:unspecifiedPurchases,
+      warnings:[
+        ...(suspiciousCash.length?["One or more vouchers debit AND credit Cash-in-Hand. These self-offsetting cash entries require accountant review and correction; no historical data was changed."]:[]),
+        ...(orphanContras.length?["One or more contra documents have no posted balanced journal"]:[]),
+        ...(missingCashReceipt.length||missingCashPayment.length?["Posted cash vouchers are missing SYS_CASH journal entries"]:[]),
+        ...(unverifiedCashSales.length?["CASH customer invoices do not by themselves prove cash settlement; verify corresponding cash receipts before closing"]:[]),
+        "Purchase invoices do not carry a reliable paid-in-cash flag; settle cash purchases with a Cash PAYMENT voucher rather than assuming all purchases are paid",
+      ],
+    });
+  }catch(e){return fail(res,e.message||"Cash audit failed",e.statusCode||400);}
+});
+
+// New Cashbook bulk path. Review first; never blindly infer a cash counterparty.
+// Imported rows use stable voucher IDs so a retried file cannot post twice.
+router.post("/cashbook/bulk-preview",upload.single("file"),async(req,res)=>{
+ try{
+  if(!canViewCompanyCashbook(req.auth))return fail(res,"Missing Cashbook view permission",403);
+  if(!req.file?.buffer)return fail(res,"Choose a CSV/Excel file",400);
+  const raw=readRows(req.file.buffer,{preserveText:true,formattedDates:true});
+  if(raw.length>2000)return fail(res,"Maximum 2,000 Cashbook rows",400);
+  const parsed=readCashbookRows(raw);
+  const tenantKey=req.auth.tenantKey;
+  // Exact party matching is allowed; ambiguous parties must be reviewed.
+  const [customers,users,transporters]=await Promise.all([
+    CustomerLink.find({tenantKey,status:"ACTIVE",systemKey:{$ne:"CASH"}}).select("globalCustomerId localName").lean(),
+    User.find({tenantKey,status:"ACTIVE",systemManaged:{$ne:true},ledgerNodeKind:{$ne:"GROUP"}}).select("_id name").lean(),
+    Transporter.find({tenantKey,status:"ACTIVE"}).select("_id name").lean(),
+  ]);
+  const directory=[...customers.map(x=>({name:x.localName,id:x.globalCustomerId,type:"CUSTOMER"})),
+   ...users.map(x=>({name:x.name,id:`USER:${x._id}`,type:"USER"})),
+   ...transporters.map(x=>({name:x.name,id:`TRANSPORTER:${x._id}`,type:"TRANSPORTER"}))].filter(x=>x.name&&upper(x.name)!=="CASH");
+  const options=directory.map(x=>({...x,lc:x.name.toLowerCase()}));
+  const preview=parsed.map(x=>{
+   if(x.error)return x;
+   const given=(x.partyName||x.particulars).toLowerCase();
+   const matches=options.filter(p=>p.lc===given);
+   // Never post a partial-text guess into somebody else's party ledger.
+   // A missing/ambiguous party is posted to SYS_SUSPENSE; the Superadmin can
+   // correct it with the existing audited voucher editor later.
+   const matched=matches.length===1?matches[0]:null;
+   const unmapped=!matched;
+   return {...x,partyName:x.partyName||matched?.name||'Unidentified cash counterparty',
+    partyType:matched?.type||'OTHER',partyId:matched?.id||'',
+    confidence:matched?'EXACT':'SUSPENSE',
+    warning:x.bankWarning||(unmapped?'Party not uniquely identified. This entry will post to Suspense until reassigned.':'')};
+  });
+  return ok(res,{importId:createHash("sha256").update(req.file.buffer).digest("hex"),
+   items:preview,invalid:preview.filter(x=>x.error).length,
+   warnings:preview.filter(x=>x.warning).length,
+   message:"Review party mapping and Cash/Bank classification before posting. Running Balance is calculated after posting."});
+ }catch(e){return fail(res,e.message||"Cashbook preview failed",400);}
+});
+
+router.post("/cashbook/bulk-post",async(req,res)=>{
+ try{
+  const importId=String(req.body.importId||"");
+  if(!/^[a-f0-9]{64}$/.test(importId))return fail(res,"Preview the Cashbook file before posting",400);
+  const items=req.body.rows;
+  if(!Array.isArray(items)||!items.length||items.length>2000)return fail(res,"Select 1 to 2,000 reviewed rows",400);
+  // Validate the entire submitted batch before posting any rows.
+  const errors=[],ready=[];
+  for(const x of items){
+   try{
+    if(!Number.isSafeInteger(x.rowNo)||x.rowNo<2)throw new Error("Invalid source row number");
+    const date=parseStrictVoucherDate(x.date),debit=Number(x.debit||0),credit=Number(x.credit||0);
+    if(!Number.isFinite(debit)||!Number.isFinite(credit)||debit<0||credit<0||(debit>0)===(credit>0))throw new Error("Exactly one Debit or Credit amount is required");
+    const kind=debit>0?"PAYMENT":"RECEIPT";
+    if(!canManualVoucherAction(req.auth,"cash",kind))throw new Error("Missing create permission");
+    if(!cleanText(x.particulars))throw new Error("Particulars required");
+    // A Superadmin-uploaded cash movement is always posted immediately.
+    // Unidentified counterparties use SYS_SUSPENSE, never an invented party.
+    if(!cleanText(x.partyName) && !cleanText(x.particulars))throw new Error("Particulars or party name required");
+    const mappedType=cleanText(x.partyType)||'OTHER';
+    if(upper(x.partyName)==="CASH")throw new Error("CASH cannot be its own counterparty");
+    // Internal company Cash/Bank movements must be ONE contra voucher.
+    if(/\b(cash\s+(deposited|deposit)\s+(in|into|to)\s+(the\s+)?bank|bank\s+deposit|cash\s+withdrawn\s+from\s+bank|cash\s+withdrawal\s+from\s+bank)\b/i.test(String(x.particulars)))
+      throw new Error('Company Cash/Bank transfer must use the Contra page; ordinary Cash bulk posting is not permitted');
+    // Explicit acknowledgement is needed for bank-looking narration.
+    if(/\b(NEFT|RTGS|IMPS|UPI)\b/i.test(String(x.particulars))&&!x.confirmCash)throw new Error("Narration mentions a bank transfer. Confirm physical cash movement first");
+    const serial=createHash("sha256").update(`${req.auth.tenantKey}:${importId}:${x.rowNo}`).digest("hex").slice(0,20).toUpperCase();
+    const voucherNo=`CB-${kind==="PAYMENT"?"P":"R"}-${serial}`;
+    ready.push({row:x.rowNo,kind,input:{date:x.date,transactionType:kind,
+      partyName:x.partyId||x.partyName||'Unidentified cash counterparty',partyType:mappedType,amount:debit||credit,
+      remarks:cleanText(x.particulars),[kind==="PAYMENT"?"paymentNo":"receiptNo"]:voucherNo}});
+   }catch(e){errors.push({row:x.rowNo||"?",error:e.message});}
+  }
+  if(new Set(ready.map(x=>x.row)).size!==ready.length)errors.push({row:"?",error:"Duplicate row numbers in upload"});
+  if(errors.length)return fail(res,"Review rejected rows before posting",400,{errors});
+  let inserted=0;const failures=[];
+  for(const entry of ready){
+   try{await postManualTransactionVoucher({auth:req.auth,channel:"cash",input:entry.input,recalculate:false});inserted++;}
+   catch(e){failures.push({row:entry.row,error:e.statusCode===409?"Already posted (safe duplicate prevention)":e.message});}
+  }
+  return ok(res,{inserted,received:ready.length,errors:failures,partial:failures.length>0},
+   failures.length?"Some rows were not posted":"Cashbook uploaded successfully",201);
+ }catch(e){return fail(res,e.message||"Cashbook import failed",e.statusCode||400);}
 });
 
 router.post("/manual-bulk/:channel",upload.single("file"),async(req,res)=>{
@@ -5263,7 +5969,14 @@ router.post("/manual-bulk/:channel",upload.single("file"),async(req,res)=>{
     catch{return fail(res,"Could not read Excel/CSV file",400);}
     if(!rows.length)return fail(res,"Uploaded file has no records",400);
     if(rows.length>2000)return fail(res,"Maximum 2,000 rows per upload",400);
-    const fields=[
+    const fields=channel==="cash"?[
+      {key:"date",label:"Date",required:true},
+      {key:"partyName",label:"Party Name",aliases:["party","party name / id"],required:true},
+      {key:"remarks",label:"Remarks",aliases:["remark","narration","description"],required:true},
+      {key:"mode",label:"Mode",required:true},
+      {key:"debit",label:"Debit",required:true},
+      {key:"credit",label:"Credit",required:true},
+    ]:[
       {key:"transactionType",label:"Transaction Mode",aliases:["transaction type","type","receipt/payment"],required:true},
       {key:"date",label:"Date",aliases:["transaction date"],required:true},
       {key:"partyName",label:"Party Name / ID",aliases:["party name","party","customer","customer id"],required:true},
@@ -5277,14 +5990,58 @@ router.post("/manual-bulk/:channel",upload.single("file"),async(req,res)=>{
     if(missing.length)return fail(res,`Missing column(s): ${missing.join(", ")}`,400);
     const records=rows.map((row,index)=>{
       const input={};for(const f of fields){const value=valueFor(row,cols[f.key]);if(value!==undefined&&value!=="")input[f.key]=value;}
-      input.bankAccountId=input.bankAccountId||req.body.bankAccountId||"";
+      input.bankAccountId=channel==="bank"?(input.bankAccountId||req.body.bankAccountId||""):"";
       return {row:index+2,input};
     });
+    let inferredFromRemarks=0,postedToSuspense=0;
+    if(channel==="cash"){
+      const importHash=createHash('sha256').update(req.file.buffer).digest('hex');
+      const tenantKey=req.auth.tenantKey;
+      const [customers,users,transporters]=await Promise.all([
+        CustomerLink.find({tenantKey,status:{$nin:["INACTIVE","DEACTIVATED"]},systemKey:{$ne:"CASH"}}).select("globalCustomerId localName displayIdentifier").lean(),
+        User.find({tenantKey,status:"ACTIVE",systemManaged:{$ne:true},ledgerNodeKind:{$ne:"GROUP"}}).select("_id name").lean(),
+        Transporter.find({tenantKey,status:"ACTIVE"}).select("_id name").lean(),
+      ]);
+      const globalIds=[...new Set(customers.map(x=>String(x.globalCustomerId||'')).filter(Boolean))];
+      const globals=globalIds.length?await GlobalCustomer.find({$or:[
+        {hiddenId:{$in:globalIds}},
+        ...(globalIds.some(x=>/^[a-f0-9]{24}$/i.test(x))?[{_id:{$in:globalIds.filter(x=>/^[a-f0-9]{24}$/i.test(x))}}]:[])
+      ]}).select('_id hiddenId legalName tradeName').lean():[];
+      const globalById=new Map();for(const g of globals){if(g.hiddenId)globalById.set(String(g.hiddenId),g);if(g._id)globalById.set(String(g._id),g);}
+      const directory=[...customers.map(x=>({name:x.localName||globalById.get(String(x.globalCustomerId))?.tradeName||globalById.get(String(x.globalCustomerId))?.legalName,
+        aliases:[x.displayIdentifier,globalById.get(String(x.globalCustomerId))?.tradeName,globalById.get(String(x.globalCustomerId))?.legalName],id:x.globalCustomerId,type:"CUSTOMER"})),
+       ...users.map(x=>({name:x.name,id:`USER:${x._id}`,type:"USER"})),
+       ...transporters.map(x=>({name:x.name,id:`TRANSPORTER:${x._id}`,type:"TRANSPORTER"}))]
+       .filter(x=>x.name&&upper(x.name)!=="CASH"&&x.id);
+      for(const {row,input} of records){
+        // Debit/Credit, not the text in Mode, defines the direction.
+        try{
+          cashBulkMode(input.mode);
+          const debit=cashBulkAmount(input.debit),credit=cashBulkAmount(input.credit);
+          if((debit>0)===(credit>0))throw new Error("Enter an amount in exactly one of Debit or Credit");
+          if(upper(input.mode)==="PAYMENT"&&credit>0||upper(input.mode)==="RECEIPT"&&debit>0)
+            throw new Error('Mode and Debit/Credit direction disagree');
+          input.transactionType=debit>0?"PAYMENT":"RECEIPT";
+          input.amount=debit||credit;
+          input.mode="CASH";
+          if(/\b(cash\s+(deposited|deposit)\s+(in|into|to)\s+(the\s+)?bank|bank\s+deposit|cash\s+withdrawn\s+from\s+bank|cash\s+withdrawal\s+from\s+bank)\b/i.test(String(input.remarks||'')))
+            throw new Error('Company Cash/Bank movements must use the Contra page');
+          const match=detectCashBulkParty(input,directory);
+          if(match){input.partyName=match.id;input.partyType=match.type;input.cashMatchSource=match.confidence;}
+          else{input.partyName=cleanText(input.partyName)||"Unidentified cash counterparty";input.partyType="OTHER";input.cashMatchSource="SUSPENSE";}
+          // A retry of the SAME file and row must not create a second voucher.
+          // A different file (even with an equal amount/date) remains a separate entry.
+          const rowFingerprint=createHash('sha256').update(`${tenantKey}:${importHash}:${row}`).digest('hex').slice(0,20).toUpperCase();
+          input[input.transactionType==='PAYMENT'?'paymentNo':'receiptNo']=`CM-${input.transactionType==='PAYMENT'?'P':'R'}-${rowFingerprint}`;
+        }catch(e){input.bulkError=e.message;}
+      }
+    }
     // Whole-file shape validation before any posting; invalid dates are never guessed.
     const errors=[];
     for(const {row,input} of records){
       try{
         parseStrictVoucherDate(input.date);
+        if(input.bulkError)throw new Error(input.bulkError);
         if(!["RECEIPT","PAYMENT"].includes(upper(input.transactionType)))throw new Error("Transaction Mode must be Receipt or Payment");
         if(!canManualVoucherAction(req.auth,channel,input.transactionType))throw new Error("Not permitted to create this receipt/payment");
         if(!cleanText(input.partyName))throw new Error("Party Name / ID is mandatory");
@@ -5293,11 +6050,17 @@ router.post("/manual-bulk/:channel",upload.single("file"),async(req,res)=>{
       }catch(e){errors.push({row,error:e.message});}
     }
     if(errors.length)return fail(res,"Bulk upload rejected: correct the invalid rows",400,{errors:errors.slice(0,100)});
-    let inserted=0;const bankYears=new Map();
+    if(req.auth.role==='SUPERADMIN')for(const record of records)record.input.source='SUPERADMIN_BULK';
+    let inserted=0,receiptInserted=0,paymentInserted=0;const bankYears=new Map();
     for(const {row,input} of records){
       try{
         const out=await postManualTransactionVoucher({auth:req.auth,channel,input,recalculate:false});
         inserted++;
+        if(channel==="cash"){
+          if(input.cashMatchSource==="REMARKS_NAME")inferredFromRemarks++;
+          if(input.cashMatchSource==="SUSPENSE")postedToSuspense++;
+        }
+        if(upper(input.transactionType)==="RECEIPT")receiptInserted++;else paymentInserted++;
         if(channel==="bank")bankYears.set(`${out.financialYear}::${out.bankAccountId}`,out);
       }catch(e){errors.push({row,error:e.message});}
     }
@@ -5306,7 +6069,8 @@ router.post("/manual-bulk/:channel",upload.single("file"),async(req,res)=>{
       try{await recalculateBankRunningBalancesForVoucher({tenantKey:req.auth.tenantKey,financialYear,bankAccountId});}
       catch(e){warnings.push(e.message);}
     }
-    return ok(res,{received:records.length,inserted,invalid:errors.length,errors:errors.slice(0,100),warnings,
+    return ok(res,{received:records.length,inserted,receiptInserted,paymentInserted,invalid:errors.length,errors:errors.slice(0,100),warnings,
+      inferredFromRemarks,postedToSuspense,
       partial:errors.length>0},errors.length?"Some rows were rejected; accepted rows posted":"Transactions posted",201);
   }catch(e){return fail(res,e.message||"Bulk upload failed",e.statusCode||400);}
 });
@@ -5406,6 +6170,171 @@ router.get("/receipts/:receiptId/cashier-otp", async (req, res) => {
 });
 
 
+// Superadmin can correct unposted collector entries without changing verified
+// customer identity or amount. Delete is an audited VOID, never silent removal.
+router.patch('/cashier/receipts/:id/superadmin-correct',async(req,res)=>{
+  try{
+    if(upper(req.auth.role||req.auth.roleCode)!=='SUPERADMIN')return fail(res,'Superadmin only',403);
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {Receipt}=financialModels(req.auth.tenantKey,financialYear);
+    const reason=cleanText(req.body?.reason).trim(),remarks=cleanText(req.body?.remarks).trim();
+    if(reason.length<5||reason.length>500)return fail(res,'Correction reason (5–500 characters) required',422);
+    if(remarks.length>1000)return fail(res,'Remarks maximum 1000 characters',422);
+    const original=await Receipt.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear,
+      collectionSource:'SALESPERSON_APP',status:'POSTED'});
+    if(!original)return fail(res,'Collector receipt not found',404);
+    if(original.ledgerPostedAt)return fail(res,'Posted receipt must be reversed through accounting correction',409);
+    // Verification amount, original party, and payment instrument cannot be edited.
+    original.remarks=remarks;
+    original.disputeHistory.push({status:'SUPERADMIN_EDIT',remark:reason,at:new Date(),by:req.auth.sub,byName:req.auth.name||''});
+    await original.save();
+    return ok(res,{id:String(original._id),remarks},'Receipt remarks corrected; original verified amount and party preserved');
+  }catch(error){return fail(res,error.message,error.statusCode||500);}
+});
+router.delete('/cashier/receipts/:id/superadmin-void',async(req,res)=>{
+  try{
+    if(upper(req.auth.role||req.auth.roleCode)!=='SUPERADMIN')return fail(res,'Superadmin only',403);
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {Receipt,SalespersonCashMovement}=financialModels(req.auth.tenantKey,financialYear);
+    const reason=cleanText(req.body?.reason).trim();
+    if(reason.length<5||reason.length>500)return fail(res,'Void reason (5–500 characters) required',422);
+    const r=await Receipt.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear,
+      collectionSource:'SALESPERSON_APP',status:'POSTED'}).lean();
+    if(!r)return fail(res,'Collector receipt not found',404);
+    if(r.ledgerPostedAt||!['','PENDING_TO_DEPOSIT','NOT_APPLICABLE'].includes(cleanText(r.cashDepositStatus)))
+      return fail(res,'Receipt is posted or already in a handover; reverse/cancel that workflow before voiding',409);
+    const hasBatch=await SalespersonCashMovement.exists({tenantKey:req.auth.tenantKey,financialYear,type:'HANDOVER',
+      status:{$in:['PENDING','APPROVED']},'receiptBreakdown.receiptId':String(r._id)});
+    if(hasBatch)return fail(res,'Receipt belongs to a handover. Reconcile the handover before voiding',409);
+    const changed=await Receipt.findOneAndUpdate({_id:r._id,tenantKey:req.auth.tenantKey,financialYear,status:'POSTED',
+      ledgerPostedAt:{$exists:false},cashDepositStatus:{$in:['',null,'PENDING_TO_DEPOSIT','NOT_APPLICABLE']}},
+      {$set:{status:'VOID',receiptWorkflowStatus:'VOIDED_BY_SUPERADMIN',remarks:`${r.remarks||''} [VOID: ${reason}]`.trim()},
+        $push:{disputeHistory:{status:'SUPERADMIN_VOID',remark:reason,at:new Date(),by:req.auth.sub,byName:req.auth.name||''}}},{new:true});
+    if(!changed)return fail(res,'Receipt status changed; refresh and retry',409);
+    if(upper(r.receiptType)==='CHEQUE'||upper(r.mode)==='CHEQUE')await GenericRecord.updateMany({tenantKey:req.auth.tenantKey,
+      app:'dms',resource:'cheque-control-received','data.linkedReceiptNo':r.receiptNo,'data.linkedReceiptFy':financialYear,
+      'data.status':{$in:['PENDING_WITH_COLLECTOR','PENDING_WITH_SALESPERSON']}},
+      {$set:{'data.status':'CANCELLED','data.custodyStatus':'CANCELLED','data.remarks':`VOID: ${reason}`}});
+    return ok(res,{id:String(changed._id),status:'VOID'},'Receipt voided with audit history; no ledger journal deleted');
+  }catch(error){return fail(res,error.message,error.statusCode||500);}
+});
+
+// Receipt disputes are separate from physical handover. The collector
+// initiates handover and enters the OTP displayed on the DMS Cashier page.
+const cashierWorkflowAllowed=req=>isAdminAuth(req.auth)||upper(req.auth.role)==='CASHIER'||canPageAction(req.auth.permissions||[],'/dms/cashier','edit');
+router.post('/cashier/receipts/:id/dispute',async(req,res)=>{
+  try{
+    if(!cashierWorkflowAllowed(req))return fail(res,'Cashier Edit permission required',403);
+    const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {Receipt}=financialModels(req.auth.tenantKey,fy),remark=cleanText(req.body?.remark).trim();
+    if(remark.length<5||remark.length>500)return fail(res,'Dispute remark must contain 5–500 characters',422);
+    const id=req.params.id;if(!mongoose.isValidObjectId(id))return fail(res,'Valid receipt ID required',422);
+    const r=await Receipt.findOneAndUpdate({_id:id,tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',customerOtpStatus:'VERIFIED',disputeStatus:{$ne:'HOLD'},ledgerPostedAt:{$exists:false}},
+      {$set:{disputeStatus:'HOLD',disputeRemark:remark,disputeRaisedAt:new Date()},$push:{disputeHistory:{status:'HOLD',remark,at:new Date(),by:req.auth.sub,byName:req.auth.name||''}}},{new:true});
+    if(!r)return fail(res,'Receipt cannot be put on hold: already disputed or posted to ledger',409);
+    return ok(res,{receiptId:String(r._id),disputeStatus:'HOLD'},'Receipt placed on dispute HOLD');
+  }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
+router.post('/cashier/receipts/:id/dispute/resolve',async(req,res)=>{
+  try{
+    if(!cashierWorkflowAllowed(req))return fail(res,'Cashier Edit permission required',403);
+    const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {Receipt}=financialModels(req.auth.tenantKey,fy),remark=cleanText(req.body?.remark).trim();
+    if(remark.length<5||remark.length>500)return fail(res,'Resolution remark must contain 5–500 characters',422);
+    if(!mongoose.isValidObjectId(req.params.id))return fail(res,'Valid receipt ID required',422);
+    const r=await Receipt.findOneAndUpdate({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear:fy,disputeStatus:'HOLD',ledgerPostedAt:{$exists:false}},
+      {$set:{disputeStatus:'RESOLVED',disputeResolvedAt:new Date()},$push:{disputeHistory:{status:'RESOLVED',remark,at:new Date(),by:req.auth.sub,byName:req.auth.name||''}}},{new:true});
+    if(!r)return fail(res,'Receipt is not on HOLD or not found',409);
+    return ok(res,{receiptId:String(r._id),disputeStatus:'RESOLVED'},'Receipt dispute resolved; can be selected again');
+  }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
+router.post('/cashier/collect-cash',async(req,res)=>{
+  return fail(res,'This action was retired. Collector initiates the handover; Cashier Close posts ledger entries.',410);
+
+  try{
+    if(!cashierWorkflowAllowed(req))return fail(res,'Cashier Edit permission required',403);
+    const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {Receipt,SalespersonCashMovement}=financialModels(req.auth.tenantKey,fy);
+    const ids=[...new Set((Array.isArray(req.body?.receiptIds)?req.body.receiptIds:[]).map(cleanText).filter(Boolean))];
+    if(!ids.length||ids.length>100||ids.some(x=>!mongoose.isValidObjectId(x)))return fail(res,'Select 1–100 valid cash receipts',422);
+    const collectorId=cleanText(req.body?.collectorId);
+    if(!collectorId)return fail(res,'Select a single collector',422);
+    const receipts=await Receipt.find({_id:{$in:ids},tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',mode:'CASH',customerOtpStatus:'VERIFIED',status:'POSTED',collectedBySalespersonId:collectorId,
+      disputeStatus:{$ne:'HOLD'},cashDepositBatchId:{$in:['',null]},cashDepositStatus:{$in:['PENDING_TO_DEPOSIT','NOT_APPLICABLE','']}}).lean();
+    if(receipts.length!==ids.length)return fail(res,'A selected receipt is already reserved, disputed, or belongs to another collector',409);
+    const amount=money2(receipts.reduce((n,r)=>n+Number(r.amount||0),0));
+    const movement=await SalespersonCashMovement.create({tenantKey:req.auth.tenantKey,financialYear:fy,movementNo:makeId('HND'),salespersonId:collectorId,
+      salespersonNameSnapshot:receipts[0].collectedBySalespersonNameSnapshot||'',recipientUserId:cleanText(req.auth.sub),recipientName:req.auth.name||'Cashier',
+      type:'HANDOVER',direction:'OUT',date:new Date(),amount,cashAmount:amount,bankAmount:0,
+      receiptBreakdown:receipts.map(r=>({receiptId:String(r._id),receiptNo:r.receiptNo,customerGlobalId:r.customerGlobalId,
+        customerNameSnapshot:r.partyNameSnapshot,amount:r.amount,mode:'CASH',receiptType:r.receiptType||'CASH',receiptDenominations:r.cashDenominations||[],collectedAt:r.customerOtpVerifiedAt||r.createdAt||r.date})),
+      handoverWorkflowStatus:'CASHIER_REQUESTED',handoverOtpStatus:'PENDING',status:'PENDING',createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||''});
+    const claimed=[];
+    try{
+      for(const r of receipts){const x=await Receipt.updateOne({_id:r._id,tenantKey:req.auth.tenantKey,financialYear:fy,
+        disputeStatus:{$ne:'HOLD'},cashDepositBatchId:{$in:['',null]},cashDepositStatus:{$in:['PENDING_TO_DEPOSIT','NOT_APPLICABLE','']}},
+        {$set:{cashDepositStatus:'HANDOVER_PENDING',cashDepositBatchId:String(movement._id)}});
+        if(x.modifiedCount!==1)throw Object.assign(new Error('Another handover reserved this receipt. Refresh and retry.'),{statusCode:409});claimed.push(r._id);}
+      const otp=await createOtp({tenantKey:req.auth.tenantKey,transactionId:String(movement._id),actionType:'CASHIER_COLLECT_CASH_FROM_COLLECTOR',recipientId:collectorId,
+        context:{movementNo:movement.movementNo,receiptCount:ids.length,amount,cashierId:cleanText(req.auth.sub)},ttlSeconds:900});
+      movement.handoverOtpId=otp.otpId;movement.handoverOtpCode=otp.code;movement.handoverOtpExpiresAt=otp.expiresAt;await movement.save();
+      return ok(res,{batchId:String(movement._id),movementNo:movement.movementNo,amount,receiptCount:ids.length,expiresAt:otp.expiresAt},'OTP is now visible to the collector in their app. Cashier must enter it to collect the selected cash.');
+    }catch(e){await Receipt.updateMany({_id:{$in:claimed},tenantKey:req.auth.tenantKey,financialYear:fy,cashDepositBatchId:String(movement._id)},{$set:{cashDepositStatus:'PENDING_TO_DEPOSIT',cashDepositBatchId:''}});await SalespersonCashMovement.updateOne({_id:movement._id,status:'PENDING'},{$set:{status:'CANCELLED',handoverWorkflowStatus:'CANCELLED'}});throw e;}
+  }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
+router.post('/cashier/collect-cash/:id/verify',async(req,res)=>{
+  return fail(res,'Cashier-requested pickups were retired; use Collector Deposit to Cashier.',410);
+  try{
+    if(!cashierWorkflowAllowed(req))return fail(res,'Cashier Edit permission required',403);
+    const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {Receipt,SalespersonCashMovement}=financialModels(req.auth.tenantKey,fy);
+    const movement=await SalespersonCashMovement.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear:fy,type:'HANDOVER',
+      handoverWorkflowStatus:'CASHIER_REQUESTED',status:'PENDING',recipientUserId:cleanText(req.auth.sub)});
+    if(!movement)return fail(res,'Pending cashier pickup not found or already collected',409);
+    const ids=(movement.receiptBreakdown||[]).map(r=>r.receiptId);
+    const reservedReceipts=await Receipt.find({_id:{$in:ids},tenantKey:req.auth.tenantKey,financialYear:fy,
+      collectionSource:'SALESPERSON_APP',mode:'CASH',customerOtpStatus:'VERIFIED',
+      disputeStatus:{$ne:'HOLD'},cashDepositBatchId:String(movement._id),cashDepositStatus:'HANDOVER_PENDING',
+      ledgerPostedAt:{$exists:false}}).select('_id').lean();
+    if(ids.length===0||reservedReceipts.length!==ids.length)return fail(res,'A selected receipt is disputed, already posted, missing, or no longer reserved for this cash pickup',409);
+    const result=await verifyOtp({otpId:movement.handoverOtpId,code:cleanText(req.body?.otp)});
+    if(!result.ok)return fail(res,result.reason,400);
+    if(result.challenge.tenantKey!==req.auth.tenantKey||String(result.challenge.transactionId)!==String(movement._id)||result.challenge.actionType!=='CASHIER_COLLECT_CASH_FROM_COLLECTOR'||String(result.challenge.recipientId)!==String(movement.salespersonId))return fail(res,'OTP does not belong to this collector',403);
+    const at=new Date();const done=await SalespersonCashMovement.findOneAndUpdate({_id:movement._id,status:'PENDING',handoverWorkflowStatus:'CASHIER_REQUESTED'},
+      {$set:{status:'APPROVED',handoverWorkflowStatus:'RECEIVED',handoverOtpStatus:'VERIFIED',handoverOtpVerifiedAt:at,cashierReceivedAt:at,cashierReceivedBy:req.auth.sub,cashierReceivedByNameSnapshot:req.auth.name||''}}, {new:true});
+    if(!done)return fail(res,'Pickup was concurrently completed; refresh',409);
+    const accepted=await Receipt.updateMany({_id:{$in:ids},tenantKey:req.auth.tenantKey,financialYear:fy,
+      cashDepositBatchId:String(movement._id),cashDepositStatus:'HANDOVER_PENDING',disputeStatus:{$ne:'HOLD'}},
+      {$set:{cashDepositStatus:'DEPOSITED_TO_CASHIER',cashDepositedAt:at,cashDepositedBy:req.auth.sub,cashDepositedByNameSnapshot:req.auth.name||'',receiptWorkflowStatus:'READY_TO_POST_LEDGER'}});
+    if(accepted.modifiedCount!==ids.length)return fail(res,'Cash custody received, but one receipt changed during confirmation. Accounts review required before ledger posting.',409);
+    return ok(res,{batchId:String(movement._id),receiptCount:ids.length,amount:movement.amount},'Collector OTP verified; cash received. Select Post to Ledger next.');
+  }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
+router.post('/cashier/collect-cash/:id/refresh-otp',async(req,res)=>{
+  try{
+    if(!cashierWorkflowAllowed(req))return fail(res,'Cashier Edit permission required',403);
+    const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear});
+    const {SalespersonCashMovement}=financialModels(req.auth.tenantKey,fy);
+    const movement=await SalespersonCashMovement.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear:fy,
+      type:'HANDOVER',status:'PENDING',handoverWorkflowStatus:'CASHIER_REQUESTED',...cashierMovementScope(req)});
+    if(!movement)return fail(res,'Pending cashier cash pickup not found',409);
+    const otp=await createOtp({tenantKey:req.auth.tenantKey,transactionId:String(movement._id),actionType:'CASHIER_COLLECT_CASH_FROM_COLLECTOR',
+      recipientId:movement.salespersonId,context:{movementNo:movement.movementNo,receiptCount:movement.receiptBreakdown?.length||0,
+        amount:movement.amount,cashierId:cleanText(req.auth.sub)},ttlSeconds:900});
+    const changed=await SalespersonCashMovement.updateOne({_id:movement._id,status:'PENDING',handoverWorkflowStatus:'CASHIER_REQUESTED'},
+      {$set:{handoverOtpId:otp.otpId,handoverOtpCode:otp.code,handoverOtpExpiresAt:otp.expiresAt,handoverOtpStatus:'PENDING'}});
+    if(changed.modifiedCount!==1)return fail(res,'Pickup has already been completed. Refresh.',409);
+    return ok(res,{batchId:String(movement._id),expiresAt:otp.expiresAt},'New OTP is now visible to the selected collector.');
+  }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
+router.get('/cashier/collect-cash/pending',async(req,res)=>{
+  try{if(!cashierWorkflowAllowed(req))return fail(res,'Cashier Edit permission required',403);
+    const fy=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
+    const {SalespersonCashMovement}=financialModels(req.auth.tenantKey,fy);
+    const rows=await SalespersonCashMovement.find({tenantKey:req.auth.tenantKey,financialYear:fy,type:'HANDOVER',handoverWorkflowStatus:'CASHIER_REQUESTED',status:'PENDING',...cashierMovementScope(req)}).lean();
+    return ok(res,{items:rows.map(x=>({id:String(x._id),collectorId:x.salespersonId,collectorName:x.salespersonNameSnapshot,amount:x.amount,receiptCount:x.receiptBreakdown.length,expiresAt:x.handoverOtpExpiresAt}))});
+  }catch(e){return fail(res,e.message,e.statusCode||500);}
+});
 // ---------------------------
 // DMS Cashier: salesperson cash handover / issues / cashbook / closing
 // ---------------------------
@@ -5415,7 +6344,7 @@ const openCashIssue = (issue) => !["RESOLVED", "CANCELLED"].includes(upper(issue
 router.get("/cashier/handovers", async (req, res) => {
   try {
     const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
-    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const { SalespersonCashMovement,Receipt } = financialModels(req.auth.tenantKey, financialYear);
     const filter = {
       tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", "receiptBreakdown.0": { $exists: true },
       ...cashierMovementScope(req),
@@ -5423,19 +6352,41 @@ router.get("/cashier/handovers", async (req, res) => {
     const status = upper(req.query.status || "PENDING");
     if (status === "PENDING") filter.status = "PENDING";
     else if (status === "RECEIVED") filter.status = "APPROVED";
+    else if (status === "LEDGER_UNCONFIRMED") {
+      // Query receipt custody first, so older unconfirmed cash is not hidden
+      // behind hundreds of already-confirmed (newer) handover batches.
+      const unconfirmed=await Receipt.find({tenantKey:req.auth.tenantKey,financialYear,
+        mode:"CASH",collectionSource:"SALESPERSON_APP",status:"POSTED",
+        cashDepositStatus:"DEPOSITED_TO_CASHIER",cashierLedgerConfirmedAt:{$exists:false},
+        cashDepositBatchId:{$nin:[null,""]}}).select("cashDepositBatchId").limit(3000).lean();
+      const ids=[...new Set(unconfirmed.map(x=>String(x.cashDepositBatchId)).filter(isObjectIdText))];
+      filter.status="APPROVED";filter._id={$in:ids};
+    }
     else if (status && status !== "ALL") filter.handoverWorkflowStatus = status;
     const rows = await SalespersonCashMovement.find(filter)
       .select("+handoverOtpCode")
       .sort({ date: -1, createdAt: -1 }).limit(500).lean();
-    const items = rows.map((m) => ({
-      _id: String(m._id), movementNo: m.movementNo, date: m.date, amount: money2(m.amount), cashAmount: money2(m.cashAmount ?? m.amount), bankAmount: money2(m.bankAmount ?? 0),
+    const receiptIds=rows.flatMap(m=>(m.receiptBreakdown||[]).map(r=>r.receiptId)).filter(isObjectIdText);
+    const receiptData=receiptIds.length?await Receipt.find({_id:{$in:receiptIds},tenantKey:req.auth.tenantKey,financialYear})
+      .select('_id receiptNo customerGlobalId amount mode receiptType status customerOtpStatus collectionSource customerOtpVerifiedAt createdAt cashierLedgerConfirmedAt cashDenominations disputeStatus disputeRemark ledgerPostedAt').lean():[];
+    const detailById=new Map(receiptData.map(r=>[String(r._id),r]));
+    const receiptIndex=indexCashierReceipts(receiptData);
+    const projected=rows.map(m=>({movement:m,live:projectCashierHandover(m,receiptIndex)}));
+    const integrityWarningCount=projected.reduce((n,x)=>n+x.live.missingReceiptCount,0);
+    const items = projected.filter(x=>x.live.rows.length>0).map(({movement:m,live}) => ({
+      _id: String(m._id), movementNo: m.movementNo, date: m.date, amount: live.amount, cashAmount: live.cashAmount, bankAmount: live.chequeAmount, missingReceiptCount: live.missingReceiptCount, needsReconciliation: live.missingReceiptCount>0,
       salespersonId: m.salespersonId, salespersonName: m.salespersonNameSnapshot || "",
       cashierId: m.recipientUserId || "", cashierName: m.recipientName || "",
       status: m.status, handoverWorkflowStatus: m.handoverWorkflowStatus || "LEGACY",
       handoverOtpStatus: m.handoverOtpStatus || "NOT_REQUIRED",
-      handoverOtp: m.handoverOtpStatus === "PENDING" ? (m.handoverOtpCode || "") : "",
+      // Cashier-requested pickup OTP must be visible to its collector only.
+      handoverOtp: m.handoverWorkflowStatus!=="CASHIER_REQUESTED"&&m.handoverOtpStatus === "PENDING" ? (m.handoverOtpCode || "") : "",
       handoverOtpExpiresAt: m.handoverOtpExpiresAt || null,
-      denominations: m.denominations || [], receiptBreakdown: m.receiptBreakdown || [],
+      denominations: m.denominations || [], receiptBreakdown: live.rows.filter(r=>["CASH","CHEQUE"].includes(upper(r.mode)))
+        .map(r=>({...r,collectedAt:r.collectedAt||detailById.get(String(r.receiptId))?.customerOtpVerifiedAt||detailById.get(String(r.receiptId))?.createdAt||m.date,
+          receiptDenominations:r.receiptDenominations?.length?r.receiptDenominations:detailById.get(String(r.receiptId))?.cashDenominations||[],
+          cashierLedgerConfirmedAt:detailById.get(String(r.receiptId))?.cashierLedgerConfirmedAt||null,
+          ledgerPostedAt:detailById.get(String(r.receiptId))?.ledgerPostedAt||null,disputeStatus:detailById.get(String(r.receiptId))?.disputeStatus||'NONE',disputeRemark:detailById.get(String(r.receiptId))?.disputeRemark||''})),
       partyIssues: (m.partyIssues || []).map((x) => ({
         issueId: x.issueId, receiptId: x.receiptId, receiptNo: x.receiptNo,
         customerGlobalId: x.customerGlobalId, partyName: x.partyNameSnapshot,
@@ -5443,10 +6394,54 @@ router.get("/cashier/handovers", async (req, res) => {
         raisedAt: x.raisedAt, acknowledgedAt: x.acknowledgedAt, resolvedAt: x.resolvedAt,
         resolutionRemark: x.resolutionRemark || "",
       })),
-      cashierReceivedAt: m.cashierReceivedAt || null,
+      remarks: m.remarks || "", cashierReceivedAt: m.cashierReceivedAt || null,
+      ledgerConfirmation: m.ledgerConfirmation || null,
     }));
-    return ok(res, { financialYear, items });
+    return ok(res, { financialYear, items, integrityWarningCount, notice: integrityWarningCount ? "Some handover snapshots point to missing, voided or altered receipts. They are excluded from active lists; Superadmin must reconcile incomplete batches before acceptance or day close." : "" });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+});
+
+// Edit the non-financial cashier handover remark only. Receipt value,
+// denomination, OTP and batch composition are immutable from DMS Cashier.
+router.patch('/cashier/handovers/:id', async(req,res)=>{
+  try{
+    if(upper(req.auth.role||req.auth.roleCode)!=='SUPERADMIN')return fail(res,'Only Superadmin may edit a cashier handover',403);
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body.financialYear});
+    const {SalespersonCashMovement}=financialModels(req.auth.tenantKey,financialYear);
+    const movement=await SalespersonCashMovement.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear,
+      type:'HANDOVER',status:'PENDING',...cashierMovementScope(req)});
+    if(!movement)return fail(res,'Only pending cashier handovers may be edited',409);
+    const remarks=cleanText(req.body.remarks);
+    if(remarks.length>500)return fail(res,'Remarks limited to 500 characters',422);
+    movement.remarks=remarks;
+    await movement.save();return ok(res,{id:String(movement._id),remarks},'Handover remarks edited; amounts and OTP unchanged');
+  }catch(error){return fail(res,error.message,error.statusCode||500);}
+});
+// Delete for an unverified handover means cancel/release the temporary request,
+// NOT delete any posted customer receipts or physical-accounting evidence.
+router.delete('/cashier/handovers/:id', async(req,res)=>{
+  try{
+    if(upper(req.auth.role||req.auth.roleCode)!=='SUPERADMIN')return fail(res,'Only Superadmin may cancel a cashier handover',403);
+    const financialYear=await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.body?.financialYear||req.query.financialYear});
+    const {SalespersonCashMovement,Receipt}=financialModels(req.auth.tenantKey,financialYear);
+    const filter={_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear,type:'HANDOVER',status:'PENDING',
+      handoverOtpStatus:'PENDING',handoverWorkflowStatus:'PENDING_SALESPERSON_OTP',...cashierMovementScope(req)};
+    const cancelled=await SalespersonCashMovement.findOneAndUpdate(filter,{$set:{status:'CANCELLED',handoverWorkflowStatus:'CANCELLED',handoverOtpStatus:'CANCELLED'},$unset:{handoverOtpCode:''}},{new:false});
+    if(!cancelled)return fail(res,'Only a cashier handover awaiting sender OTP may be cancelled. Verified or received handovers require a formal correction.',409);
+    const receiptIds=(cancelled.receiptBreakdown||[]).map(x=>x.receiptId).filter(x=>mongoose.isValidObjectId(x));
+    if(receiptIds.length)await Receipt.updateMany({tenantKey:req.auth.tenantKey,financialYear,_id:{$in:receiptIds},
+      cashDepositBatchId:String(cancelled._id),cashDepositStatus:'HANDOVER_PENDING'},
+      {$set:{cashDepositStatus:'PENDING_TO_DEPOSIT',cashDepositBatchId:''}});
+    // Cancelling a mixed handover must release cheque custody as well as cash,
+    // otherwise its cheque is permanently stuck in HANDOVER_REQUESTED.
+    await GenericRecord.updateMany({tenantKey:req.auth.tenantKey,app:'dms',resource:'cheque-control-received',
+      'data.cashierHandoverId':String(cancelled._id),'data.status':'HANDOVER_REQUESTED'},
+      {$set:{'data.status':'PENDING_WITH_COLLECTOR','data.custodyStatus':'PENDING_WITH_COLLECTOR'},
+       $unset:{'data.cashierHandoverId':''}});
+    if(cancelled.handoverOtpId)await OtpChallenge.updateOne({tenantKey:req.auth.tenantKey,otpId:cancelled.handoverOtpId,
+      transactionId:String(cancelled._id),status:'PENDING'},{$set:{status:'CANCELLED'}});
+    return ok(res,{cancelled:true,movementNo:cancelled.movementNo},'Unverified handover cancelled and receipts released for resubmission; audit history kept');
+  }catch(error){return fail(res,error.message,error.statusCode||500);}
 });
 
 // Cashier can issue a replacement OTP for an expired handover WITHOUT creating
@@ -5570,13 +6565,38 @@ router.post("/cashier/handovers/:id/receive", async (req, res) => {
     if (movement.status === "APPROVED") return ok(res, movement, "Cash handover is already received");
     if (movement.status !== "PENDING") return fail(res, `Cash handover is ${movement.status}`, 409);
     if (movement.handoverOtpStatus !== "VERIFIED") return fail(res, "Salesperson has not yet confirmed the cashier handover OTP", 409);
+    if ((movement.receiptBreakdown||[]).some(r=>!["CASH","CHEQUE"].includes(upper(r.mode))))
+      return fail(res,"Online/bank payments cannot enter physical cashier custody",409);
+    const receiptIdsToCheck=(movement.receiptBreakdown||[]).map(r=>r.receiptId).filter(isObjectIdText);
+    const live=await Receipt.find({_id:{$in:receiptIdsToCheck},tenantKey:req.auth.tenantKey,financialYear,
+      cashDepositBatchId:String(movement._id),cashDepositStatus:'HANDOVER_PENDING',customerOtpStatus:'VERIFIED',
+      disputeStatus:{$ne:'HOLD'},status:'POSTED'}).lean();
+    if(live.length!==receiptIdsToCheck.length)return fail(res,'One or more receipts changed, are disputed, or do not belong to this handover',409);
+    for(const row of movement.receiptBreakdown||[]){
+      if(upper(row.mode)!=='CHEQUE')continue;
+      const original=live.find(r=>String(r._id)===String(row.receiptId));
+      if(!original||upper(original.receiptType)!=='CHEQUE'&&upper(original.mode)!=='CHEQUE')return fail(res,'Cheque is not linked to its original customer receipt',409);
+      const exists=await GenericRecord.exists({tenantKey:req.auth.tenantKey,app:'dms',resource:'cheque-control-received',
+        'data.linkedReceiptNo':row.receiptNo,'data.linkedReceiptFy':financialYear,'data.cashierHandoverId':String(movement._id),
+        'data.status':{$in:['HANDOVER_REQUESTED','WITH_CASHIER']}});
+      if(!exists)return fail(res,`Cheque ${row.receiptNo} was changed or is not registered`,409);
+    }
     const openIssues = (movement.partyIssues || []).filter(openCashIssue);
     if (openIssues.length) return fail(res, `Resolve ${openIssues.length} cash issue(s) before receiving this handover`, 409, { issues: openIssues.map((x) => ({ issueId: x.issueId, partyName: x.partyNameSnapshot, status: x.status })) });
 
+    // This confirms physical custody ONLY. Company Received visibility waits until day closing.
+    for(const row of movement.receiptBreakdown||[]){if(upper(row.mode)!=='CHEQUE')continue;
+      const result=await GenericRecord.updateOne({tenantKey:req.auth.tenantKey,app:'dms',resource:'cheque-control-received',
+        'data.linkedReceiptNo':row.receiptNo,'data.linkedReceiptFy':financialYear,
+        'data.cashierHandoverId':String(movement._id),'data.status':{$in:['HANDOVER_REQUESTED','WITH_CASHIER']}},
+        {$set:{'data.status':'WITH_CASHIER','data.custodyStatus':'WITH_CASHIER','data.cashierUserId':cleanText(req.auth.sub),
+          'data.cashierReceivedAt':new Date().toISOString()}});
+      if(result.matchedCount!==1)return fail(res,'Cheque custody changed during cashier receipt. Please refresh.',409);
+    }
     movement.status = "APPROVED";
     movement.handoverWorkflowStatus = "RECEIVED";
     // Bank-only handovers do not need to participate in cashier cash closing.
-    if (num(movement.cashAmount ?? movement.amount) === 0) movement.cashierCloseId = "BANK_ONLY";
+    // Cheque-only bundles also remain open until cashier closes the day.
     movement.cashierReceivedAt = new Date();
     movement.cashierReceivedBy = req.auth.sub;
     movement.cashierReceivedByNameSnapshot = req.auth.name || "";
@@ -5595,80 +6615,199 @@ router.post("/cashier/handovers/:id/receive", async (req, res) => {
         receiptWorkflowStatus: "COMPLETED",
       } },
     );
-    return ok(res, { movementNo: movement.movementNo, amount: money2(movement.amount), receivedAt: movement.cashierReceivedAt }, "Cash received and added to cashier cashbook");
+    const chequeIds=(movement.receiptBreakdown||[]).filter(r=>upper(r.mode)==='CHEQUE').map(r=>r.receiptId).filter(isObjectIdText);
+    if(chequeIds.length)await Receipt.updateMany({_id:{$in:chequeIds},tenantKey:req.auth.tenantKey,financialYear,
+      cashDepositBatchId:String(movement._id)},{$set:{chequeApprovalStatus:'AWAITING_CASHIER_CLOSE'}});
+    return ok(res,{movementNo:movement.movementNo,amount:money2(movement.amount),cashAmount:money2(movement.cashAmount||0),
+      chequeAmount:money2(movement.bankAmount||0),receivedAt:movement.cashierReceivedAt},
+      'Cash and cheques accepted into cashier custody; ledger posting and Company Received transfer wait for day close');
   } catch (error) { return fail(res, error.message, error.statusCode || 500, error.details); }
 });
+
+// Customer OTP only verifies the collection. This action posts the party ledger
+// AFTER physical cash custody is accepted by cashier; journal posting is
+// idempotent and rejects duplicate/mismatched receipts.
+router.post("/cashier/ledger-confirm", (req,res) => fail(res,
+  'This action was retired. Collector handover is physical custody only. Cashier Close posts customer ledgers.',410));
 
 router.get("/cashier/cashbook", async (req, res) => {
   try {
     const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
-    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
+    const { SalespersonCashMovement, Receipt } = financialModels(req.auth.tenantKey, financialYear);
     const movements = await SalespersonCashMovement.find({
       tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "APPROVED", "receiptBreakdown.0": { $exists: true },
       ...cashierMovementScope(req),
     }).sort({ cashierReceivedAt: -1, date: -1 }).limit(1000).lean();
+    const closureIds=[...new Set(movements.map(m=>cleanText(m.cashierCloseId)).filter(isObjectIdText))];
+    const closures=closureIds.length?await SalespersonCashMovement.find({tenantKey:req.auth.tenantKey,financialYear,
+      type:'CASHIER_CLOSE',_id:{$in:closureIds}}).select('_id status').lean():[];
+    const closeStates=new Map(closures.map(m=>[String(m._id),upper(m.status)]));
+    // Never resurrect a deleted receipt from the immutable handover snapshot.
+    const sourceIds=[...new Set(movements.flatMap(m=>(m.receiptBreakdown||[]).map(r=>r.receiptId)).filter(isObjectIdText))];
+    const sourceNos=[...new Set(movements.flatMap(m=>(m.receiptBreakdown||[]).filter(r=>!isObjectIdText(r.receiptId)).map(r=>cleanText(r.receiptNo)).filter(Boolean)))];
+    const originalReceipts=sourceIds.length||sourceNos.length ? await Receipt.find({tenantKey:req.auth.tenantKey,financialYear,
+      $or:[...sourceIds.length?[{_id:{$in:sourceIds}}]:[],...sourceNos.length?[{receiptNo:{$in:sourceNos}}]:[]]})
+      .select('_id receiptNo customerGlobalId amount mode receiptType status customerOtpStatus collectionSource').lean() : [];
+    const receiptIndex=indexCashierReceipts(originalReceipts);
+    const projected=movements.map(m=>({movement:m,live:projectCashierHandover(m,receiptIndex)}));
+    const integrityWarningCount=projected.reduce((n,x)=>n+x.live.missingReceiptCount,0);
     const items = [];
-    for (const m of movements) for (const r of m.receiptBreakdown || []) items.push({
+    for (const {movement:m,live} of projected) for (const r of live.rows) if(["CASH","CHEQUE"].includes(upper(r.mode))) items.push({
       id: `${m._id}:${r.receiptId || r.receiptNo}`, batchId: String(m._id), movementNo: m.movementNo,
       receivedAt: m.cashierReceivedAt || m.verifiedAt || m.date, salespersonName: m.salespersonNameSnapshot || "",
       receiptId: r.receiptId, receiptNo: r.receiptNo, customerGlobalId: r.customerGlobalId,
-      partyName: r.customerNameSnapshot || "", mode: r.mode || "CASH", receiptType: r.receiptType || "", amount: money2(r.amount), cashierCloseId: m.cashierCloseId || "",
+      partyName: r.customerNameSnapshot || "", mode: r.mode || "CASH", receiptType: r.receiptType || "", amount: money2(r.amount),
+      cashierCloseId: m.cashierCloseId || "", cashierCloseStatus:m.cashierCloseId?(closeStates.get(String(m.cashierCloseId))||'REVIEW'):'NOT_CLOSED',
+      collectedAt:r.collectedAt||m.date,denominations:r.receiptDenominations||[],
     });
     const total = money2(items.reduce((sum, x) => sum + num(x.amount), 0));
-    const unclosedTotal = money2(items.filter((x) => x.mode === "CASH" && !x.cashierCloseId).reduce((sum, x) => sum + num(x.amount), 0));
-    return ok(res, { financialYear, items, total, unclosedTotal });
+    const unclosedTotal = money2(items.filter((x) => x.mode === "CASH" && x.cashierCloseStatus!=="POSTED").reduce((sum, x) => sum + num(x.amount), 0));
+    return ok(res, { financialYear, items, total, unclosedTotal, integrityWarningCount });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
 router.get("/cashier/close-preview", async (req, res) => {
   try {
     const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.query.financialYear });
-    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
-    const batches = await SalespersonCashMovement.find({
+    const { SalespersonCashMovement, Receipt } = financialModels(req.auth.tenantKey, financialYear);
+    const unfinished=await SalespersonCashMovement.findOne({tenantKey:req.auth.tenantKey,financialYear,
+      type:'CASHIER_CLOSE',status:'PENDING',recipientUserId:cleanText(req.auth.sub)}).sort({createdAt:1}).lean();
+    const batches=await SalespersonCashMovement.find(unfinished?{
+      tenantKey:req.auth.tenantKey,financialYear,type:'HANDOVER',status:'APPROVED',cashierCloseId:String(unfinished._id),
+      cashierReceivedBy:cleanText(req.auth.sub)}:{
       tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "APPROVED", "receiptBreakdown.0": { $exists: true },
       $or: [{ cashierCloseId: { $exists: false } }, { cashierCloseId: "" }, { cashierCloseId: null }],
-      ...cashierMovementScope(req),
+      cashierReceivedBy:cleanText(req.auth.sub),
     }).sort({ cashierReceivedAt: 1, date: 1 }).lean();
-    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.cashAmount ?? x.amount), 0));
+    const receiptIds=[...new Set(batches.flatMap(b=>(b.receiptBreakdown||[]).map(r=>r.receiptId)).filter(isObjectIdText))];
+    const receiptNos=[...new Set(batches.flatMap(b=>(b.receiptBreakdown||[]).filter(r=>!isObjectIdText(r.receiptId)).map(r=>cleanText(r.receiptNo)).filter(Boolean)))];
+    const originals=receiptIds.length||receiptNos.length?await Receipt.find({tenantKey:req.auth.tenantKey,financialYear,
+      $or:[...receiptIds.length?[{_id:{$in:receiptIds}}]:[],...receiptNos.length?[{receiptNo:{$in:receiptNos}}]:[]]})
+      .select('_id receiptNo customerGlobalId amount mode receiptType status customerOtpStatus collectionSource').lean():[];
+    const receiptIndex=indexCashierReceipts(originals);
+    const checked=batches.map(b=>({batch:b,live:projectCashierHandover(b,receiptIndex)}));
+    const integrityWarningCount=checked.reduce((n,x)=>n+x.live.missingReceiptCount,0);
+    const expectedAmount=money2(checked.reduce((sum,x)=>sum+x.live.cashAmount,0));
+    const chequeAmount=money2(checked.reduce((sum,x)=>sum+x.live.chequeAmount,0));
     return ok(res, {
-      financialYear, expectedAmount, batchCount: batches.length,
+      financialYear, expectedAmount, chequeAmount,pendingClosing:!!unfinished,integrityWarningCount,needsReconciliation:integrityWarningCount>0,
+      savedDenominations:unfinished?.denominations||[],
+      cashReceiptCount:checked.flatMap(x=>x.live.rows).filter(r=>upper(r.mode)==='CASH').length,
+      chequeReceiptCount:checked.flatMap(x=>x.live.rows).filter(r=>upper(r.mode)==='CHEQUE').length,
+      batchCount: batches.length,
       salespersonCount: new Set(batches.map((x) => x.salespersonId).filter(Boolean)).size,
-      batches: batches.map((x) => ({ _id: String(x._id), movementNo: x.movementNo, salespersonName: x.salespersonNameSnapshot || "", amount: money2(x.cashAmount ?? x.amount), receivedAt: x.cashierReceivedAt || x.verifiedAt })),
+      batches: checked.filter(x=>x.live.rows.length).map(({batch:x,live}) => ({ _id: String(x._id), movementNo: x.movementNo, salespersonName: x.salespersonNameSnapshot || "", amount: live.cashAmount, receivedAt: x.cashierReceivedAt || x.verifiedAt, needsReconciliation:live.missingReceiptCount>0 })),
     });
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 
+// Day close is the ONLY DMS point that posts received physical CASH to party
+// ledgers and moves accepted CHEQUES into Company Received. The in-progress
+// closing is persisted for safe retry after transient failures (idempotent journals).
 router.post("/cashier/close", async (req, res) => {
   try {
-    const financialYear = await resolveFinancialYear({ tenantKey: req.auth.tenantKey, requested: req.body.financialYear || req.query.financialYear });
-    const { SalespersonCashMovement } = financialModels(req.auth.tenantKey, financialYear);
-    const batches = await SalespersonCashMovement.find({
-      tenantKey: req.auth.tenantKey, financialYear, type: "HANDOVER", status: "APPROVED", "receiptBreakdown.0": { $exists: true },
-      $or: [{ cashierCloseId: { $exists: false } }, { cashierCloseId: "" }, { cashierCloseId: null }],
-      ...cashierMovementScope(req),
-    });
-    if (!batches.length) return fail(res, "There is no unclosed cashier collection", 409);
-    const expectedAmount = money2(batches.reduce((sum, x) => sum + num(x.cashAmount ?? x.amount), 0));
-    const denominations = parseCashDenominations(req.body.denominations);
-    const declaredAmount = denominationTotal2(denominations);
-    if (!(expectedAmount > 0)) return fail(res, "No physical cash requires closing", 409);
-    if (!denominations.length) return fail(res, "Enter closing denominations", 400);
-    if (Math.abs(declaredAmount - expectedAmount) > 0.009) return fail(res, `Closing denomination total ₹${declaredAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })} must match cashier collection ₹${expectedAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`, 409);
-
-    let movementNo = makeId("CSH-CLOSE");
-    while (await SalespersonCashMovement.exists({ tenantKey: req.auth.tenantKey, financialYear, movementNo })) movementNo = makeId("CSH-CLOSE");
-    const closing = await SalespersonCashMovement.create({
-      tenantKey: req.auth.tenantKey, financialYear, movementNo,
-      salespersonId: `CASHIER:${req.auth.sub}`, salespersonNameSnapshot: req.auth.name || "Cashier",
-      recipientUserId: req.auth.sub, recipientName: req.auth.name || "Cashier",
-      date: new Date(), dayKey: new Date().toISOString().slice(0, 10), type: "CASHIER_CLOSE", direction: "OUT",
-      amount: expectedAmount, denominations, closeExpectedAmount: expectedAmount, closeDeclaredAmount: declaredAmount,
-      closeVariance: money2(declaredAmount - expectedAmount), closeDate: new Date(), status: "POSTED",
-      remarks: cleanText(req.body.remarks), createdBy: req.auth.sub, createdByNameSnapshot: req.auth.name || "",
-    });
-    await SalespersonCashMovement.updateMany({ _id: { $in: batches.map((x) => x._id) } }, { $set: { cashierCloseId: String(closing._id) } });
-    return ok(res, { closingNo: closing.movementNo, amount: expectedAmount, denominations, batchCount: batches.length }, "Cashier closed successfully", 201);
-  } catch (error) { return fail(res, error.message, error.statusCode || 500); }
+    if(!cashierWorkflowAllowed(req))return fail(res,'Cashier edit permission required',403);
+    const tenantKey=req.auth.tenantKey;
+    const financialYear=await resolveFinancialYear({tenantKey,requested:req.body?.financialYear||req.query.financialYear});
+    const {SalespersonCashMovement,Receipt}=financialModels(tenantKey,financialYear);
+    const actorScope={cashierReceivedBy:cleanText(req.auth.sub)};
+    // Complete any interrupted closing rather than creating a second close.
+    let closing=await SalespersonCashMovement.findOne({tenantKey,financialYear,type:'CASHIER_CLOSE',status:'PENDING',
+      recipientUserId:cleanText(req.auth.sub)}).sort({createdAt:1});
+    let batches=[];
+    if(closing){
+      batches=await SalespersonCashMovement.find({tenantKey,financialYear,type:'HANDOVER',status:'APPROVED',
+        cashierCloseId:String(closing._id),...actorScope});
+      if(!batches.length)return fail(res,'Incomplete cashier close has no linked batches. Contact Superadmin for reconciliation.',409);
+    }else{
+      batches=await SalespersonCashMovement.find({tenantKey,financialYear,type:'HANDOVER',status:'APPROVED',
+        'receiptBreakdown.0':{$exists:true},$or:[{cashierCloseId:{$exists:false}},{cashierCloseId:''},{cashierCloseId:null}],...actorScope});
+      if(!batches.length)return fail(res,'There are no cashier-received collections awaiting closing',409);
+    }
+    const rows=batches.flatMap(b=>(b.receiptBreakdown||[]).map(row=>({...row,batchId:String(b._id)})));
+    if(rows.some(row=>!['CASH','CHEQUE'].includes(upper(row.mode))))return fail(res,'Legacy online/mixed receipt found; Superadmin must reconcile it',409);
+    const cashRows=rows.filter(x=>upper(x.mode)==='CASH'),chequeRows=rows.filter(x=>upper(x.mode)==='CHEQUE');
+    const cashAmount=money2(cashRows.reduce((sum,r)=>sum+num(r.amount),0)),chequeAmount=money2(chequeRows.reduce((sum,r)=>sum+num(r.amount),0));
+    const receiptIds=rows.map(r=>r.receiptId);
+    if(receiptIds.some(id=>!isObjectIdText(id))||new Set(receiptIds).size!==receiptIds.length)
+      return fail(res,'Duplicated or invalid receipt references in handover; review before closing',409);
+    const live=await Receipt.find({_id:{$in:receiptIds},tenantKey,financialYear,
+      collectionSource:'SALESPERSON_APP',customerOtpStatus:'VERIFIED',status:'POSTED',disputeStatus:{$ne:'HOLD'},
+      cashDepositStatus:'DEPOSITED_TO_CASHIER'}).lean();
+    if(live.length!==receiptIds.length)return fail(res,'A cashier receipt is disputed, not verified, or not physically accepted',409);
+    const byId=new Map(live.map(r=>[String(r._id),r]));
+    for(const row of rows){const r=byId.get(String(row.receiptId));
+      if(!r||r.receiptNo!==row.receiptNo||String(r.customerGlobalId)!==String(row.customerGlobalId)||Math.abs(num(r.amount)-num(row.amount))>0.009||
+        upper(row.mode)!==(upper(r.receiptType)==='CHEQUE'||upper(r.mode)==='CHEQUE'?'CHEQUE':'CASH'))
+        return fail(res,`Original customer/amount mismatch for ${row.receiptNo}`,409);
+      if(String(r.cashDepositBatchId)!==row.batchId)return fail(res,'Receipt belongs to another handover',409);
+    }
+    const denominations=parseCashDenominations(closing?.denominations||req.body?.denominations||[]);
+    const declaredAmount=denominationTotal2(denominations);
+    if(cashAmount>0&&!denominations.length)return fail(res,'Enter physical cash denominations before closing',422);
+    if(Math.abs(cashAmount-declaredAmount)>0.009)return fail(res,`Cash denomination total ₹${declaredAmount} must equal cash in custody ₹${cashAmount}`,409);
+    // Validate cheque custody before any cash journals are posted.
+    const registered=[];
+    for(const row of chequeRows){
+      const cheque=await GenericRecord.findOne({tenantKey,app:'dms',resource:'cheque-control-received',
+        'data.linkedReceiptNo':row.receiptNo,'data.linkedReceiptFy':financialYear,
+        'data.cashierHandoverId':row.batchId});
+      if(!cheque||!['WITH_CASHIER','RECEIVED'].includes(upper(cheque.data?.status))||
+        (cleanText(cheque.data?.customerGlobalId)&&cleanText(cheque.data?.customerGlobalId)!==cleanText(byId.get(String(row.receiptId))?.customerGlobalId))||
+        Math.abs(num(cheque.data?.amount)-num(row.amount))>0.009)
+        return fail(res,`Cheque ${row.receiptNo} is not physically held by cashier or its party/amount differs`,409);
+      registered.push(cheque);
+    }
+    if(!closing){
+      let movementNo=makeId('CSH-CLOSE');
+      while(await SalespersonCashMovement.exists({tenantKey,financialYear,movementNo}))movementNo=makeId('CSH-CLOSE');
+      closing=await SalespersonCashMovement.create({tenantKey,financialYear,movementNo,
+        salespersonId:`CASHIER:${req.auth.sub}`,salespersonNameSnapshot:req.auth.name||'Cashier',
+        recipientUserId:cleanText(req.auth.sub),recipientName:req.auth.name||'Cashier',
+        date:new Date(),dayKey:new Date().toISOString().slice(0,10),type:'CASHIER_CLOSE',direction:'OUT',
+        amount:cashAmount,bankAmount:chequeAmount,denominations,closeExpectedAmount:cashAmount,
+        closeDeclaredAmount:declaredAmount,closeVariance:0,closeDate:new Date(),status:'PENDING',
+        remarks:cleanText(req.body?.remarks),createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||''});
+      const claimed=[];
+      for(const batch of batches){
+        const result=await SalespersonCashMovement.updateOne({_id:batch._id,tenantKey,financialYear,status:'APPROVED',
+          $or:[{cashierCloseId:{$exists:false}},{cashierCloseId:''},{cashierCloseId:null}]},
+          {$set:{cashierCloseId:String(closing._id)}});
+        if(result.modifiedCount!==1){
+          await SalespersonCashMovement.updateMany({_id:{$in:claimed}},{$set:{cashierCloseId:''}});
+          await SalespersonCashMovement.updateOne({_id:closing._id},{$set:{status:'CANCELLED'}});
+          return fail(res,'Another cashier close reserved a batch. Refresh and retry.',409);
+        }
+        claimed.push(batch._id);
+      }
+    }
+    // Idempotent customer journals; a retry continues from the same closing.
+    const results=[];
+    for(const row of cashRows){results.push(await postCustodyApprovedReceipt({tenantKey,financialYear,
+      receiptId:row.receiptId,channel:'CASH',actorId:req.auth.sub,actorName:req.auth.name||''}));}
+    // Company Received cheque records are released AFTER the closing request.
+    if(registered.length){
+      const approval=await GenericRecord.findOneAndUpdate({tenantKey,app:'dms',resource:'cheque-control-approval-bundles',
+        reference:`CASHIER-CLOSE:${closing._id}`},{$setOnInsert:{tenantKey,app:'dms',resource:'cheque-control-approval-bundles',
+          reference:`CASHIER-CLOSE:${closing._id}`,title:`Cashier close ${closing.movementNo}`,status:'ACTIVE',
+          createdBy:cleanText(req.auth.sub),data:{financialYear,status:'APPROVED',cashierId:cleanText(req.auth.sub),
+            collectorId:'MULTIPLE',chequeIds:registered.map(c=>String(c._id)),receiptNos:chequeRows.map(r=>r.receiptNo),
+            count:chequeRows.length,amount:chequeAmount,approvedAt:new Date(),approvedBy:cleanText(req.auth.sub),
+            approvedByName:cleanText(req.auth.name),source:'CASHIER_DAY_CLOSE'}}},{upsert:true,new:true});
+      for(let i=0;i<chequeRows.length;i++){
+        const row=chequeRows[i],ch=registered[i];
+        await GenericRecord.updateOne({_id:ch._id,tenantKey,app:'dms',resource:'cheque-control-received',
+          'data.status':{$in:['WITH_CASHIER','RECEIVED']}},{$set:{'data.status':'RECEIVED','data.custodyStatus':'COMPANY_RECEIVED',
+            'data.approvalBundleId':String(approval._id),'data.statusDate':new Date().toISOString().slice(0,10)}});
+        await Receipt.updateOne({_id:row.receiptId,tenantKey,financialYear},
+          {$set:{chequeApprovalStatus:'APPROVED',chequeApprovalBatchId:String(approval._id),receiptWorkflowStatus:'READY_TO_POST_LEDGER'}});
+      }
+    }
+    await SalespersonCashMovement.updateOne({_id:closing._id,tenantKey,financialYear,status:'PENDING'},{$set:{status:'POSTED'}});
+    return ok(res,{closingNo:closing.movementNo,amount:cashAmount,chequeAmount,
+      cashPosted:results.filter(r=>!r.alreadyPosted).length,chequesTransferred:chequeRows.length,batchCount:batches.length},
+      'Cashier closed: cash posted to parties; cheques transferred to Company Received. No duplicate postings.',201);
+  }catch(error){return fail(res,error.message,error.statusCode||500,error.details);}
 });
 
 router.get("/payments", async (req, res) => {

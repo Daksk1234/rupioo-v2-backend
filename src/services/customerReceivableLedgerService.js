@@ -27,7 +27,10 @@ async function currentYearRows({ tenantKey, financialYear, customerGlobalId }) {
   const [sales, receipts, creditNotes] = await Promise.all([
     SalesInvoice.find({ tenantKey, financialYear: fy, customerGlobalId, status: "POSTED" })
       .select("_id invoiceNo date grandTotal remarks createdAt").lean(),
-    Receipt.find({ tenantKey, financialYear: fy, customerGlobalId, status: "POSTED" })
+    Receipt.find({ tenantKey, financialYear: fy, customerGlobalId, status: "POSTED", $or: [
+        { collectionSource: { $ne: "SALESPERSON_APP" } },
+        { ledgerPostedAt: { $exists: true } },
+      ] })
       .select("_id receiptNo date amount remarks createdAt statementImportId").lean(),
     CreditNote.find({
       tenantKey, financialYear: fy, status: "ISSUED",

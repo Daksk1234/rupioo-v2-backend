@@ -36,6 +36,25 @@ const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024 },
 });
 
+// FY-specific stock opening is a reporting baseline, not a stock movement.
+// Superadmin may set imported historical FY quantities/rates without altering
+// product.currentStock or posting phantom inward/outward stock movements.
+function normalizeStockFyOpenings(value) {
+  if(!value || typeof value !== 'object' || Array.isArray(value))throw new Error('Stock FY openings must be a financial-year map');
+  const output={};
+  for(const [fy,raw] of Object.entries(value)) {
+    const match=/^(\d{4})-(\d{2})$/.exec(fy);
+    if(!match||Number(match[2])!==(Number(match[1])+1)%100)throw new Error(`Invalid stock opening financial year: ${fy}`);
+    const original=(raw&&typeof raw==='object')?raw:{qty:raw};
+    const qty=Number(original.qty??original.quantity??original.openingStock??0);
+    const rate=Number(original.rate??original.openingRate??0);
+    if(!Number.isFinite(qty)||qty<0||!Number.isFinite(rate)||rate<0)throw new Error(`Invalid FY opening stock quantity/rate for ${fy}`);
+    output[fy]={qty,rate};
+  }
+  if(Object.keys(output).length>60)throw new Error('Too many stock opening years');
+  return output;
+}
+
 const PRODUCT_MEDIA_MAX_BYTES = 2 * 1024 * 1024;
 const PRODUCT_MEDIA_MIME_EXTENSIONS = new Map([
   ["image/jpeg", new Set([".jpg", ".jpeg"])],
@@ -283,7 +302,9 @@ router.post("/", async (req, res) => {
     if (!isAdminAuth(req.auth)) {
       delete body.minimumProfitPct;
       delete body.pricingScheme;
+      delete body.openingStockByFY;
     }
+    if(body.openingStockByFY!==undefined)body.openingStockByFY=normalizeStockFyOpenings(body.openingStockByFY);
     const gstWasProvided = hasValue(req.body?.gstRate) || req.body?.gstRate === 0;
 
     delete body.hsnDescription;
@@ -1068,7 +1089,9 @@ router.put("/:id", async (req, res) => {
     if (!isAdminAuth(req.auth)) {
       delete changes.minimumProfitPct;
       delete changes.pricingScheme;
+      delete changes.openingStockByFY;
     }
+    if(changes.openingStockByFY!==undefined)changes.openingStockByFY=normalizeStockFyOpenings(changes.openingStockByFY);
     const gstWasProvided = hasValue(req.body?.gstRate) || req.body?.gstRate === 0;
     if (String(changes.status || "").toUpperCase() === "INACTIVE" && existing.status !== "INACTIVE") {
       const inUse = await referencedProductIds(req.auth.tenantKey, [req.params.id]);

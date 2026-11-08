@@ -21,6 +21,9 @@ export function fyModels(db) {
     { tenantKey: 1, financialYear: 1, postingKey: 1 },
     { unique: true, partialFilterExpression: { postingKey: { $type: "string" } } },
   );
+  // Cashbook/BANK lookups filter by ledger account and sort by voucher date.
+  // The party-specific index below cannot satisfy that sort without a party filter.
+  ledgerEntrySchema.index({ tenantKey: 1, financialYear: 1, accountCode: 1, status: 1, date: 1, createdAt: 1 });
   // Fast customer-ledger reports (Lock Party / receivable ageing).
   ledgerEntrySchema.index({ tenantKey: 1, financialYear: 1, accountCode: 1, status: 1, partyGlobalId: 1, date: 1 });
 
@@ -124,6 +127,8 @@ export function fyModels(db) {
     sourceKey: String,
     date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true },
+    // Identity of the precise tenant-local CustomerLink chosen by the collector.
+    customerLinkId: String,
     partyType:String,
     partyNameSnapshot:String,
     amount: Number,
@@ -139,6 +144,10 @@ export function fyModels(db) {
       amount: Number,
     }],
     payerAccountNumber: String,
+    payerIfsc: String, payerBankName: String, collectedByRole: String,
+    clientMutationId: { type: String, index: true },
+    bankMatchStatus: {type:String,default:"PENDING_BANK_VERIFICATION"},
+    bankMatchStatementRowId: String, bankMatchedAt: Date,
     paymentProofFileId: { type: String, index: true },
     paymentProofKind: String,
     upiPaymentText: String,
@@ -182,12 +191,21 @@ export function fyModels(db) {
     cashierOtpVerifiedAt: Date,
     cashierOtpVerifiedBy: String,
     cashierOtpVerifiedByNameSnapshot: String,
-    ledgerPostedAt: Date,
+    ledgerPostedAt: Date,ledgerPostedBy:String,ledgerPostedByNameSnapshot:String,
+    chequeBankReceivedDate:Date,
+    chequeApprovalStatus:{type:String,default:'NOT_REQUIRED',index:true},
+    chequeApprovalBatchId:String,
+    disputeStatus:{type:String,default:'NONE',index:true},
+    disputeRemark:String,disputeRaisedAt:Date,disputeResolvedAt:Date,
+    disputeHistory:[{status:String,remark:String,at:Date,by:String,byName:String}],
+    cashierLedgerConfirmedAt: Date,
+    cashierLedgerConfirmedBy: String,
+    cashierLedgerConfirmedByNameSnapshot: String,
 
     // Physical-cash details captured from the Sales Person app. These fields are
-    // intentionally independent from accounting posting: the receipt can already
-    // be posted to the customer ledger while the notes are still physically with
-    // the salesperson and therefore still PENDING_TO_DEPOSIT.
+    // Cash custody is independent of ledger posting. For new collector receipts,
+    // customer OTP verification is NOT a ledger post; cashier must approve custody
+    // and explicitly post to ledger after receiving physical cash.
     cashDenominations: [{ denomination: Number, count: Number, amount: Number }],
     cashDepositStatus: { type: String, default: "NOT_APPLICABLE", index: true },
     cashDepositBatchId: { type: String, index: true },
@@ -199,12 +217,73 @@ export function fyModels(db) {
     createdByNameSnapshot:String,
     status: { type: String, default: "POSTED", index: true }
   }, { timestamps: true });
+  receiptSchema.index({tenantKey:1,financialYear:1,clientMutationId:1},{unique:true,partialFilterExpression:{clientMutationId:{$type:"string"}}});
+  receiptSchema.index({tenantKey:1,financialYear:1,bankMatchStatementRowId:1},{unique:true,partialFilterExpression:{bankMatchStatementRowId:{$type:"string"}}});
   receiptSchema.index({ tenantKey: 1, financialYear: 1, collectedBySalespersonId: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, status: 1, bounceStatus: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, collectionSource: 1, receiptWorkflowStatus: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, customerOtpStatus: 1, cashierOtpStatus: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, chequeStatus: 1, chequeIssueDate: -1 });
   receiptSchema.index({tenantKey:1,financialYear:1,sourceKey:1},{unique:true,partialFilterExpression:{sourceKey:{$type:"string"}}});
+
+  // An internal cash↔bank transfer is NOT a customer receipt/payment.
+  // Keep its own document so receipt totals, collection incentives and supplier
+  // payments do not grow when the company simply moves its own money.
+  const contraVoucherSchema = new Schema({
+    tenantKey:{type:String,index:true},financialYear:{type:String,index:true},
+    contraNo:{type:String,required:true,index:true},date:{type:Date,index:true},
+    direction:{type:String,enum:["DEPOSIT","WITHDRAWAL"],required:true},
+    bankAccountId:{type:String,index:true},bankNameSnapshot:String,
+    amount:{type:Number,required:true},reference:String,remarks:String,
+    runningBalance:Number,status:{type:String,default:"POSTED",index:true},
+    createdBy:String,createdByNameSnapshot:String,
+  },{timestamps:true});
+  contraVoucherSchema.index({tenantKey:1,financialYear:1,contraNo:1},{unique:true});
+
+  // Single source record for a transfer between two banks belonging to this company.
+  // Never insert a customer Receipt or Payment for an internal transfer.
+  const bankTransferSchema = new Schema({
+    tenantKey:{type:String,index:true},financialYear:{type:String,index:true},
+    transferNo:{type:String,required:true},date:{type:Date,index:true},
+    fromBankAccountId:{type:String,required:true,index:true},
+    toBankAccountId:{type:String,required:true,index:true},
+    fromBankNameSnapshot:String,toBankNameSnapshot:String,
+    amount:{type:Number,required:true},reference:String,remarks:String,
+    fromRunningBalance:Number,toRunningBalance:Number,
+    status:{type:String,enum:["PENDING_POST","POSTED"],default:"PENDING_POST",index:true},
+    createdBy:String,createdByNameSnapshot:String,
+  },{timestamps:true});
+  bankTransferSchema.index({tenantKey:1,financialYear:1,transferNo:1},{unique:true});
+  bankTransferSchema.index({tenantKey:1,financialYear:1,fromBankAccountId:1,toBankAccountId:1,date:1});
+
+  // Immutable audit trail for edits to posted, DMS-direct vouchers.
+  // Journal updates and this audit record commit within the same DB transaction.
+  const voucherEditAuditSchema = new Schema({
+    tenantKey:{type:String,index:true},financialYear:{type:String,index:true},
+    voucherKind:String,voucherId:String,voucherNo:String,
+    previous:Schema.Types.Mixed,next:Schema.Types.Mixed,
+    previousJournal:[Schema.Types.Mixed],nextJournal:[Schema.Types.Mixed],
+    reason:String,editedBy:String,editedByNameSnapshot:String,editedAt:Date,
+  },{timestamps:true});
+  voucherEditAuditSchema.index({tenantKey:1,financialYear:1,voucherKind:1,voucherId:1,createdAt:-1});
+
+  // Superadmin book adjustments retain the source and full correction trail.
+  // They do not silently mutate statutory invoices or OTP evidence.
+  const bookCorrectionSchema = new Schema({
+    tenantKey:{type:String,required:true,index:true},financialYear:{type:String,required:true,index:true},
+    book:{type:String,enum:['CASH','BANK'],required:true},sourceKey:{type:String,required:true},bankAccountId:String,
+    date:Date,debit:Number,credit:Number,remarks:String,partyName:String,partyGlobalId:String,partyType:String,deleted:Boolean,
+    originalSnapshot:Schema.Types.Mixed,originalJournalNet:Number,
+    activeJournalTransactionIds:[String],editedBy:String,editedByNameSnapshot:String,reason:String,
+  },{timestamps:true});
+  bookCorrectionSchema.index({tenantKey:1,financialYear:1,book:1,sourceKey:1},{unique:true});
+  bookCorrectionSchema.index({tenantKey:1,financialYear:1,book:1,bankAccountId:1,date:1});
+  const bookCorrectionAuditSchema = new Schema({
+    tenantKey:String,financialYear:String,book:String,sourceKey:String,action:String,
+    previous:Schema.Types.Mixed,next:Schema.Types.Mixed,reason:String,
+    correctionJournalId:String,editedBy:String,editedByNameSnapshot:String,
+  },{timestamps:true});
+  bookCorrectionAuditSchema.index({tenantKey:1,financialYear:1,book:1,sourceKey:1,createdAt:-1});
 
   const paymentSchema = new Schema({ tenantKey: String, financialYear: String, paymentNo: String, sourceKey:String, date: { type: Date, index: true }, partyGlobalId: { type: String, index: true }, partyType:String, partyNameSnapshot:String, amount: Number, mode: String, reference: String, remarks:String, bankAccountId:{type:String,index:true}, bankNameSnapshot:String, statementImportId:String, statementRowNo:Number, runningBalance:Number, createdBy:String, createdByNameSnapshot:String, status: { type: String, default: "POSTED" } }, { timestamps: true });
 
@@ -506,6 +585,7 @@ export function fyModels(db) {
       receiptId: String, receiptNo: String, customerGlobalId: String,
       customerNameSnapshot: String, amount: Number, mode: String, receiptType: String,
       receiptDenominations: [{ denomination: Number, count: Number, amount: Number }],
+      collectedAt: Date,
     }],
     handoverWorkflowStatus: { type: String, default: "LEGACY", index: true },
     handoverOtpId: String,
@@ -581,6 +661,11 @@ export function fyModels(db) {
     PurchaseInvoice: get("PurchaseInvoice", purchaseInvoiceSchema),
     Receipt: get("Receipt", receiptSchema),
     Payment: get("Payment", paymentSchema),
+    VoucherEditAudit: get("VoucherEditAudit", voucherEditAuditSchema),
+    BookCorrection: get("BookCorrection", bookCorrectionSchema),
+    BookCorrectionAudit: get("BookCorrectionAudit", bookCorrectionAuditSchema),
+    ContraVoucher: get("ContraVoucher", contraVoucherSchema),
+    BankTransfer: get("BankTransfer", bankTransferSchema),
     StockMovement: get("StockMovement", stockMovementSchema),
     WarehouseTransfer: get("WarehouseTransfer", warehouseTransferSchema),
     WarehouseClosing: get("WarehouseClosing", warehouseClosingSchema),

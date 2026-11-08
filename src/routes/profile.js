@@ -9,6 +9,7 @@ import { gstChangeConfirmation, migrateCompanyTenantKey, normalizeCompanyGstin, 
 import { encryptSecret } from "../services/mail/crypto.js";
 import { verifySmtpConnection } from "../services/mail/smtpMail.service.js";
 import { detectMailProvider, isValidEmail } from "../services/mail/providerDetection.service.js";
+import { discoverFinancialYears, fiscalYearCandidates, firstDataYear, normalizeYears, invalidateFinancialYearDiscovery } from "../services/financialYearDiscoveryService.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -90,6 +91,8 @@ async function loadProfile(req) {
       .lean(),
   ]);
 
+  const discovery = await discoverFinancialYears({tenantKey:company.tenantKey,configured:company.financialYears || []});
+  const effectiveFinancialYears=fiscalYearCandidates({configured:company.financialYears,discovered:discovery.discovered,opening:company.firstCashFinancialYear});
   const subscription = subscriptionSnapshot(company);
   const mailConnection = await MailConnection.findOne({ database: company.tenantKey })
     .select("email provider authMode status smtpHost smtpPort smtpSecure smtpUser encryptedSmtpPassword lastHealthAt lastSuccessfulSendAt lastError")
@@ -102,7 +105,9 @@ async function loadProfile(req) {
       tenantId: String(user.tenantId || company._id || ""),
       tenantKey: user.tenantKey,
     },
-    company,
+    company: {...company, financialYears:effectiveFinancialYears},
+    financialYearDiscovery: {...discovery, availableFinancialYears:effectiveFinancialYears,
+      suggestedOpeningFinancialYear: firstDataYear({discovered:discovery.discovered,configured:effectiveFinancialYears})},
     plan,
     group: group
       ? {
@@ -147,6 +152,7 @@ router.put("/", async (req, res) => {
   if (!user || !company) return fail(res, "Superadmin/company profile not found", 404);
   const previousCashYear=String(company.firstCashFinancialYear||"");
   const previousCashAmount=Number(company.firstCashOpeningBalance||0);
+  const discoveredYears=await discoverFinancialYears({tenantKey:company.tenantKey,configured:company.financialYears || []});
 
   const requestedGstin = normalizeCompanyGstin(req.body.gstin ?? company.gstin ?? company.tenantKey);
   let tenantMigration = null;
@@ -222,11 +228,14 @@ router.put("/", async (req, res) => {
   }
 
   if (Array.isArray(req.body.financialYears)) {
-    const years = Array.from(new Set(req.body.financialYears.map(clean).filter(Boolean)));
+    const years = normalizeYears([...req.body.financialYears.map(clean),...discoveredYears.discovered]);
     company.financialYears = years;
     if (years.length && !years.includes(company.financialYear)) company.financialYear = years[0];
   }
 
+  // Include fiscal-year data that already exists, even when the Superadmin
+  // originally enabled only later financial years. Never remove data years.
+  company.financialYears=normalizeYears([...(company.financialYears || []),...discoveredYears.discovered]);
   // First-year cash opening: company-wide, not per cashier or per user.
   // Validate BEFORE saving anything. Cashbook and finance reports both read SYS_CASH.
   const cashOpeningChanged = req.body.firstCashFinancialYear !== undefined || req.body.firstCashOpeningBalance !== undefined;
@@ -236,9 +245,13 @@ router.put("/", async (req, res) => {
     const match=/^(\d{4})-(\d{2})$/.exec(firstYear);
     if(!match || Number(match[2])!==((Number(match[1])+1)%100))return fail(res,"First Cash Financial Year must use YYYY-YY, e.g. 2025-26",400);
     if(!Number.isFinite(amount) || amount<0 || amount>1e14)return fail(res,"Cash opening must be a valid non-negative amount",400);
-    const configured=[...(company.financialYears||[])].filter(Boolean);
-    if(configured.length && !configured.includes(firstYear))return fail(res,"Cash opening FY must be one of the enabled financial years",400);
-    if(configured.length && firstYear!==configured.sort()[0])return fail(res,"Cash opening must be set against the company's first financial year",400);
+    // Historical data determines the first FY; a registration-date default
+    // must not reject old imported cash or bank records.
+    const effective=fiscalYearCandidates({configured:company.financialYears,discovered:discoveredYears.discovered,opening:firstYear});
+    const earliest=discoveredYears.firstDataFinancialYear || firstDataYear({configured:effective});
+    if(earliest && firstYear!==earliest)
+      return fail(res,`First Cash Opening belongs to ${earliest}, the earliest ${discoveredYears.firstDataFinancialYear?'financial year with company records':'configured financial year'}. Select that year in the Profile before saving.`,400);
+    company.financialYears=effective;
     company.firstCashFinancialYear=firstYear;
     company.firstCashOpeningBalance=Math.round(amount*100)/100;
   }
@@ -282,6 +295,7 @@ router.put("/", async (req, res) => {
     company.markModified("gstin");
   }
   await company.save();
+  invalidateFinancialYearDiscovery(company.tenantKey);
 
   const persistedCompany = await CompanyProfile.findById(company._id).lean();
   if (!persistedCompany) return fail(res, "Company profile disappeared while saving", 500, { code: "COMPANY_PROFILE_SAVE_FAILED" });

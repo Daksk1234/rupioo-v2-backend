@@ -1,8 +1,25 @@
 import crypto from "crypto";
+import mongoose from "mongoose";
 import { useDatabase, getFinancialYearDbName } from "../config/db.js";
 import { fyModels } from "../models/fyModels.js";
 import { isTenantMigrationActive } from "./tenantMigrationLock.js";
 import { resolveFinancialStorageTenantKeySync } from "./financialStorageTenantService.js";
+
+// Check whether a financial-year collection already exists without creating it.
+// Cash opening balances use this for years whose ledger collection may be absent.
+export async function financialCollectionExists(tenantKey, financialYear, collectionName) {
+  if (isTenantMigrationActive(tenantKey)) {
+    const error = new Error("Company GST/tenant migration is in progress. Retry this request after the migration completes.");
+    error.status = 423;
+    error.code = "TENANT_MIGRATION_RUNNING";
+    throw error;
+  }
+  const physicalTenantKey = resolveFinancialStorageTenantKeySync(tenantKey);
+  const databaseName = getFinancialYearDbName(physicalTenantKey, financialYear);
+  return mongoose.connection.getClient().db(databaseName)
+    .listCollections({ name: String(collectionName) }, { nameOnly: true })
+    .hasNext();
+}
 
 export function financialModels(tenantKey, financialYear) {
   if (isTenantMigrationActive(tenantKey)) {
@@ -38,6 +55,17 @@ export async function postBalancedEntries({ tenantKey, financialYear, transactio
       ).digest("hex"),
     };
   });
+  // Block the original cause: CASH cannot be debited and credited in the
+  // same voucher (even though such a posting mathematically balances).
+  // A company cash/bank contra uses SYS_CASH on ONE side and the bank ledger
+  // on the other, so it remains valid.
+  const cashDr = prepared.some((e) => e.accountCode === "SYS_CASH" && e.debit > 0);
+  const cashCr = prepared.some((e) => e.accountCode === "SYS_CASH" && e.credit > 0);
+  if (cashDr && cashCr) {
+    const err = new Error(`Voucher ${transaction}: Cash-in-Hand cannot be both debited and credited. Choose the real counterparty or use a Cash / Bank Contra voucher.`);
+    err.statusCode = 422;
+    throw err;
+  }
   const totalDebit = prepared.reduce((sum, e) => sum + e.debit, 0);
   const totalCredit = prepared.reduce((sum, e) => sum + e.credit, 0);
   if (Math.abs(totalDebit - totalCredit) > 0.01) {

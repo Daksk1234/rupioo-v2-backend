@@ -2,6 +2,7 @@
 // IMPORTANT: this file uses the old DMS only as a business-rule reference.
 // It queries only current V2 models / FY databases and does not import legacy code.
 import { financialModels } from "./accountingService.js";
+import { companyCashOpening } from "./companyCashOpeningService.js";
 import { buildGstReport } from "./gstReportsService.js";
 import { inspectBankLedgerRows } from "./bankLedgerIntegrityService.js";
 import { buildLegacyReport, invoiceLines, orderRows, reportPeriod } from "./legacyReportsService.js";
@@ -382,6 +383,8 @@ async function accountingRows({ tenantKey, financialYear, period, f }) {
     const op = (ledger.openingBalances || []).find((x) => T(x.financialYear) === T(financialYear));
     if (op) addOpening(ledger.systemAccountCode, signedOpening(op.amount, op.type));
   }
+  // Cashbook, Trial Balance and Balance Sheet must show the same SYS_CASH opening.
+  openingByCode.set("SYS_CASH", await companyCashOpening({tenantKey,financialYear}));
   for (const c of customers) {
     if (ledgerOwnerKeys.has(`CUSTOMER|${c.globalCustomerId}`)) continue;
     const ap = c.accountingProfile || {}; if (T(ap.financialYear) && T(ap.financialYear) !== T(financialYear)) continue;

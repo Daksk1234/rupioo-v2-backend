@@ -1,3 +1,6 @@
+import { buildBookMonthSummary } from "../services/bookMonthSummary.js";
+import {applyBankCorrections} from "../services/superadminBookCorrectionRules.js";
+import { bankStatementOpening, bankStatementNext, bankTransferMovement } from "../services/bankStatementBalanceRules.js";
 import express from "express";
 import multer from "multer";
 import crypto from "crypto";
@@ -171,9 +174,10 @@ function parseStatementAmount(value,{signedBalance=false}={}) {
 }
 
 function normalizeStatementMode(rawMode, remarks) {
-  const modeText = upper(rawMode);
-  const remarkText = upper(remarks);
-  if (modeText.includes("CASH") || /(^|[^A-Z])CASH([^A-Z]|$)/.test(remarkText)) return "CASH";
+  // Every entry imported FROM a BANK STATEMENT is a bank-side movement.
+  // "CASH DEPOSIT" in narration describes the other side; it does NOT turn
+  // the bank entry into a cash payment/receipt. Explicitly map such deposits
+  // to Company Cash-in-Hand (Contra) during review when appropriate.
   return "BANK";
 }
 
@@ -204,12 +208,14 @@ function normalizeStatementRows(rawRows, cols) {
     const rawDate = valueFor(row, cols.date);
     const rawDebit = cols.debit ? row[cols.debit] : "";
     const rawCredit = cols.credit ? row[cols.credit] : "";
+    const rawAmount = cols.amount ? row[cols.amount] : "";
+    const rawDirection = cols.transactionType ? row[cols.transactionType] : "";
     const rawBalance = cols.runningBalance ? row[cols.runningBalance] : "";
 
     // Running Balance is deliberately optional. V2 calculates it itself after
     // upload so a bank-exported or manually prepared balance column can never
     // block an otherwise valid statement import.
-    const blankRow = !clean(rawDate) && !sourcePartyName && !remarks && !clean(rawDebit) && !clean(rawCredit) && !clean(rawBalance);
+    const blankRow = !clean(rawDate) && !sourcePartyName && !remarks && !clean(rawDebit) && !clean(rawCredit) && !clean(rawAmount) && !clean(rawBalance);
     if (blankRow) continue;
 
     if (isLegacyTemplateSampleRow(row, cols)) { ignoredTemplateRows++; continue; }
@@ -230,8 +236,20 @@ function normalizeStatementRows(rawRows, cols) {
     const mode = normalizeStatementMode(valueFor(row, cols.mode), remarks);
     const debitParsed = parseStatementAmount(rawDebit);
     const creditParsed = parseStatementAmount(rawCredit);
-    const debit = Math.max(0, Number(debitParsed ?? 0));
-    const credit = Math.max(0, Number(creditParsed ?? 0));
+    // The Debit/Credit column determines the direction. Some bank exports
+    // put negative numbers in one of these columns; taking Math.max(0, x)
+    // previously erased those receipt/payment rows entirely.
+    let debit = Math.abs(Number(debitParsed ?? 0));
+    let credit = Math.abs(Number(creditParsed ?? 0));
+    // Some bank exports have one Amount column and a separate Cr/Dr or
+    // Receipt/Payment column. Never guess direction from narration or sign.
+    if(debit===0 && credit===0 && clean(rawAmount)) {
+      const amount=Math.abs(Number(parseStatementAmount(rawAmount)??0));
+      const direction=upper(rawDirection).replace(/[^A-Z]/g,"");
+      if(["CR","CREDIT","RECEIPT","DEPOSIT","IN","C"].includes(direction)) credit=amount;
+      else if(["DR","DEBIT","PAYMENT","WITHDRAWAL","OUT","D"].includes(direction)) debit=amount;
+      else {errors.push({row:rowNo,error:"Amount row requires a Receipt/Payment (Cr/Dr) direction; no transaction was silently skipped"});continue;}
+    }
 
     if (!date) { errors.push({row:rowNo,error:"Invalid date"}); continue; }
     if ((debit > 0 && credit > 0) || (debit <= 0 && credit <= 0)) { errors.push({row:rowNo,error:"Enter either Debit or Credit, not both"}); continue; }
@@ -294,6 +312,10 @@ async function buildSmartPartyMatcher(tenantKey,{excludeBankAccountId=""}={}) {
   };
 
   for(const link of links){
+    // The system-managed CASH party is not a payer/payee. Showing it in
+    // narration matching allows accidental cash-account counterpostings.
+    // Cash deposits/withdrawals are selected explicitly as CASH:COMPANY.
+    if(upper(link.systemKey)==="CASH"||upper(link.accountingProfile?.systemAccountCode)==="SYS_CASH")continue;
     const global=gm.get(String(link.globalCustomerId));
     const preferred=clean(link.localName||global?.tradeName||global?.legalName||link.displayIdentifier||link.globalCustomerId);
     const bankDetails=Array.isArray(link.bankDetails)?link.bankDetails:[];
@@ -335,6 +357,7 @@ async function buildSmartPartyMatcher(tenantKey,{excludeBankAccountId=""}={}) {
       ||userLedgersForOwner[0]
       ||null;
     const partyAccountCode=clean(ledger?.systemAccountCode||activeMapping?.systemAccountCode||user.tallyAccountTypeCode)||"SYS_SUSPENSE";
+    if(upper(partyAccountCode)==="SYS_CASH")continue;
     const preferred=clean(user.name||activeMapping?.ledgerName||ledger?.name||ownerId);
     const aliases=[user.name,activeMapping?.ledgerName,ledger?.name,user.bankDetails?.accountName];
     const accountNumbers=[user.bankDetails?.accountNumber];
@@ -371,6 +394,15 @@ async function buildSmartPartyMatcher(tenantKey,{excludeBankAccountId=""}={}) {
       accountTypeLabel:`BANK ACCOUNT • ${clean(bank.bankName)}`
     });
   }
+
+  // Explicitly selectable internal transfer counterparty. Do NOT give it
+  // generic aliases such as "CASH"; narration AI must never guess that a
+  // bank deposit is a contra without an accountant selecting this ledger.
+  registerEntry({
+    ref:"CASH:COMPANY",ownerType:"INTERNAL_CASH",ownerId:tenantKey,
+    preferred:"Company Cash-in-Hand (Contra)",aliases:[],accountNumbers:[],
+    partyAccountCode:"SYS_CASH",ledgerId:"",accountTypeLabel:"INTERNAL CONTRA",
+  });
 
   const uniqueEntry=(arr=[])=>{
     const m=new Map(); for(const x of arr)m.set(String(x.ref),x);
@@ -561,8 +593,7 @@ function sortStatementRows(rows=[]) {
 }
 
 function signedOpeningValue(opening={}) {
-  const amount=Math.abs(Number(opening?.amount||0));
-  return opening?.type==="CR"?-amount:amount;
+  return bankStatementOpening(opening);
 }
 
 function manualTransactionFilter(tenantKey,financialYear,bankAccountId){
@@ -587,9 +618,9 @@ function movementSort(a,b){
 }
 
 async function loadPostedBankMovements({tenantKey,financialYear,bankAccountId}){
-  const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
+  const {BankStatementRow,Receipt,Payment,ContraVoucher,BankTransfer,BookCorrection}=financialModels(tenantKey,financialYear);
   const manualFilter=manualTransactionFilter(tenantKey,financialYear,bankAccountId);
-  const [statementRows,receipts,payments]=await Promise.all([
+  const [statementRows,receipts,payments,contras,bankTransfers,corrections]=await Promise.all([
     BankStatementRow.find({
       tenantKey,financialYear,bankAccountId,
       transactionId:{$nin:[null,""]},
@@ -597,22 +628,33 @@ async function loadPostedBankMovements({tenantKey,financialYear,bankAccountId}){
     }).select("_id importId rowNo date debit credit runningBalance transactionId transactionType createdAt").lean(),
     Receipt.find(manualFilter).select("_id receiptNo date amount runningBalance createdAt").lean(),
     Payment.find(manualFilter).select("_id paymentNo date amount runningBalance createdAt").lean(),
+    ContraVoucher.find({tenantKey,financialYear,bankAccountId,status:"POSTED"}).select("_id contraNo date direction amount runningBalance createdAt").lean(),
+    BankTransfer.find({tenantKey,financialYear,status:"POSTED",$or:[{fromBankAccountId:bankAccountId},{toBankAccountId:bankAccountId}]}).lean(),
+    BookCorrection.find({tenantKey,financialYear,book:'BANK',bankAccountId}).lean(),
   ]);
 
-  return [
+  const originals=[
     ...statementRows.map(x=>({
-      kind:"STATEMENT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:x.rowNo,
+      _listId:`BST:${x._id}`,kind:"STATEMENT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:x.rowNo,
       debit:Number(x.debit||0),credit:Number(x.credit||0),priority:0,
     })),
     ...receipts.map(x=>({
-      kind:"RECEIPT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
+      _listId:`RCT:${x._id}`,kind:"RECEIPT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
       debit:0,credit:Number(x.amount||0),priority:0,
     })),
+    ...contras.map(x=>({_listId:`CTR:${x._id}`,kind:"CONTRA",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
+      debit:x.direction==="WITHDRAWAL"?Number(x.amount||0):0,
+      credit:x.direction==="DEPOSIT"?Number(x.amount||0):0,priority:0})),
     ...payments.map(x=>({
-      kind:"PAYMENT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
+      _listId:`PAY:${x._id}`,kind:"PAYMENT",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
       debit:Number(x.amount||0),credit:0,priority:0,
     })),
-  ].sort(movementSort);
+    ...bankTransfers.map(x=>({
+      _listId:`BTR:${x._id}:${bankAccountId}`,kind:"BANK_TRANSFER",id:String(x._id),doc:x,date:x.date,createdAt:x.createdAt,rowNo:0,
+      ...bankTransferMovement(x,bankAccountId),priority:0,
+    })),
+  ];
+  return applyBankCorrections(originals,corrections).sort(movementSort);
 }
 
 async function calculateDraftRunningBalances({tenantKey,financialYear,bankAccountId,openingSigned,draftRows=[]}){
@@ -631,7 +673,7 @@ async function calculateDraftRunningBalances({tenantKey,financialYear,bankAccoun
   const calculated=new Map();
   for(const row of merged){
     if(row._draft && balanceBeforeFirstDraft===null)balanceBeforeFirstDraft=running;
-    running=round2(running-Number(row.debit||0)+Number(row.credit||0));
+    running=bankStatementNext(running,row.debit,row.credit);
     if(row._draft)calculated.set(Number(row.rowNo),running);
   }
   const rows=drafts.map(x=>({
@@ -653,12 +695,12 @@ async function recalculatePostedBankRunningBalances({tenantKey,financialYear,ban
   const movements=await loadPostedBankMovements({tenantKey,financialYear,bankAccountId:bank.bankAccountId});
   if(!movements.length)return {updated:0,closingBalance:round2(openingSigned)};
 
-  const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
-  const statementOps=[],receiptOps=[],paymentOps=[];
+  const {BankStatementRow,Receipt,Payment,ContraVoucher,BankTransfer}=financialModels(tenantKey,financialYear);
+  const statementOps=[],receiptOps=[],paymentOps=[],contraOps=[],transferOps=[];
   let running=round2(openingSigned);
 
   for(const movement of movements){
-    running=round2(running-Number(movement.debit||0)+Number(movement.credit||0));
+    running=bankStatementNext(running,movement.debit,movement.credit);
     if(movement.kind==="STATEMENT"){
       statementOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
       if(clean(movement.doc.transactionId)){
@@ -672,6 +714,11 @@ async function recalculatePostedBankRunningBalances({tenantKey,financialYear,ban
       receiptOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
     }else if(movement.kind==="PAYMENT"){
       paymentOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
+    }else if(movement.kind==="CONTRA"){
+      contraOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{runningBalance:running}}}});
+    }else if(movement.kind==="BANK_TRANSFER"){
+      const field=bankAccountId===movement.doc.fromBankAccountId?"fromRunningBalance":"toRunningBalance";
+      transferOps.push({updateOne:{filter:{_id:movement.doc._id},update:{$set:{[field]:running}}}});
     }
   }
 
@@ -679,6 +726,8 @@ async function recalculatePostedBankRunningBalances({tenantKey,financialYear,ban
     statementOps.length?BankStatementRow.bulkWrite(statementOps,{ordered:false}):null,
     receiptOps.length?Receipt.bulkWrite(receiptOps,{ordered:false}):null,
     paymentOps.length?Payment.bulkWrite(paymentOps,{ordered:false}):null,
+    contraOps.length?ContraVoucher.bulkWrite(contraOps,{ordered:false}):null,
+    transferOps.length?BankTransfer.bulkWrite(transferOps,{ordered:false}):null,
   ]);
 
   return {updated:movements.length,closingBalance:round2(running)};
@@ -736,11 +785,20 @@ async function refreshStatementImportAfterDelete({tenantKey,financialYear,import
 async function deleteBankTransactionIds({tenantKey,financialYear,ids=[]}){
   const unique=[...new Set((ids||[]).map(clean).filter(Boolean))];
   if(!unique.length)return {deleted:0,statement:0,receipts:0,payments:0};
-  const {BankStatementRow,Receipt,Payment,LedgerEntry}=financialModels(tenantKey,financialYear);
+  const {BankStatementRow,Receipt,Payment,LedgerEntry,ContraVoucher}=financialModels(tenantKey,financialYear);
   let deleted=0,statement=0,receipts=0,payments=0;const importIds=new Set(),bankAccountIds=new Set();
   for(const token of unique){
     const [kind,rawId]=token.includes(":")?token.split(/:(.+)/):["",token];
     const id=clean(rawId);if(!id)continue;
+    if(kind==="CTR"){
+      const row=await ContraVoucher.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
+      if(clean(row.bankAccountId))bankAccountIds.add(clean(row.bankAccountId));
+      // Contra's journal contains BOTH legs. Delete only when the entire
+      // document is explicitly selected, never from a cashbook balance edit.
+      const tx=clean(row.contraNo);
+      if(tx)await LedgerEntry.deleteMany({tenantKey,financialYear,transactionId:tx,transactionType:"CONTRA"});
+      await row.deleteOne();deleted++;continue;
+    }
     if(kind==="BST"){
       const row=await BankStatementRow.findOne({_id:id,tenantKey,financialYear});if(!row)continue;
       if(clean(row.bankAccountId))bankAccountIds.add(clean(row.bankAccountId));
@@ -862,6 +920,21 @@ router.put("/:id/opening-balance", async (req,res)=>{
 });
 
 
+// Rebuild historic stored row running balances after changing an FY opening
+// (or upgrading older DR/CR code). Does not alter journals or voucher amounts.
+router.post("/transactions/rebuild-running", async(req,res)=>{
+  try{
+    if(!isAdminAuth(req.auth))return fail(res,"Superadmin permission required",403);
+    const financialYear=clean(req.body.financialYear);
+    const bankAccountId=clean(req.body.bankAccountId);
+    if(!financialYear||!bankAccountId)return fail(res,"Financial year and bank account required",400);
+    const bank=await BankAccount.findOne({tenantKey:req.auth.tenantKey,bankAccountId,status:{$ne:"DELETED"}});
+    if(!bank)return fail(res,"Bank account not found",404);
+    const outcome=await recalculatePostedBankRunningBalances({tenantKey:req.auth.tenantKey,financialYear,bank});
+    return ok(res,{financialYear,bankAccountId,...outcome},"Running balances rebuilt from real credit/debit movements");
+  }catch(e){return fail(res,e.message||"Could not rebuild bank running balances",400);}
+});
+
 router.get("/transactions/latest-month",async(req,res)=>{
   try{
     const tenantKey=req.auth.tenantKey;
@@ -870,15 +943,17 @@ router.get("/transactions/latest-month",async(req,res)=>{
     if(!bankAccountId)return fail(res,"Select one bank account",400);
     const permitted=await BankAccount.exists({tenantKey,bankAccountId,status:"ACTIVE"});
     if(!permitted)return fail(res,"Bank account not found",404);
-    const {BankStatementRow,Receipt,Payment}=financialModels(tenantKey,financialYear);
+    const {BankStatementRow,Receipt,Payment,ContraVoucher,BankTransfer}=financialModels(tenantKey,financialYear);
     const base={tenantKey,financialYear,bankAccountId};
     const manual={...base,mode:{$ne:"CASH"},status:"POSTED",$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
-    const [stmt,receipt,payment]=await Promise.all([
+    const [stmt,receipt,payment,contra,transfer]=await Promise.all([
       BankStatementRow.findOne({...base,transactionId:{$nin:[null,""]},classification:{$in:["POSTED","SUSPENSE","UNMATCHED"]}}).sort({date:-1}).select("date").lean(),
       Receipt.findOne(manual).sort({date:-1}).select("date").lean(),
       Payment.findOne(manual).sort({date:-1}).select("date").lean(),
+      ContraVoucher.findOne({...base,status:"POSTED"}).sort({date:-1}).select("date").lean(),
+      BankTransfer.findOne({tenantKey,financialYear,status:"POSTED",$or:[{fromBankAccountId:bankAccountId},{toBankAccountId:bankAccountId}]}).sort({date:-1}).select("date").lean(),
     ]);
-    const dates=[stmt?.date,receipt?.date,payment?.date].filter(Boolean);
+    const dates=[stmt?.date,receipt?.date,payment?.date,contra?.date,transfer?.date].filter(Boolean);
     dates.sort((a,b)=>new Date(b)-new Date(a));
     return ok(res,{financialYear,bankAccountId,month:dates.length?new Date(dates[0]).getUTCMonth()+1:null});
   }catch(e){return fail(res,e.message||"Could not determine latest bank month",400);}
@@ -887,31 +962,103 @@ router.get("/transactions/latest-month",async(req,res)=>{
 router.get("/transactions", async (req,res)=>{
   const financialYear=clean(req.query.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");
   if(!financialYear)return fail(res,"Select Financial Year",400);
-  const {BankStatementRow,BankStatementImport,Receipt,Payment}=financialModels(req.auth.tenantKey,financialYear);
+  const {BankStatementRow,BankStatementImport,Receipt,Payment,ContraVoucher,BankTransfer,BookCorrection}=financialModels(req.auth.tenantKey,financialYear);
   const page=Math.max(1,Number(req.query.page||1)),limit=Math.max(10,Math.min(200,Number(req.query.limit||50)));
   const q=clean(req.query.q),bankAccountId=clean(req.query.bankAccountId),type=upper(req.query.type||"ALL");
   const rx=q?new RegExp(q,"i"):null,dateFilter=transactionDateFilter(req.query.fromDate,req.query.toDate);
+  // Include entries whose source date is outside the selected month but whose
+  // Superadmin-corrected date now belongs to it. Fetch by source ID so a
+  // changed date never makes a transaction disappear from both months.
+  const currentCorrections=dateFilter?await BookCorrection.find({tenantKey:req.auth.tenantKey,financialYear,book:'BANK',
+    ...(bankAccountId?{bankAccountId}:{}),date:dateFilter,deleted:{$ne:true}}).select('sourceKey').lean():[];
+  const correctedIds={BST:[],RCT:[],PAY:[],CTR:[],BTR:[]};
+  for(const entry of currentCorrections){
+    const [prefix,id]=String(entry.sourceKey||'').split(':');
+    if(correctedIds[prefix]&&/^[0-9a-f]{24}$/i.test(id))correctedIds[prefix].push(id);
+  }
+  const scopeFor=(name)=>dateFilter?{$or:[{date:dateFilter},...correctedIds[name].length?[{_id:{$in:correctedIds[name]}}]:[]]}:{};
   const statementFilter={tenantKey:req.auth.tenantKey,financialYear,transactionId:{$nin:[null,""]},classification:{$in:["POSTED","SUSPENSE","UNMATCHED"]}};
-  if(dateFilter)statementFilter.date=dateFilter;
+  if(dateFilter)statementFilter.$and=[scopeFor('BST')];
   if(bankAccountId)statementFilter.bankAccountId=bankAccountId;
-  if(["RECEIPT","PAYMENT"].includes(type))statementFilter.transactionType=type;
   if(rx)statementFilter.$or=[{matchedPartyName:rx},{partyName:rx},{remarks:rx},{mode:rx},{transactionId:rx}];
   const manualBase={tenantKey:req.auth.tenantKey,financialYear,bankAccountId:{$nin:[null,""]},mode:{$ne:"CASH"},status:"POSTED",$or:[{statementImportId:{$exists:false}},{statementImportId:""},{statementImportId:null}]};
-  if(dateFilter)manualBase.date=dateFilter;
   if(bankAccountId)manualBase.bankAccountId=bankAccountId;
-  const receiptFilter={...manualBase},paymentFilter={...manualBase};
-  if(rx){receiptFilter.$and=[{$or:manualBase.$or},{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{receiptNo:rx}]}];delete receiptFilter.$or;paymentFilter.$and=[{$or:manualBase.$or},{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{paymentNo:rx}]}];delete paymentFilter.$or;}
-  const [statementRows,manualReceipts,manualPayments]=await Promise.all([
+  const receiptFilter={...manualBase,...(dateFilter?{$and:[scopeFor('RCT')]}:{})};
+  const paymentFilter={...manualBase,...(dateFilter?{$and:[scopeFor('PAY')]}:{})};
+  if(rx){
+    receiptFilter.$and=[{$or:manualBase.$or},...(receiptFilter.$and||[]),{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{receiptNo:rx}]}];delete receiptFilter.$or;
+    paymentFilter.$and=[{$or:manualBase.$or},...(paymentFilter.$and||[]),{$or:[{partyNameSnapshot:rx},{remarks:rx},{mode:rx},{paymentNo:rx}]}];delete paymentFilter.$or;
+  }
+  const [statementRows,manualReceipts,manualPayments,manualContras,manualTransfers]=await Promise.all([
     BankStatementRow.find(statementFilter).sort({date:-1,rowNo:-1}).limit(5000).lean(),
-    type==="PAYMENT"?[]:Receipt.find(receiptFilter).sort({date:-1,createdAt:-1}).limit(5000).lean(),
-    type==="RECEIPT"?[]:Payment.find(paymentFilter).sort({date:-1,createdAt:-1}).limit(5000).lean(),
+    Receipt.find(receiptFilter).sort({date:-1,createdAt:-1}).limit(5000).lean(),
+    Payment.find(paymentFilter).sort({date:-1,createdAt:-1}).limit(5000).lean(),
+    ContraVoucher.find({tenantKey:req.auth.tenantKey,financialYear,
+      bankAccountId:bankAccountId||{$nin:[null,""]},status:"POSTED",
+      ...(dateFilter?{$and:[scopeFor('CTR')]}:{}),
+      ...(rx?{$or:[{remarks:rx},{reference:rx},{contraNo:rx}]}:{})
+    }).sort({date:-1,createdAt:-1}).limit(5000).lean(),
+    BankTransfer.find({tenantKey:req.auth.tenantKey,financialYear,status:"POSTED",
+      ...(bankAccountId?{$or:[{fromBankAccountId:bankAccountId},{toBankAccountId:bankAccountId}]}:{}),
+      ...((dateFilter||rx)?{$and:[
+        ...(dateFilter?[scopeFor('BTR')]:[]),
+        ...(rx?[{$or:[{remarks:rx},{reference:rx},{transferNo:rx}]}]:[]),
+      ]}:{}),
+    }).sort({date:-1,createdAt:-1}).limit(5000).lean(),
   ]);
   const merged=[
     ...statementRows.map(x=>({...x,_listId:`BST:${x._id}`})),
-    ...manualReceipts.map(x=>({_listId:`RCT:${x._id}`,date:x.date,transactionType:"RECEIPT",transactionId:x.receiptNo,matchedPartyGlobalId:x.customerGlobalId,matchedPartyName:x.partyNameSnapshot||x.customerGlobalId||"",remarks:x.remarks||x.reference||"",mode:x.mode,debit:0,credit:Number(x.amount||0),runningBalance:x.runningBalance,bankAccountId:x.bankAccountId,bankNameSnapshot:x.bankNameSnapshot,classification:x.status==="PENDING_CLASSIFICATION"?"SUSPENSE":"POSTED"})),
-    ...manualPayments.map(x=>({_listId:`PAY:${x._id}`,date:x.date,transactionType:"PAYMENT",transactionId:x.paymentNo,matchedPartyGlobalId:x.partyGlobalId,matchedPartyName:x.partyNameSnapshot||x.partyGlobalId||"",remarks:x.remarks||x.reference||"",mode:x.mode,debit:Number(x.amount||0),credit:0,runningBalance:x.runningBalance,bankAccountId:x.bankAccountId,bankNameSnapshot:x.bankNameSnapshot,classification:x.status==="PENDING_CLASSIFICATION"?"SUSPENSE":"POSTED"})),
-  ].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
-  const total=merged.length,items=merged.slice((page-1)*limit,page*limit);
+    ...manualReceipts.map(x=>({_listId:`RCT:${x._id}`,_directVoucherEditable:Boolean(x.sourceKey&&x.receiptWorkflowStatus==="DMS_DIRECT"&&!x.collectedBySalespersonId&&!x.cashCustodyMovementId),date:x.date,transactionType:"RECEIPT",transactionId:x.receiptNo,matchedPartyGlobalId:x.customerGlobalId,matchedPartyName:x.partyNameSnapshot||x.customerGlobalId||"",remarks:x.remarks||x.reference||"",mode:x.mode,debit:0,credit:Number(x.amount||0),runningBalance:x.runningBalance,bankAccountId:x.bankAccountId,bankNameSnapshot:x.bankNameSnapshot,classification:x.status==="PENDING_CLASSIFICATION"?"SUSPENSE":"POSTED"})),
+    ...manualPayments.map(x=>({_listId:`PAY:${x._id}`,_directVoucherEditable:Boolean(x.sourceKey),date:x.date,transactionType:"PAYMENT",transactionId:x.paymentNo,matchedPartyGlobalId:x.partyGlobalId,matchedPartyName:x.partyNameSnapshot||x.partyGlobalId||"",remarks:x.remarks||x.reference||"",mode:x.mode,debit:Number(x.amount||0),credit:0,runningBalance:x.runningBalance,bankAccountId:x.bankAccountId,bankNameSnapshot:x.bankNameSnapshot,classification:x.status==="PENDING_CLASSIFICATION"?"SUSPENSE":"POSTED"})),
+    ...manualContras.map(x=>({_listId:`CTR:${x._id}`,date:x.date,
+      transactionType:x.direction==="DEPOSIT"?"RECEIPT":"PAYMENT",transactionId:x.contraNo,
+      matchedPartyGlobalId:"CASH:COMPANY",matchedPartyName:"Cash-in-Hand (Contra)",
+      remarks:x.remarks||x.reference||"Cash / Bank Contra",mode:"BANK",
+      debit:x.direction==="WITHDRAWAL"?Number(x.amount||0):0,
+      credit:x.direction==="DEPOSIT"?Number(x.amount||0):0,
+      runningBalance:x.runningBalance,bankAccountId:x.bankAccountId,bankNameSnapshot:x.bankNameSnapshot,
+      classification:"POSTED",isContra:true})),
+    ...manualTransfers.flatMap(x=>{
+      const accounts=bankAccountId?[bankAccountId]:[x.fromBankAccountId,x.toBankAccountId];
+      return accounts.filter(id=>id===x.fromBankAccountId||id===x.toBankAccountId).flatMap(id=>{
+        const movement=bankTransferMovement(x,id);
+
+        return [{_listId:`BTR:${x._id}:${id}`,date:x.date,
+          transactionType:movement.credit?"RECEIPT":"PAYMENT",transactionId:x.transferNo,
+          matchedPartyGlobalId:movement.credit?`BANK:${x.fromBankAccountId}`:`BANK:${x.toBankAccountId}`,
+          matchedPartyName:movement.credit?(x.fromBankNameSnapshot||"Own bank"):(x.toBankNameSnapshot||"Own bank"),
+          remarks:x.remarks||x.reference||"Own bank transfer",mode:"BANK_TRANSFER",
+          debit:movement.debit,credit:movement.credit,
+          runningBalance:movement.debit?x.fromRunningBalance:x.toRunningBalance,
+          bankAccountId:id,classification:"POSTED",isInternalTransfer:true}];
+      });
+    }),
+  ];
+  const bookCorrections=await BookCorrection.find({tenantKey:req.auth.tenantKey,financialYear,book:'BANK',
+    ...(bankAccountId?{bankAccountId}:{})}).lean();
+  const corrected=applyBankCorrections(merged,bookCorrections)
+    .filter(row=>{
+      if(dateFilter){const d=new Date(row.date);if(dateFilter.$gte&&d<dateFilter.$gte)return false;if(dateFilter.$lte&&d>dateFilter.$lte)return false;}
+      if(type==='RECEIPT'&&Number(row.credit||0)<=0)return false;
+      if(type==='PAYMENT'&&Number(row.debit||0)<=0)return false;
+      return true;
+    })
+    .sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+  // These totals include both posted statement rows and direct vouchers, never
+  // merely the currently paginated rows. The UI labels the active filters.
+  // Summary is computed from the complete FY source set, not the visible page.
+  // Overview requests omit q/type so monthly balances stay accurate even when
+  // filters are applied to the expanded month's detail list.
+  let monthlySummaries;
+  if(String(req.query.groupByMonth||"")==="1"){
+    const bank=bankAccountId?await BankAccount.findOne({tenantKey:req.auth.tenantKey,bankAccountId}).lean():null;
+    const opening=bank?openingForYear(bank,financialYear):{exists:false};
+    const openingSigned=opening.exists?signedOpeningValue(opening):0;
+    monthlySummaries=buildBookMonthSummary({financialYear,openingBalance:openingSigned,rows:corrected});
+  }
+  const totalDebit=round2(corrected.reduce((n,row)=>n+Number(row.debit||0),0));
+  const totalCredit=round2(corrected.reduce((n,row)=>n+Number(row.credit||0),0));
+  const total=corrected.length,items=corrected.slice((page-1)*limit,page*limit);
   const bankIds=[...new Set(items.map(x=>x.bankAccountId).filter(Boolean))];
   const banks=bankIds.length?await BankAccount.find({tenantKey:req.auth.tenantKey,bankAccountId:{$in:bankIds}}).select("bankAccountId bankName accountNumber").lean():[];
   const bm=new Map(banks.map(x=>[String(x.bankAccountId),x]));
@@ -922,7 +1069,7 @@ router.get("/transactions", async (req,res)=>{
   const userIds=[...new Set(items.flatMap(x=>{const batch=im.get(String(x.importId||x.statementImportId||""));return [x.createdBy,x.submittedBy,batch?.submittedBy,batch?.importedBy].filter(Boolean)}))];
   const [partyMap,userMap]=await Promise.all([resolvePartyDisplayMap(req.auth.tenantKey,partyRefs),resolveUserDisplayMap(req.auth.tenantKey,userIds)]);
   const enriched=items.map(x=>{const batch=im.get(String(x.importId||x.statementImportId||""));const partyRef=String(x.matchedPartyGlobalId||"");const partyName=x.matchedPartyName||x.partyName||partyMap.get(partyRef)?.name||"";const userId=String(x.submittedBy||batch?.submittedBy||x.createdBy||batch?.importedBy||"");const userName=x.submittedByNameSnapshot||batch?.submittedByNameSnapshot||x.createdByNameSnapshot||batch?.importedByNameSnapshot||userMap.get(userId)||userId;return {...x,matchedPartyName:partyName,partyNameDisplay:partyName,userNameDisplay:userName,bankNameSnapshot:x.bankNameSnapshot||bm.get(String(x.bankAccountId))?.bankName||"",bankAccountNumberSnapshot:bm.get(String(x.bankAccountId))?.accountNumber||""}});
-  return ok(res,{items:enriched,meta:{page,limit,total,pages:Math.max(1,Math.ceil(total/limit))}});
+  return ok(res,{items:enriched,monthlySummaries,totals:{debit:totalDebit,credit:totalCredit,scope:"CURRENT_FILTERS",possiblyTruncated:total>=5000},meta:{page,limit,total,pages:Math.max(1,Math.ceil(total/limit))}});
 });
 
 // Ledger is source-verified on every read. This admin-only reconciliation
@@ -930,7 +1077,7 @@ router.get("/transactions", async (req,res)=>{
 // legitimate bank transactions, or disputed amount/party mismatches.
 async function bankLedgerAudit({tenantKey,financialYear}){
   const {LedgerEntry,Receipt,Payment,BankStatementRow}=financialModels(tenantKey,financialYear);
-  const rows=await LedgerEntry.find({tenantKey,financialYear,status:"POSTED",transactionType:{$in:["RECEIPT","PAYMENT","BANK_STATEMENT_RECEIPT","BANK_STATEMENT_PAYMENT"]}})
+  const rows=await LedgerEntry.find({tenantKey,financialYear,status:"POSTED",transactionType:{$in:["RECEIPT","PAYMENT","BANK_STATEMENT_RECEIPT","BANK_STATEMENT_PAYMENT","CONTRA"]}})
     .sort({createdAt:1,_id:1}).lean();
   const checked=await inspectBankLedgerRows({tenantKey,financialYear,rows});
   const [duplicateReceipts,duplicatePayments,postedStatements]=await Promise.all([
@@ -987,22 +1134,22 @@ router.post("/transactions/ledger-integrity/repair",async(req,res,next)=>{
 
 router.post("/transactions/bulk-delete",async(req,res,next)=>{
   try{
+    const permissions=new Set(req.auth?.permissions||[]);
+    if(req.auth?.role!=="MASTER"&&!permissions.has("*")&&!permissions.has("dms.finance_reports.bank_statement.delete"))
+      return fail(res,"Bank delete permission is required",403);
     const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");if(!financialYear)return fail(res,"Select Financial Year",400);
     const ids=Array.isArray(req.body.ids)?req.body.ids:[];if(!ids.length)return fail(res,"Select at least one bank transaction",400);
+    // Imported statements are removed via reconciliation. Direct DMS vouchers
+    // must use the per-row VOID endpoint, which preserves their audit trail.
+    if(ids.some(token=>!/^BST:[a-f0-9]{24}$/i.test(clean(token))))
+      return fail(res,"Bulk Delete supports imported bank statement rows only. For direct receipts/payments use each row's Delete icon (audited void). Contra transfers require source reconciliation.",409);
     const result=await deleteBankTransactionIds({tenantKey:req.auth.tenantKey,financialYear,ids});
     return ok(res,result,`${result.deleted} bank transaction(s) deleted`);
   }catch(error){return next(error);}
 });
 
-router.post("/transactions/delete-all",async(req,res,next)=>{
-  try{
-    const financialYear=clean(req.body.financialYear)||await ensureDefaultFinancialYear(req.auth.tenantKey,"");if(!financialYear)return fail(res,"Select Financial Year",400);
-    const ids=await transactionIdsForDeleteAll({tenantKey:req.auth.tenantKey,financialYear,fromDate:clean(req.body.fromDate),toDate:clean(req.body.toDate),bankAccountId:clean(req.body.bankAccountId),type:upper(req.body.type||"ALL"),q:clean(req.body.q)});
-    if(!ids.length)return ok(res,{deleted:0},"No bank transactions matched the current filters");
-    const result=await deleteBankTransactionIds({tenantKey:req.auth.tenantKey,financialYear,ids});
-    return ok(res,result,`${result.deleted} bank transaction(s) deleted`);
-  }catch(error){return next(error);}
-});
+// Delete All is intentionally disabled. Only explicit selected rows may be removed.
+router.post("/transactions/delete-all",(req,res)=>fail(res,"Delete All is disabled; select specific transactions instead",403));
 
 router.post("/:id/statement-preview", upload.single("file"), async (req,res,next)=>{
   try{
@@ -1024,8 +1171,10 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
       {key:"partyName",label:"Party Name",aliases:["party","particulars","name","beneficiary","description"]},
       {key:"remarks",label:"Remarks",aliases:["remark","narration","details"],required:true},
       {key:"mode",label:"Mode",aliases:["transaction mode","type"]},
-      {key:"debit",label:"Debit",aliases:["withdrawal","debit amount"],required:true},
-      {key:"credit",label:"Credit",aliases:["deposit","credit amount"],required:true},
+      {key:"debit",label:"Debit",aliases:["withdrawal","withdrawal amount","debit amount","dr amount","money out"]},
+      {key:"credit",label:"Credit",aliases:["deposit","deposit amount","credit amount","cr amount","money in"]},
+      {key:"amount",label:"Amount",aliases:["transaction amount","txn amount"]},
+      {key:"transactionType",label:"Receipt/Payment",aliases:["transaction type","transaction mode","dr/cr","dr cr","debit/credit","cr/dr","type"]},
       // Legacy bank exports may still contain Balance / Running Balance. We
       // accept it for compatibility but never validate or trust it.
       {key:"runningBalance",label:"Running Balance",aliases:["balance","closing balance"],required:false},
@@ -1033,6 +1182,8 @@ router.post("/:id/statement-preview", upload.single("file"), async (req,res,next
     const cols=resolveColumns(rawRows[0],fields);
     const missing=fields.filter(f=>f.required&&!cols[f.key]).map(f=>f.label);
     if(missing.length)return fail(res,`Missing column(s): ${missing.join(", ")}`,400);
+    if(!(cols.debit&&cols.credit) && !(cols.amount&&cols.transactionType))
+      return fail(res,"Upload either both Debit and Credit columns, or Amount plus Receipt/Payment (Cr/Dr) columns",400);
 
     const normalized=normalizeStatementRows(rawRows,cols);
     if(normalized.errors.length)return fail(res,"Bank statement has invalid rows",400,{errors:normalized.errors.slice(0,50)});
@@ -1393,7 +1544,7 @@ router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
     const matcher=await buildSmartPartyMatcher(req.auth.tenantKey,{excludeBankAccountId:bank.bankAccountId});
     const assignmentMap=new Map((Array.isArray(req.body.assignments)?req.body.assignments:[]).map(x=>[Number(x.rowNo),clean(x.partyGlobalId)]));
     const bankSystemCode=["OD","CC"].includes(upper(bank.accountType))?"SYS_BANK_OD":"SYS_BANK_ACCOUNT";
-    let postedRows=0,unmatchedRows=0,errorRows=0;const errors=[];
+    let postedRows=0,postedReceipts=0,postedPayments=0,unmatchedRows=0,errorRows=0;const errors=[];
     for(const r of rows){
       let createdTransactionId="",createdType="",claimed=false;
       try{
@@ -1401,6 +1552,36 @@ router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
         const selected=requested&&requested!=="SUSPENSE"?matcher.byId.get(String(requested)):null;
         const partyId=selected?.ref||"";const partyName=selected?.preferred||"Suspense Account";const partyCode=selected?.partyAccountCode||"SYS_SUSPENSE";const partyLedgerId=selected?.ledgerId||"";
         if(selected?.ownerType==="USER"&&partyCode==="SYS_SUSPENSE")throw new Error(`Set Accounting Account Type for ${partyName} in User Master before posting this bank row`);
+        if(partyCode==="SYS_CASH"&&selected?.ownerType!=="INTERNAL_CASH")throw new Error("Use Company Cash-in-Hand (Contra) for an internal Cash/Bank transfer. Do not select CASH as a normal receipt/payment party.");
+        // Potential duplication MUST be checked irrespective of the selected
+        // party. A previously posted DMS contra is still a bank movement even
+        // when the imported narration is incorrectly mapped to Suspense.
+        const utcDay=new Date(r.date.toISOString().slice(0,10)+"T00:00:00.000Z");
+        const utcNext=new Date(utcDay.getTime()+86400000);
+        const sameAmount=Number(r.credit>0?r.credit:r.debit);
+        const {ContraVoucher,BankTransfer,LedgerEntry:CompanyJournal}=financialModels(req.auth.tenantKey,financialYear);
+        // A manually posted bank-to-bank transfer has ALREADY moved both bank
+        // balances. Reject an equal statement row instead of posting it again
+        // as a customer receipt/payment. Reconcile it to that transfer.
+        const manualTransfer=await BankTransfer.exists({
+          tenantKey:req.auth.tenantKey,financialYear,status:"POSTED",
+          ...(r.credit>0?{toBankAccountId:bank.bankAccountId}:{fromBankAccountId:bank.bankAccountId}),
+          date:{$gte:utcDay,$lt:utcNext},amount:sameAmount,
+        });
+        if(manualTransfer)throw new Error("This bank statement row may duplicate an internal bank-to-bank transfer of the same date and amount. Reconcile it with the transfer instead of posting another customer voucher.");
+        const manualContra=await ContraVoucher.exists({
+          tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,status:"POSTED",
+          direction:r.credit>0?"DEPOSIT":"WITHDRAWAL",
+          date:{$gte:utcDay,$lt:utcNext},amount:sameAmount,
+        });
+        if(manualContra)throw new Error("Possible duplicate bank transaction: a Cash/Bank contra of the same amount and date already exists for this bank account. Reconcile the statement instead of posting twice.");
+        const appCashDeposit=r.credit>0?await CompanyJournal.exists({
+          tenantKey:req.auth.tenantKey,financialYear,status:"POSTED",
+          transactionType:"SALESPERSON_BANK_DEPOSIT",accountCode:bankSystemCode,
+          bankAccountId:bank.bankAccountId,date:{$gte:utcDay,$lt:utcNext},debit:sameAmount,
+        }):null;
+        if(appCashDeposit)throw new Error("Possible duplicate: Sales Person App already recorded a cash-to-bank deposit with this date and amount. Reconcile before posting bank statement row.");
+
         const duplicate=await existingPostedBankRow({
           BankStatementRow,tenantKey:req.auth.tenantKey,financialYear,bankAccountId:bank.bankAccountId,row:r,excludeId:r._id,
         });
@@ -1419,15 +1600,28 @@ router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
         createdTransactionId=transactionId;
         createdType=isReceipt?"RECEIPT":"PAYMENT";
         const bankEntry={accountCode:bankSystemCode,ledgerId:bank.ledgerId||"",bankAccountId:bank.bankAccountId};
-        if(isReceipt){
+        if(selected?.ownerType==="INTERNAL_CASH") {
+          // Bank import itself is the source document; do NOT create a
+          // Receipt/Payment, because a contra is not customer collection.
+          await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear,
+            transactionId,transactionType:"CONTRA",date:r.date,partyGlobalId:"CASH:COMPANY",
+            narration:r.remarks||"Bank-statement Cash/Bank contra",
+            entries:isReceipt
+              ?[{...bankEntry,debit:amount},{accountCode:"SYS_CASH",credit:amount}]
+              :[{accountCode:"SYS_CASH",debit:amount},{...bankEntry,credit:amount}],
+          });
+        }else if(isReceipt){
           await Receipt.create({tenantKey:req.auth.tenantKey,financialYear,receiptNo:transactionId,sourceKey:transactionId,date:r.date,customerGlobalId:partyId,partyNameSnapshot:partyName,amount,mode:r.mode||"BANK",reference:"",remarks:r.remarks,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,statementImportId:batch.importId,statementRowNo:r.rowNo,runningBalance:r.runningBalance,bounceStatus:"CLEAR",status:selected?"POSTED":"PENDING_CLASSIFICATION",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear,transactionId,transactionType:"BANK_STATEMENT_RECEIPT",date:r.date,partyGlobalId:partyId,narration:r.remarks||`Bank receipt - ${partyName}`,entries:[{...bankEntry,debit:amount},{accountCode:partyCode,ledgerId:partyLedgerId,credit:amount}]});
         }else{
           await Payment.create({tenantKey:req.auth.tenantKey,financialYear,paymentNo:transactionId,sourceKey:transactionId,date:r.date,partyGlobalId:partyId,partyNameSnapshot:partyName,amount,mode:r.mode||"BANK",reference:"",remarks:r.remarks,bankAccountId:bank.bankAccountId,bankNameSnapshot:bank.bankName,statementImportId:batch.importId,statementRowNo:r.rowNo,runningBalance:r.runningBalance,status:selected?"POSTED":"PENDING_CLASSIFICATION",createdBy:req.auth.sub,createdByNameSnapshot:req.auth.name||""});
           await postBalancedEntries({tenantKey:req.auth.tenantKey,financialYear,transactionId,transactionType:"BANK_STATEMENT_PAYMENT",date:r.date,partyGlobalId:partyId,narration:r.remarks||`Bank payment - ${partyName}`,entries:[{accountCode:partyCode,ledgerId:partyLedgerId,debit:amount},{...bankEntry,credit:amount}]});
         }
+
         r.matchedPartyGlobalId=partyId;r.matchedPartyName=partyName;r.partyAccountCode=partyCode;r.transactionId=transactionId;r.classification=selected?"POSTED":"SUSPENSE";r.submittedAt=new Date();r.submittedBy=req.auth.sub;r.submittedByNameSnapshot=req.auth.name||"";await r.save();
-        postedRows++;if(!selected)unmatchedRows++;
+        postedRows++;
+        if(r.credit>0)postedReceipts++;else postedPayments++;
+        if(!selected)unmatchedRows++;
       }catch(error){
         // If any step failed, remove this attempt's incomplete voucher + journal
         // before clearing its uniqueness claim, so retry never multiplies entries.
@@ -1471,7 +1665,7 @@ router.post("/:id/statement-submit/:importId", async (req,res,next)=>{
     await batch.save();
 
     return ok(res,{
-      importId:batch.importId,postedRows,unmatchedRows,errorRows,
+      importId:batch.importId,postedRows,postedReceipts,postedPayments,unmatchedRows,errorRows,
       totalRows:batch.totalRows,duplicateRows:batch.duplicateRows,
       closingBalance:batch.closingBalance,
       bankClosingBalance:rebuilt.closingBalance,

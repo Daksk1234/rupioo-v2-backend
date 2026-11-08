@@ -199,7 +199,8 @@ async function partySourceRowsWithLegacyFallback({ tenantKey, entity, financialY
   const [sales, purchases, receipts, payments, notes] = await Promise.all([
     debtor ? SalesInvoice.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED" }).select("_id invoiceNo date grandTotal remarks createdAt").lean() : Promise.resolve([]),
     creditor ? PurchaseInvoice.find({ tenantKey, financialYear: fy, supplierGlobalId: entity.entityId, status: "POSTED" }).select("_id invoiceNo date grandTotal remarks createdAt").lean() : Promise.resolve([]),
-    debtor ? Receipt.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED" }).select("_id receiptNo date amount remarks createdAt statementImportId").lean() : Promise.resolve([]),
+    debtor ? Receipt.find({ tenantKey, financialYear: fy, customerGlobalId: entity.entityId, status: "POSTED",
+      $or: [{ collectionSource: { $ne: "SALESPERSON_APP" } }, { ledgerPostedAt: { $exists: true } }] }).select("_id receiptNo date amount remarks createdAt statementImportId").lean() : Promise.resolve([]),
     creditor ? Payment.find({ tenantKey, financialYear: fy, partyGlobalId: entity.entityId, status: "POSTED" }).select("_id paymentNo date amount remarks createdAt statementImportId").lean() : Promise.resolve([]),
     CreditNote.find({ tenantKey, financialYear: fy, status: "ISSUED", $or:[{partyGlobalId:entity.entityId},{customerGlobalId:entity.entityId}] }).select("_id creditNoteNo documentNo documentType date grandTotal reason remarks createdAt partyGlobalId customerGlobalId").lean(),
   ]);

@@ -1,4 +1,5 @@
-import { CustomerGrade, Product } from "../models/index.js";
+import { calculateDynamicPrice } from "./dynamicPriceEngine.js";
+import { CustomerGrade, PriceDiscountRule, Product } from "../models/index.js";
 import { financialModels } from "./accountingService.js";
 
 export const round2 = (value) => Number((Number(value) || 0).toFixed(2));
@@ -161,10 +162,20 @@ export async function getMaxActiveGradeDiscount(tenantKey) {
 
 export async function recalculateAllProductsForGrades(tenantKey) {
   const maxDiscount = await getMaxActiveGradeDiscount(tenantKey);
-  const products = await Product.find({ tenantKey, status: "ACTIVE" }).lean();
+  const [products,grades,rules] = await Promise.all([
+    Product.find({ tenantKey, status: "ACTIVE" }).lean(),
+    CustomerGrade.find({tenantKey,status:"ACTIVE"}).lean(),
+    PriceDiscountRule.find({tenantKey,status:"ACTIVE"}).lean(),
+  ]);
   if (!products.length) return { updated: 0, maxDiscount };
 
   const ops = products.map((product) => {
+    const config=product.priceListSettings;
+    if(config?.enabled){
+      const grade=grades.find(g=>String(g.code)===String(config.targetGradeCode))||grades.reduce((best,g)=>!best||g.discountPct>best.discountPct?g:best,null);
+      const calculated=calculateDynamicPrice({mode:config.mode,salePrice:config.salePrice,mrp:config.mrp,gstRate:product.gstRate,gradePct:grade?.discountPct||0,rules,overrides:config.discountOverrides||{}});
+      return {updateOne:{filter:{_id:product._id,tenantKey},update:{$set:{mrp:calculated.mrp,salePrice:calculated.salePrice,"priceListSettings.mrp":calculated.mrp,"priceListSettings.salePrice":calculated.salePrice,maxGradeDiscountPct:maxDiscount}}}};
+    }
     const cost = costBaseOf(product);
     const minimumProfit = Math.max(3, Number(product.minimumProfitPct || 3));
     const stored = Number(product.profitPercentage || 0);

@@ -21,6 +21,7 @@ const actionForRequest = (req) => {
   // of incorrectly requiring Create permission.
   if (/^\/transactions\/sales-invoices\/[^/]+\/process(?:\/|$)/i.test(path)) return "edit";
   if (/^\/transactions\/sales-invoices\/[^/]+\/email(?:\/|$)/i.test(path)) return "download";
+  if (path.startsWith("/cheques/") && method === "POST") return "create";
   if (method === "GET" || method === "HEAD") return "view";
   if (path.includes("bulk-upload")) return "create";
   if (path.includes("bulk-edit")) return "edit";
@@ -43,6 +44,7 @@ function mappedPageForApi(req) {
   if (path.startsWith("/employees")) return "/hr/employees";
   if (path.startsWith("/recruitment")) return "/hr/recruitment";
   if (path.startsWith("/company")) return "/dms/company-settings";
+  if (path.startsWith("/cheques")) return "/dms/cheque-control";
   if (path.startsWith("/banks/transactions") || path.includes("/statement-preview") || path.includes("/statement-submit") || path.includes("/statement-imports")) return "/dms/banking";
   if (path.startsWith("/banks")) return "/dms/bank-accounts";
 

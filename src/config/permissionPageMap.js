@@ -73,10 +73,13 @@ export const PAGE_PERMISSION_MAP = {
   // Keep this mapping in sync with frontend/src/config/permissionPageMap.js.
   "/dms/customer-complaints": p("dms.users.create_customer"),
   "/dms/damage-claims": p("dms.users.create_customer"),
+  // Full-page posted voucher corrections: independent MASTER/Plan/Role permission.
+  "/dms/transactions/voucher-edit": p("dms.transaction.voucher_edit"),
   "/dms/receipts": p("dms.transaction.receipt"),
   "/dms/cashier": p("dms.transaction.receipt", "dms.transaction.cashbook", "dms.transaction.cashaccount"),
   "/dms/payments": p("dms.transaction.payment"),
   "/dms/cashbook": p("dms.transaction.cashbook", "dms.transaction.cashaccount", "dms.transaction.receipt", "dms.transaction.payment"),
+  "/dms/cheque-control": p("dms.transaction.cheque_control"),
   "/dms/banking": p("dms.finance_reports.bank_statement", "dms.transaction.cashbook", "dms.transaction.cashaccount"),
   "/dms/bank-accounts": p("dms.finance_reports.bank_statement"),
   "/dms/expenses": p("dms.users.expense_accounts"),

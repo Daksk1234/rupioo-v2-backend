@@ -1,6 +1,6 @@
 import express from "express";
 import multer from "multer";
-import { CompanyUnit, ProductCategory, CustomerGrade, CustomerLink, PriceList, PriceListItem, Product, Unit } from "../models/index.js";
+import { CompanyUnit, ProductCategory, CustomerGrade, CustomerLink, PriceList, PriceListItem, PriceDiscountRule, Product, Unit } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { readRows, resolveColumns, valueFor, cleanText } from "../utils/bulkSpreadsheet.js";
@@ -21,6 +21,7 @@ import {
   round2,
 } from "../services/oldDmsPricingService.js";
 
+import { calculateDynamicPrice } from "../services/dynamicPriceEngine.js";
 const router = express.Router();
 router.use(requireAuth);
 router.use((req,res,next)=>{if(req.auth?.role==="MASTER"||(req.auth?.apps||[]).includes("dms"))return next();return fail(res,"DMS access required",403);});
@@ -109,6 +110,33 @@ router.post("/categories/bulk-edit",async(req,res)=>{const ids=(req.body.selecti
 router.post("/categories/bulk-delete",async(req,res)=>{const ids=(req.body.selection?.ids||[]).filter(Boolean);if(!ids.length)return fail(res,"Select categories",400);const r=await ProductCategory.updateMany({_id:{$in:ids},tenantKey:req.auth.tenantKey},{$set:{status:"INACTIVE"}});ok(res,{deleted:r.modifiedCount,soft:true},`${r.modifiedCount} categories deactivated`)});
 
 
+/* Tenant-owned discounts are listed on both Grade Discounts and Price List. */
+router.get("/price-discount-rules", async (req,res) => {
+  const items = await PriceDiscountRule.find({tenantKey:req.auth.tenantKey}).sort({mode:1,defaultPct:1,code:1}).lean();
+  return ok(res,{items});
+});
+router.post("/price-discount-rules", async (req,res) => {
+  if (!isAdminAuth(req.auth)) return fail(res,"Superadmin access required",403);
+  const code=upper(req.body?.code).replace(/[^A-Z0-9_-]/g,"").slice(0,32);
+  const name=cleanText(req.body?.name).slice(0,90);
+  const mode=upper(req.body?.mode||"VARIABLE");
+  const defaultPct=Number(req.body?.defaultPct ?? 0);
+  if (!code || !name || !["FIXED","VARIABLE"].includes(mode) || !Number.isFinite(defaultPct) || defaultPct<0 || defaultPct>=100) return fail(res,"Valid code, name, FIXED/VARIABLE and discount 0–99.99% are required",400);
+  try { const result=await PriceDiscountRule.create({tenantKey:req.auth.tenantKey,code,name,mode,defaultPct}); return ok(res,result,"Discount created",201); }
+  catch(e){return fail(res,e?.code===11000?"Discount code already exists":e.message,400);}
+});
+router.put("/price-discount-rules/:id",async(req,res)=>{
+  if (!isAdminAuth(req.auth)) return fail(res,"Superadmin access required",403);
+  const changes={};
+  if(req.body.name!==undefined)changes.name=cleanText(req.body.name).slice(0,90);
+  if(req.body.defaultPct!==undefined){const pct=Number(req.body.defaultPct);if(!Number.isFinite(pct)||pct<0||pct>=100)return fail(res,"Discount must be below 100%",400);changes.defaultPct=pct;}
+  if(req.body.mode!==undefined){const mode=upper(req.body.mode);if(!["FIXED","VARIABLE"].includes(mode))return fail(res,"Invalid discount mode",400);changes.mode=mode;}
+  if(req.body.status!==undefined){if(!["ACTIVE","INACTIVE"].includes(upper(req.body.status)))return fail(res,"Invalid status",400);changes.status=upper(req.body.status);}
+  const result=await PriceDiscountRule.findOneAndUpdate({_id:req.params.id,tenantKey:req.auth.tenantKey},{$set:changes},{new:true,runValidators:true});
+  if(!result)return fail(res,"Discount not found",404);
+  return ok(res,result,"Discount updated");
+});
+
 /* -------------------------------------------------------------------------- */
 /* OLD-DMS PRICE LIST LOGIC                                                    */
 /* Product master itself is the price list. Highest active customer grade      */
@@ -128,7 +156,7 @@ router.get("/old-dms-price-list/products", async (req, res) => {
     { hsnCode: new RegExp(q, "i") },
   ];
 
-  const [maxDiscount, products, total, activeGrades] = await Promise.all([
+  const [maxDiscount, products, total, activeGrades, discountRules] = await Promise.all([
     getMaxActiveGradeDiscount(req.auth.tenantKey),
     Product.find(filter).sort({ name: 1 }).skip((page - 1) * limit).limit(limit).lean(),
     Product.countDocuments(filter),
@@ -136,6 +164,7 @@ router.get("/old-dms-price-list/products", async (req, res) => {
       .sort({ discountPct: 1, code: 1 })
       .select("code name discountPct")
       .lean(),
+    PriceDiscountRule.find({tenantKey:req.auth.tenantKey,status:"ACTIVE"}).sort({mode:1,defaultPct:1,code:1}).lean(),
   ]);
 
   const packingCodes = Array.from(new Set(products.map((product) => upper(product.packingUnit)).filter(Boolean)));
@@ -218,8 +247,28 @@ router.get("/old-dms-price-list/products", async (req, res) => {
       },
     );
 
+    const settings = product.priceListSettings?.enabled ? product.priceListSettings : null;
+    let manualPrice = null;
+    if (settings) {
+      const selectedGrade=activeGrades.find(g=>upper(g.code)===upper(settings.targetGradeCode)) || activeGrades.reduce((best,g)=>!best || g.discountPct>best.discountPct?g:best,null);
+      try {
+        manualPrice=calculateDynamicPrice({
+          mode:settings.mode, salePrice:settings.salePrice ?? product.salePrice,
+          mrp:settings.mrp ?? product.mrp,
+          gstRate:product.gstRate,
+          gradePct:selectedGrade?.discountPct||0,
+          rules:discountRules,overrides:settings.discountOverrides||{},
+        });
+      } catch(e) { console.error("Price List manual price invalid",String(product._id),e.message); }
+    }
     return {
       ...product,
+      priceListSettings:settings,
+      ...(manualPrice ? {
+        mrp:manualPrice.mrp, mrpBasicExGst:manualPrice.mrpExGst,
+        calculatedSalePrice:manualPrice.salePrice, saleIncludingGst:manualPrice.saleIncludingGst,
+        discountSteps:manualPrice.discountSteps,
+      } : {}),
       packingUnitName: product.packingUnit ? packingUnitNames.get(upper(product.packingUnit)) || product.packingUnit : "",
 
       // Existing fields retained for backward compatibility.
@@ -232,7 +281,7 @@ router.get("/old-dms-price-list/products", async (req, res) => {
       // New names used by the Price List page.
       landedPrice: round2(landedPrice),
       marketSalePrice: round2(marketSalePrice),
-      minimumSalePrice: round2(minimumSalePrice),
+      minimumSalePrice: settings?.minimumSalePrice ?? round2(minimumSalePrice),
 
       purchaseObservations: Number(purchaseHistory?.observations || 0),
       saleObservations: Number(saleHistory?.observations || 0),
@@ -246,14 +295,18 @@ router.get("/old-dms-price-list/products", async (req, res) => {
       maxGradeDiscountPct: priced.maxGradeDiscountPct,
       gradeLoading: priced.gradeLoading,
       gstRate: priced.gstRate,
-      mrp: priced.mrp,
-      mrpBasicExGst: mrpBasicExcludingGst(priced.mrp, priced.gstRate),
+      mrp: manualPrice?.mrp ?? priced.mrp,
+      mrpBasicExGst: manualPrice?.mrpExGst ?? mrpBasicExcludingGst(priced.mrp, priced.gstRate),
       gradePrices: activeGrades.map((grade) => ({
         code: grade.code,
         name: grade.name,
         discountPct: Number(grade.discountPct || 0),
-        basicRate: gradeBasicFromMrp(priced.mrp, priced.gstRate, grade.discountPct),
-        saleIncludingGst: gradeSaleIncludingGstFromMrp(priced.mrp, grade.discountPct),
+        basicRate: manualPrice
+          ? calculateDynamicPrice({mode:"MRP_TO_SALE",mrp:manualPrice.mrp,gstRate:product.gstRate,gradePct:grade.discountPct,rules:discountRules,overrides:settings.discountOverrides||{}}).salePrice
+          : gradeBasicFromMrp(priced.mrp, priced.gstRate, grade.discountPct),
+        saleIncludingGst: manualPrice
+          ? calculateDynamicPrice({mode:"MRP_TO_SALE",mrp:manualPrice.mrp,gstRate:product.gstRate,gradePct:grade.discountPct,rules:discountRules,overrides:settings.discountOverrides||{}}).saleIncludingGst
+          : gradeSaleIncludingGstFromMrp(priced.mrp, grade.discountPct),
       })),
       lossStatus: minimumSalePrice > 0 && landedPrice > 0 && minimumSalePrice < landedPrice,
       belowMinimum: profitPercentage < 3,
@@ -269,6 +322,7 @@ router.get("/old-dms-price-list/products", async (req, res) => {
   return ok(res, {
     items: safeItems,
     maxDiscount,
+    discountRules: discountRules.map(({code,name,mode,defaultPct,status})=>({code,name,mode,defaultPct,status})),
     grades: activeGrades.map((grade) => ({
       code: grade.code,
       name: grade.name,
@@ -281,6 +335,48 @@ router.get("/old-dms-price-list/products", async (req, res) => {
       averageMethod: "Market Sale Price is the simple arithmetic mean of posted Sales Invoice line effective rates for the selected FY. Average Purchase remains the simple arithmetic mean of posted Purchase Invoice line effective rates.",
     } : {}),
   });
+});
+
+router.put("/old-dms-price-list/products/:id/manual",async(req,res)=>{
+  if(!isAdminAuth(req.auth))return fail(res,"Superadmin access required to edit the Price List",403);
+  const product=await Product.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,status:"ACTIVE"});
+  if(!product)return fail(res,"Product not found",404);
+  const body=req.body||{};
+  const mode=upper(body.mode||"SALE_TO_MRP");
+  if(!["SALE_TO_MRP","MRP_TO_SALE"].includes(mode))return fail(res,"Choose a valid pricing direction",400);
+  const gstRate=Number(body.gstRate??product.gstRate??0);
+  const salePrice=Number(body.salePrice ?? product.salePrice ?? 0);
+  const mrp=Number(body.mrp ?? product.mrp ?? 0);
+  const landedCost=Number(body.landedCost??product.landedCost??0);
+  const manualMin=Number(body.minimumSalePrice??0);
+  if(![gstRate,salePrice,mrp,landedCost,manualMin].every(n=>Number.isFinite(n)&&n>=0))return fail(res,"Prices and GST must be valid non-negative numbers",400);
+  if(!Number.isFinite(gstRate)||gstRate>100)return fail(res,"GST must be 0–100%",400);
+  const [grades,rules]=await Promise.all([
+    CustomerGrade.find({tenantKey:req.auth.tenantKey,status:"ACTIVE"}).lean(),
+    PriceDiscountRule.find({tenantKey:req.auth.tenantKey,status:"ACTIVE"}).lean(),
+  ]);
+  const selected=grades.find(g=>upper(g.code)===upper(body.targetGradeCode))||grades.reduce((max,g)=>!max||g.discountPct>max.discountPct?g:max,null);
+  const discountOverrides={};
+  for(const rule of rules){const value=body.discountOverrides?.[rule.code];if(value===undefined)continue;
+    const number=Number(value.percent??rule.defaultPct);
+    if(!Number.isFinite(number)||number<0||number>=100)return fail(res,`Invalid discount for ${rule.code}`,400);
+    discountOverrides[rule.code]={percent:number,enabled:rule.mode==="FIXED"?true:value.enabled!==false};
+  }
+  let result;
+  try{result=calculateDynamicPrice({mode,salePrice,mrp,gstRate,gradePct:selected?.discountPct||0,rules,overrides:discountOverrides});}
+  catch(e){return fail(res,e.message,400);}
+  if(result.salePrice===0&&result.mrp===0)return fail(res,"Enter a sale price or MRP greater than zero",400);
+  product.gstRate=gstRate;
+  product.landedCost=landedCost;
+  product.mrp=result.mrp;
+  product.salePrice=result.salePrice;
+  if(body.name!==undefined){const name=cleanText(body.name);if(!name)return fail(res,"Product name required",400);product.name=name;}
+  if(body.sku!==undefined){const sku=cleanText(body.sku);if(!sku)return fail(res,"SKU required",400);product.sku=sku;}
+  product.priceListSettings={enabled:true,mode, salePrice:result.salePrice,mrp:result.mrp,
+    targetGradeCode:selected?.code||"",discountOverrides,
+    ...(manualMin>0?{minimumSalePrice:manualMin}:{}),updatedBy:String(req.auth.sub||""),updatedAt:new Date()};
+  try{await product.save();}catch(e){return fail(res,e?.code===11000?"SKU already exists":e.message,400);}
+  return ok(res,{id:product._id,price:result},"Price List updated");
 });
 
 router.put("/old-dms-price-list/products", async (req, res) => {

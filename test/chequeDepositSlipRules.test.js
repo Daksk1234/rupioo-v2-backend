@@ -1,0 +1,12 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {isEligibleReceivedCheque,slipGroups,isSbiDepositAccount,isISODate,moneyWords} from '../src/services/chequeDepositSlipRules.js';
+const item={status:'PENDING_RECEIVED',chequeDate:'2026-11-03',receivedDate:'2026-11-02',chequeNo:'001122',amount:1500,depositBankAccountId:''};
+test('due cheque with company custody is eligible',()=>assert.equal(isEligibleReceivedCheque(item,'2026-11-03','BANK-1'),true));
+test('future cheque blocked',()=>assert.equal(isEligibleReceivedCheque({...item,chequeDate:'2026-11-04'},'2026-11-03','BANK-1'),false));
+test('salesperson custody blocked',()=>assert.equal(isEligibleReceivedCheque({...item,status:'PENDING_WITH_SALESPERSON'},'2026-11-03','BANK-1'),false));
+test('deposit history blocked',()=>assert.equal(isEligibleReceivedCheque({...item,depositDate:'2026-11-02'},'2026-11-03','BANK-1'),false));
+test('different bank blocked',()=>assert.equal(isEligibleReceivedCheque({...item,depositBankAccountId:'BANK-2'},'2026-11-03','BANK-1'),false));
+test('invalid date rejected',()=>assert.equal(isISODate('2026-02-30'),false));
+test('SBI bank guard',()=>{assert.ok(isSbiDepositAccount({bankName:'State Bank of India'}));assert.ok(!isSbiDepositAccount({bankName:'HDFC Bank'}));});
+test('page splitting 1 4 5 and 9',()=>{assert.deepEqual([1,4,5,9].map(n=>slipGroups(Array(n).fill(0)).map(g=>g.length)),[[1],[4],[4,1],[4,4,1]]);});
+test('Indian rupees wording',()=>assert.equal(moneyWords(125025.50),'Rupees One Lakh Twenty Five Thousand Twenty Five and Fifty Paise Only'));

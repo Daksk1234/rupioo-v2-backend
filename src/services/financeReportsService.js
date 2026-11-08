@@ -1,4 +1,5 @@
 import { financialModels } from "./accountingService.js";
+import { companyCashOpening } from "./companyCashOpeningService.js";
 import { BankAccount, CompanyLedger, CompanyProfile, CustomerLink } from "../models/index.js";
 import { buildLockPartyReport } from "./salesCustomerStatusReportService.js";
 import { buildStockAnalysisReport } from "./stockAnalysisReportService.js";
@@ -215,19 +216,12 @@ export async function buildReceiptBounce({ tenantKey, financialYear }) {
 }
 
 async function liquidOpening(tenantKey, financialYear) {
-  const [banks, cashLedgers] = await Promise.all([
-    BankAccount.find({ tenantKey, status: { $ne: "DELETED" } }).select("accountType openingBalance openingBalanceType financialYear openingBalances").lean(),
-    CompanyLedger.find({ tenantKey, systemAccountCode: "SYS_CASH", status: { $ne: "INACTIVE" } }).select("openingBalances").lean(),
-  ]);
-  let opening = 0;
-  for (const bank of banks) {
-    const row = (bank.openingBalances || []).find((x) => clean(x.financialYear) && normalizeFy(x.financialYear) === financialYear);
-    const val = row ? signed(row.amount, row.type) : (clean(bank.financialYear) && normalizeFy(bank.financialYear) === financialYear ? signed(bank.openingBalance, bank.openingBalanceType) : 0);
-    opening += val;
-  }
-  for (const ledger of cashLedgers) {
-    const row = (ledger.openingBalances || []).find((x) => normalizeFy(x.financialYear) === financialYear);
-    if (row) opening += signed(row.amount, row.type);
+  const banks=await BankAccount.find({tenantKey,status:{$ne:"DELETED"}})
+    .select("accountType openingBalance openingBalanceType financialYear openingBalances").lean();
+  let opening=await companyCashOpening({tenantKey,financialYear});
+  for(const bank of banks){
+    const row=(bank.openingBalances||[]).find(x=>clean(x.financialYear)&&normalizeFy(x.financialYear)===financialYear);
+    opening+=row?signed(row.amount,row.type):(clean(bank.financialYear)&&normalizeFy(bank.financialYear)===financialYear?signed(bank.openingBalance,bank.openingBalanceType):0);
   }
   return money(opening);
 }
@@ -290,7 +284,8 @@ async function workingCapitalCore(tenantKey, financialYear) {
     buildStockAnalysisReport({ tenantKey, financialYear: meta.financialYear, reportType: "CLOSING" }),
     models.SalesInvoice.aggregate([{ $match: { tenantKey, financialYear: meta.financialYear, status: { $in: ["POSTED", "COMPLETED"] } } }, { $group: { _id: null, total: { $sum: "$grandTotal" } } }]),
     models.PurchaseInvoice.aggregate([{ $match: { tenantKey, financialYear: meta.financialYear, status: { $in: ["POSTED", "COMPLETED"] } } }, { $group: { _id: null, total: { $sum: "$grandTotal" } } }]),
-    models.Receipt.aggregate([{ $match: { tenantKey, financialYear: meta.financialYear, status: "POSTED", bounceStatus: { $not: /BOUNCE|RETURN|DISHON/i } } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
+    models.Receipt.aggregate([{ $match: { tenantKey, financialYear: meta.financialYear, status: "POSTED", bounceStatus: { $not: /BOUNCE|RETURN|DISHON/i },
+      $or: [{ collectionSource: { $ne: "SALESPERSON_APP" } }, { ledgerPostedAt: { $exists: true } }] } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
   ]);
   const move = new Map(movements.map((x) => [upper(x._id), { debit: Number(x.debit || 0), credit: Number(x.credit || 0) }]));
   const companyOpening = new Map();
@@ -321,6 +316,9 @@ async function workingCapitalCore(tenantKey, financialYear) {
   };
   const debtors = asset("SYS_SUNDRY_DEBTORS");
   const creditors = liability("SYS_SUNDRY_CREDITORS");
+  // Cashbook and Balance Sheet MUST have the same opening (including the
+  // first-FY profile balance and properly rolled-forward prior-year activity).
+  companyOpening.set("SYS_CASH", await companyCashOpening({tenantKey,financialYear:meta.financialYear}));
   const cash = asset("SYS_CASH");
   const bank = asset("SYS_BANK_ACCOUNT", bankAssetOpen);
   const bankOd = liability("SYS_BANK_OD", bankOdOpen);

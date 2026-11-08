@@ -1,7 +1,8 @@
 // Permission catalogue generated ONLY from the user's Roles_and_Permissions.xlsx.
-// No extra V2 screens are included except:
+// V2-only permission screens include:
 //   1) Family & Individual Accounts
 //   2) Company & Stakeholders
+//   3) Edit Posted Voucher (dedicated View + Edit gate)
 //
 // V15 standardized action columns across every screen:
 // View, Edit, Create, Delete, Download, Screenshot, Print.
@@ -589,6 +590,20 @@ export const permissionCatalogue = [
     "app": "dms",
     "category": "Transaction",
     "screens": [
+      {
+        "key": "dms.transaction.cheque_control",
+        "label": "Cheque Controlling System (Issued / Received)",
+        "allowedActions": ["view", "create", "edit", "download"],
+        "source": "V2_REQUIRED_EXTRA",
+        "sourcePath": "Transaction > Cheque Controlling System"
+      },
+      {
+        "key": "dms.transaction.voucher_edit",
+        "label": "Edit Posted Voucher (Receipt / Payment / Bank / Cash)",
+        "allowedActions": ["view", "edit"],
+        "source": "V2_REQUIRED_EXTRA",
+        "sourcePath": "Transaction > Edit Posted Voucher"
+      },
       {
         "key": "dms.transaction.receipt",
         "label": "Receipt",
@@ -2838,7 +2853,9 @@ export const permissionCatalogue = [
 const STANDARD_PERMISSION_ACTIONS = PERMISSION_ACTIONS.map((action) => action.key);
 for (const group of permissionCatalogue) {
   for (const screen of group.screens || []) {
-    screen.allowedActions = [...STANDARD_PERMISSION_ACTIONS];
+    screen.allowedActions = screen.key === "dms.transaction.voucher_edit"
+      ? ["view", "edit"]
+      : [...STANDARD_PERMISSION_ACTIONS];
   }
 }
 

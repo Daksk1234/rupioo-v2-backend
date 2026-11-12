@@ -33,7 +33,7 @@ export async function loadCompanyCashbookSources({ tenantKey, financialYear, lin
       .select('_id paymentNo partyNameSnapshot amount mode remarks status statementImportId sourceKey date createdAt').lean() : [],
     receiptsExist ? models.Receipt.find({tenantKey,financialYear,$or:[
       {mode:'CASH',status:'POSTED'},...(receiptNos.length?[{receiptNo:{$in:receiptNos}}]:[])]})
-      .select('_id receiptNo customerGlobalId partyNameSnapshot amount mode remarks status statementImportId receiptWorkflowStatus collectionSource cashDepositStatus cashDepositBatchId ledgerPostedAt sourceKey date createdAt').lean() : [],
+      .select('_id receiptNo customerGlobalId partyNameSnapshot amount mode remarks status statementImportId receiptWorkflowStatus collectionSource cashDepositStatus cashDepositBatchId ledgerPostedAt againstInvoices sourceKey date createdAt').lean() : [],
     salesExist ? models.SalesInvoice.find({ tenantKey, financialYear, customerGlobalId: { $in: cashPartyIds },
       status: { $in: ['POSTED', 'COMPLETED'] }, invoiceType: { $ne: 'PERFORMA' } })
       .select('_id invoiceNo customerGlobalId customerNameSnapshot status invoiceType grandTotal date createdAt').lean() : [],

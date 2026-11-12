@@ -117,16 +117,62 @@ router.post('/issued/books',access('create'),safe(async(req,res)=>{
   }finally{await session.endSession();}
   return ok(res,{bookId,startingNo:start,endingNo:numbers.at(-1),numberOfLeaves:count},'Cheque book registered',201);
 }));
-router.get('/issued',access('view'),safe(async(req,res)=>{
-  const tenantKey=req.auth.tenantKey;
-  const page=Math.max(1,Number.parseInt(req.query.page,10)||1),limit=Math.max(1,Math.min(100,Number.parseInt(req.query.limit,10)||50));
-  const filter={...source(tenantKey,LEAVES)};
+// Shared filtering keeps the highlighted and expanded issued-cheque registers
+// consistent with the regular status/search/book filters.
+const issuedFilter = (req) => {
+  const filter={...source(req.auth.tenantKey,LEAVES)};
   if(clean(req.query.bankAccountId))filter['data.bankAccountId']=clean(req.query.bankAccountId);
   if(clean(req.query.bookId))filter['data.bookId']=clean(req.query.bookId);
   if(clean(req.query.status))filter['data.status']=clean(req.query.status).toUpperCase();
-  const q=clean(req.query.q).slice(0,100);if(q)filter.$or=[{'data.chequeNo':{$regex:q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),$options:'i'}},{'data.issuedPartyName':{$regex:q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),$options:'i'}}];
+  const q=clean(req.query.q).slice(0,100);
+  if(q){const escaped=q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');filter.$or=[{'data.chequeNo':{$regex:escaped,$options:'i'}},{'data.issuedPartyName':{$regex:escaped,$options:'i'}}];}
+  return filter;
+};
+const chequePageOptions = (req) => ({
+  page:Math.max(1,Number.parseInt(req.query.page,10)||1),
+  limit:Math.max(1,Math.min(100,Number.parseInt(req.query.limit,10)||50)),
+});
+const issuedResponse = docs => docs.map(x=>({id:String(x._id),...x.data}));
+const unclearedChequeStatuses=['ISSUED','RETURNED'];
+// Numeric order must match Issue Cheque even across books with different
+// zero-padding or lengths (e.g. 99 precedes 100 and 0099).
+const firstThreeAvailable = filter => GenericRecord.aggregate([
+  {$match:{...filter,'data.status':'AVAILABLE'}},
+  {$addFields:{chequeSerialSort:{$convert:{input:'$data.chequeNo',to:'decimal',onError:null,onNull:null}}}},
+  {$sort:{chequeSerialSort:1,createdAt:1,_id:1}},
+  {$limit:3}
+]);
+// The default Company Issued view shows uncleared cheques before any unused
+// leaves, rather than letting a full cheque book hide pending payments.
+router.get('/issued/highlights',access('view'),safe(async(req,res)=>{
+  const filter=issuedFilter(req),{page,limit}=chequePageOptions(req);
+  const uncleared={...filter,'data.status':{$in:unclearedChequeStatuses}};
+  const available={...filter,'data.status':'AVAILABLE'};
+  const [docs,unclearedTotal,preview,availableTotal,allTotal]=await Promise.all([
+    GenericRecord.find(uncleared).sort({'data.issuedDate':-1,'data.chequeNo':1,_id:1}).skip((page-1)*limit).limit(limit).lean(),
+    GenericRecord.countDocuments(uncleared),
+    firstThreeAvailable(filter),
+    GenericRecord.countDocuments(available),
+    GenericRecord.countDocuments(filter)
+  ]);
+  return ok(res,{items:issuedResponse(docs),availablePreview:issuedResponse(preview),
+    availableTotal,unclearedTotal,allTotal,remainingTotal:Math.max(0,allTotal-unclearedTotal-preview.length),
+    meta:pageMeta(page,limit,unclearedTotal)});
+}));
+router.get('/issued/remaining',access('view'),safe(async(req,res)=>{
+  const filter=issuedFilter(req),{page,limit}=chequePageOptions(req);
+  const preview=await firstThreeAvailable(filter);
+  const rest={...filter,'data.status':{$nin:unclearedChequeStatuses},_id:{$nin:preview.map(row=>row._id)}};
+  const [docs,total]=await Promise.all([
+    GenericRecord.find(rest).sort({'data.status':1,'data.chequeNo':1,_id:1}).skip((page-1)*limit).limit(limit).lean(),
+    GenericRecord.countDocuments(rest)
+  ]);
+  return ok(res,{items:issuedResponse(docs),meta:pageMeta(page,limit,total)});
+}));
+router.get('/issued',access('view'),safe(async(req,res)=>{
+  const {page,limit}=chequePageOptions(req),filter=issuedFilter(req);
   const [docs,total]=await Promise.all([GenericRecord.find(filter).sort({'data.chequeNo':1,_id:1}).skip((page-1)*limit).limit(limit).lean(),GenericRecord.countDocuments(filter)]);
-  return ok(res,{items:docs.map(x=>({id:String(x._id),...x.data})),meta:pageMeta(page,limit,total)});
+  return ok(res,{items:issuedResponse(docs),meta:pageMeta(page,limit,total)});
 }));
 // Return the next AVAILABLE cheque for one company bank. Cheque number is
 // read-only in the UI. This endpoint does not reserve a cheque: assignment
@@ -368,7 +414,7 @@ router.post('/cashier/collect-cheques',safe(async(req,res)=>{
 
   if(!cashierActor(req.auth)&&!isAdminAuth(req.auth)&&!canPageAction(req.auth.permissions||[],'/dms/cashier','edit'))return fail(res,'Cashier permission required',403);
   const fy=clean(req.body?.financialYear),ids=[...new Set(Array.isArray(req.body?.chequeIds)?req.body.chequeIds.map(clean):[])];
-  if(!/^20\d{2}-\d{2}$/.test(fy)||!ids.length||ids.length>100||ids.some(x=>!/^[a-f0-9]{24}$/i.test(x)))return fail(res,'Select 1–100 valid cheques within a financial year',422);
+  if(!/^20\d{2}-\d{2}$/.test(fy)||!ids.length||ids.length>200||ids.some(x=>!/^[a-f0-9]{24}$/i.test(x)))return fail(res,'Select 1–100 valid cheques within a financial year',422);
   const docs=await GenericRecord.find({...source(req.auth.tenantKey,RECEIVED),_id:{$in:ids}});
   if(docs.length!==ids.length)return fail(res,'Selected cheque record not found',409);
   const collectorId=clean(req.body?.collectorId);
@@ -451,6 +497,7 @@ router.post('/company-received/:id/post-ledger',access('edit'),safe(async(req,re
   const doc=await GenericRecord.findOne({...source(req.auth.tenantKey,RECEIVED),_id:req.params.id});
   if(!doc)return fail(res,'Registered company cheque not found',404);
   const d=doc.data||{},fy=clean(d.linkedReceiptFy||req.body?.financialYear);
+  if(d.collectionLinked)return fail(res,'Collector cheques must pass Accounts OTP, bank deposit, clearance and explicit posting in the new Company Received workflow',409);
   if(!d.linkedReceiptNo||!d.approvalBundleId||!['RECEIVED','DEPOSITED','REDEPOSITED','CLEARED'].includes(d.status))return fail(res,'Cheque requires verified bundle approval before posting',409);
   const {Receipt}=financialModels(req.auth.tenantKey,fy),receipt=await Receipt.findOne({tenantKey:req.auth.tenantKey,financialYear:fy,receiptNo:d.linkedReceiptNo,chequeApprovalStatus:'APPROVED'});
   if(!receipt)return fail(res,'Approved original customer receipt not found',409);
@@ -460,10 +507,12 @@ router.post('/company-received/:id/post-ledger',access('edit'),safe(async(req,re
   if(!approvedBundle)return fail(res,'Original cheque bundle has not been approved',409);
   if(clean(receipt.customerGlobalId)!==clean(d.customerGlobalId)||Math.abs(Number(receipt.amount)-Number(d.amount))>0.009)return fail(res,'Original party or amount differs from cheque; posting blocked',409);
   const date=clean(req.body?.bankReceivedDate);
-  const result=await postCustodyApprovedReceipt({tenantKey:req.auth.tenantKey,financialYear:fy,receiptId:receipt._id,channel:'CHEQUE',bankReceivedDate:date,actorId:req.auth.sub,actorName:req.auth.name||''});
+  const result=await postCustodyApprovedReceipt({tenantKey:req.auth.tenantKey,financialYear:fy,receiptId:receipt._id,channel:'CHEQUE',bankReceivedDate:date,
+    bankAccountId:clean(req.body?.bankAccountId)||d.depositBankAccountId,actorId:req.auth.sub,actorName:req.auth.name||''});
   await GenericRecord.updateOne({_id:doc._id},{$set:{'data.ledgerStatus':'POSTED','data.ledgerTransactionId':receipt.receiptNo,
-    'data.ledgerFinancialYear':fy,'data.ledgerPostingMode':'RECEIPT_SUSPENSE','data.bankReceivedDate':date}});
-  return ok(res,{...result,bankReceivedDate:date},result.alreadyPosted?'Existing ledger posting verified':'Cheque customer ledger posted with bank-received date');
+    'data.ledgerFinancialYear':fy,'data.ledgerPostingMode':'RECEIPT_BANK','data.bankReceivedDate':date,
+    'data.depositBankAccountId':result.bankAccountId,'data.depositBankName':result.bankName,'data.bankLedgerTransactionId':result.bankTransactionId}});
+  return ok(res,{...result,bankReceivedDate:date},result.alreadyPosted?'Existing ledger and bank posting verified':'Cheque posted to customer ledger and Bank Statement');
 }));
 router.get('/company-received',access('view'),safe(async(req,res)=>{
   const fy=clean(req.query.financialYear);
@@ -637,6 +686,37 @@ router.delete('/received/:id',access('delete'),safe(async(req,res)=>{
   if(result.deletedCount!==1)return fail(res,'Cheque changed while deleting. Refresh Company Received and try again.',409);
   return ok(res,{deleted:true,reason},'Independent, unposted received cheque deleted');
 }));
+// Bulk delete means audit-preserving cancellation of physical cheque leaves.
+// An issued number may not disappear, be reused, or be cancelled after posting.
+// The batch is all-or-nothing: every selected row is checked inside a transaction.
+router.post('/issued/bulk-cancel',access('delete'),safe(async(req,res)=>{
+  const ids=req.body?.ids;
+  const reason=clean(req.body?.reason);
+  if(!Array.isArray(ids)||!ids.length||ids.length>200||ids.some(id=>typeof id!=='string'||!/^[a-f0-9]{24}$/i.test(id))||new Set(ids).size!==ids.length)
+    return fail(res,'Select between 1 and 200 distinct cheque leaves',422);
+  if(reason.length<5)return fail(res,'Enter a cancellation reason of at least 5 characters',422);
+  const session=await GenericRecord.startSession();
+  try{
+    await session.withTransaction(async()=>{
+      const docs=await GenericRecord.find({...source(req.auth.tenantKey,LEAVES),_id:{$in:ids}}).session(session);
+      if(docs.length!==ids.length)throw Object.assign(new Error('Some cheques no longer exist. Refresh and select again.'),{statusCode:409});
+      for(const doc of docs){
+        const data=doc.data||{};
+        if(!['AVAILABLE','ISSUED','RETURNED'].includes(data.status))
+          throw Object.assign(new Error(`Cheque ${data.chequeNo||''} cannot be cancelled in status ${data.status||'UNKNOWN'}`),{statusCode:409});
+        if(clean(data.bankTransactionReference)||data.ledgerTransactionId)
+          throw Object.assign(new Error(`Cheque ${data.chequeNo||''} has a bank/ledger reference; reconcile it before cancellation`),{statusCode:409});
+      }
+      for(const doc of docs){
+        doc.data={...doc.data,status:'CANCELLED',history:[...(doc.data?.history||[]),latestEvent('CANCELLED',req.auth,`Bulk deletion requested: ${reason}`)]};
+        doc.updatedBy=clean(req.auth.sub);
+        doc.markModified('data');
+        await doc.save({session});
+      }
+    });
+  }finally{await session.endSession();}
+  return ok(res,{cancelled:ids.length},`${ids.length} cheque leaf/leaves cancelled with audit history retained`);
+}));
 router.delete('/issued/:id',access('delete'),safe(async(req,res)=>{
   const doc=await GenericRecord.findOne({...source(req.auth.tenantKey,LEAVES),_id:req.params.id});
   if(!doc)return fail(res,'Cheque leaf not found',404);
@@ -787,6 +867,10 @@ async function postChequeClearing(req,doc,data,clearedDate,bank,reference){
     if(!existing||Number(existing.amount)!==amount||clean(existing.customerGlobalId)!==data.customerGlobalId || !['CHEQUE','CHECK','CHQ'].includes(clean(existing.receiptType||existing.mode).toUpperCase())){
       throw Object.assign(new Error('Linked original cheque receipt was not found or has different amount/customer'),{statusCode:409});
     }
+    const postedBank=await financialModels(req.auth.tenantKey,oldFy).LedgerEntry.findOne({tenantKey:req.auth.tenantKey,financialYear:oldFy,
+      transactionId:existing.bankLedgerTransactionId||linkedNo,bankAccountId:bank.bankAccountId,
+      accountCode:['OD','CC'].includes(clean(bank.accountType).toUpperCase())?'SYS_BANK_OD':'SYS_BANK_ACCOUNT',status:'POSTED',debit:amount}).lean();
+    if(postedBank)return {transactionId:existing.bankLedgerTransactionId||linkedNo,financialYear:oldFy,mode:'LINKED_EXISTING'};
     const oldLedger=await financialModels(req.auth.tenantKey,oldFy).LedgerEntry.findOne({tenantKey:req.auth.tenantKey,financialYear:oldFy,transactionId:linkedNo,transactionType:'RECEIPT',accountCode:'SYS_SUSPENSE',status:'POSTED',debit:amount}).lean();
     if(!oldLedger)throw Object.assign(new Error('Linked receipt has no matching open cheque suspense debit; reconcile before clearing'),{statusCode:409});
     mode='SUSPENSE_CLEARING';
@@ -845,6 +929,7 @@ async function postBounceCharge(req,doc,data,bank,bounceDate,fee,bearer){
 }
 router.patch('/received/:id',access('edit'),safe(async(req,res)=>{
   const doc=await docForReceived(req,req.params.id),old=doc.data||{},d=req.body||{};
+  if(old.collectionLinked)return fail(res,'Collector-linked cheques are managed through the verified Cashier/Accounts/Bank workflow only',409);
   if(isCustodyPending(old.status))return fail(res,'Cashier OTP handover must finish before DMS editing/deposit',409);
   if(['CLEARED','CANCELLED','LOST'].includes(old.status))return fail(res,'Finalized cheque is locked',409);
   // Company acknowledgment is a real next step after cashier receipt.

@@ -125,6 +125,7 @@ export function fyModels(db) {
     financialYear: String,
     receiptNo: { type: String, index: true },
     sourceKey: String,
+    creationSource: {type:String,index:true},
     date: { type: Date, index: true },
     customerGlobalId: { type: String, index: true },
     // Identity of the precise tenant-local CustomerLink chosen by the collector.
@@ -166,6 +167,7 @@ export function fyModels(db) {
     chequeDepositDate: Date,
     chequeClearanceDate: Date,
     chequeBounceDate: Date,
+    chequeBouncePostedAt:Date,chequeBounceChargeSnapshot:Number,
     chequeStatus: { type:String, index:true },
     // Sales Person app ownership. Legacy receipts remain valid because these
     // fields are optional and attribution falls back to createdBy where needed.
@@ -192,7 +194,7 @@ export function fyModels(db) {
     cashierOtpVerifiedBy: String,
     cashierOtpVerifiedByNameSnapshot: String,
     ledgerPostedAt: Date,ledgerPostedBy:String,ledgerPostedByNameSnapshot:String,
-    chequeBankReceivedDate:Date,
+    chequeBankReceivedDate:Date,bankLedgerTransactionId:String,
     chequeApprovalStatus:{type:String,default:'NOT_REQUIRED',index:true},
     chequeApprovalBatchId:String,
     disputeStatus:{type:String,default:'NONE',index:true},
@@ -220,6 +222,7 @@ export function fyModels(db) {
   receiptSchema.index({tenantKey:1,financialYear:1,clientMutationId:1},{unique:true,partialFilterExpression:{clientMutationId:{$type:"string"}}});
   receiptSchema.index({tenantKey:1,financialYear:1,bankMatchStatementRowId:1},{unique:true,partialFilterExpression:{bankMatchStatementRowId:{$type:"string"}}});
   receiptSchema.index({ tenantKey: 1, financialYear: 1, collectedBySalespersonId: 1, date: -1 });
+  receiptSchema.index({tenantKey:1,financialYear:1,creationSource:1,mode:1,status:1,date:1});
   receiptSchema.index({ tenantKey: 1, financialYear: 1, status: 1, bounceStatus: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, collectionSource: 1, receiptWorkflowStatus: 1, date: -1 });
   receiptSchema.index({ tenantKey: 1, financialYear: 1, customerOtpStatus: 1, cashierOtpStatus: 1, date: -1 });

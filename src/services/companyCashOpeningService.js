@@ -26,18 +26,17 @@ export async function companyCashOpening({ tenantKey, financialYear }) {
     if (validFY(entry.financialYear)) explicit.set(entry.financialYear, amount((explicit.get(entry.financialYear) || 0) + signed(entry)));
   }
   if (validFY(profile?.firstCashFinancialYear)) {
+    explicit.clear();
     explicit.set(profile.firstCashFinancialYear, amount(profile.firstCashOpeningBalance));
   }
-  if (explicit.has(financialYear)) return amount(explicit.get(financialYear));
-  const earlier = [...explicit.keys()].filter((fy) => fy < financialYear).sort();
+  const earlier = [...explicit.keys()].filter((fy) => fy <= financialYear).sort();
   if (!earlier.length) return 0;
   const start = Number(earlier[0].slice(0, 4));
   const target = Number(financialYear.slice(0, 4));
   if (target - start > 50) throw new Error("Cash FY opening rollover exceeds supported range");
-  let balance = 0;
+  let balance = amount(explicit.get(earlier[0]));
   for (let year = start; year < target; year++) {
     const fy = `${year}-${String((year + 1) % 100).padStart(2, "0")}`;
-    if (explicit.has(fy)) balance = amount(explicit.get(fy));
     // A historical FY without posted journals has no movement. In that case
     // do not compile LedgerEntry: doing so could recreate a missing collection.
     if(!await financialCollectionExists(tenantKey,fy,"ledgerentries"))continue;

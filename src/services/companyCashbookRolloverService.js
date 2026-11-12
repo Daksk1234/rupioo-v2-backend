@@ -62,7 +62,7 @@ async function postedCashbookYearMovement({ tenantKey, financialYear }) {
   return {
     projectedMovement: adjusted.closingBalance,
     journalMovement: money(book.journalClosingBalance+journalCorrection),
-    issueCount: book.issues.length,
+    issueCount: adjusted.rows.filter(row=>row.needsCorrection).length,
   };
 }
 

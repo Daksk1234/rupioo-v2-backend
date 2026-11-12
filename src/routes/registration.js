@@ -361,6 +361,7 @@ router.post("/superadmin", async (req, res) => {
       bankDetails,
       financialYear,
       financialYears,
+      firstFinancialYear: req.body.firstFinancialYear && financialYears.includes(req.body.firstFinancialYear) ? req.body.firstFinancialYear : financialYears[0],
       hasMultipleBranches,
       branchCount,
       planCode: plan.code,

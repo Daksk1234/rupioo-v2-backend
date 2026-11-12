@@ -35,7 +35,7 @@ export function financialModels(tenantKey, financialYear) {
 
 // One transaction ID can have exactly one immutable, balanced journal posting.
 // Identical retries return the existing lines; changed retries are rejected.
-export async function postBalancedEntries({ tenantKey, financialYear, transactionId, transactionType, date, partyGlobalId, entries, narration }) {
+export async function postBalancedEntries({ tenantKey, financialYear, transactionId, transactionType, date, partyGlobalId, entries, narration, session = null }) {
   const { LedgerEntry } = financialModels(tenantKey, financialYear);
   const transaction = String(transactionId || "").trim();
   if (!transaction || !String(transactionType || "").trim()) throw new Error("Ledger posting requires transaction ID and type");
@@ -87,7 +87,7 @@ export async function postBalancedEntries({ tenantKey, financialYear, transactio
     transactionId: transaction,
     status: { $ne: "POSTED" },
     postingKey: { $exists: true, $type: "string" },
-  }).select("_id postingKey archivedPostingKey").lean();
+  }).select("_id postingKey archivedPostingKey").session(session).lean();
   if (inactiveWithPostingKey.length) {
     await LedgerEntry.bulkWrite(
       inactiveWithPostingKey.map((old) => ({
@@ -99,7 +99,7 @@ export async function postBalancedEntries({ tenantKey, financialYear, transactio
           },
         },
       })),
-      { ordered: false },
+      { ordered: false, ...(session ? {session} : {}) },
     );
   }
 
@@ -110,7 +110,7 @@ export async function postBalancedEntries({ tenantKey, financialYear, transactio
     financialYear,
     transactionId: transaction,
     status: "POSTED",
-  }).lean();
+  }).session(session).lean();
   if (existing.length) {
     const same = existing.length === prepared.length && prepared.every((line) =>
       existing.some((old) =>
@@ -129,7 +129,7 @@ export async function postBalancedEntries({ tenantKey, financialYear, transactio
     throw error;
   }
   try {
-    return await LedgerEntry.insertMany(prepared, { ordered: true });
+    return await LedgerEntry.insertMany(prepared, { ordered: true, ...(session ? {session} : {}) });
   } catch (error) {
     if (error?.code === 11000) {
       const conflict = new Error(`Transaction ${transaction} has already been posted. Duplicate journal posting prevented.`);

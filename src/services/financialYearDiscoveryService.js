@@ -4,7 +4,7 @@
  * No collections/databases are created by this read-only discovery.
  */
 import mongoose from 'mongoose';
-import { CompanyLedger, User, BankAccount, CustomerLink } from '../models/index.js';
+import { CompanyLedger, User, BankAccount, CustomerLink, Product } from '../models/index.js';
 import { getTenantDbName } from '../config/db.js';
 import { resolveFinancialStorageTenantKeySync } from './financialStorageTenantService.js';
 import {validFY,normalizeYears} from './financialYearDiscoveryRules.js';
@@ -63,19 +63,22 @@ export async function discoverFinancialYears({tenantKey, configured=[]}={}){
   const key=String(tenantKey);
   const old=cache.get(key);
   if(old&&old.until>Date.now())return old.value;
-  const [fromDatabases,ledgerOpenings,userOpenings,bankOpenings,customerOpenings]=await Promise.all([
+  const [fromDatabases,ledgerOpenings,userOpenings,bankOpenings,customerOpenings,stockOpenings]=await Promise.all([
     yearsFromFinancialDatabases(tenantKey,configured),
     CompanyLedger.find({tenantKey, 'openingBalances.0':{$exists:true}}).select('openingBalances.financialYear').lean(),
-    User.distinct('openingFinancialYear',{tenantKey,openingFinancialYear:{$exists:true,$ne:''}}),
+    User.find({tenantKey}).select('openingFinancialYear accountingMappings.financialYear').lean(),
     BankAccount.find({tenantKey}).select('financialYear openingBalances.financialYear').lean(),
-    CustomerLink.distinct('openingFinancialYear',{tenantKey,openingFinancialYear:{$exists:true,$ne:''}}),
+    CustomerLink.find({tenantKey}).select('openingFinancialYear accountingProfile.financialYear').lean(),
+    Product.find({tenantKey}).select('openingFinancialYear financialYear openingStockByFY openingStocks financialYearOpenings').lean(),
   ]);
   const found=normalizeYears([
     ...fromDatabases,
     ...ledgerOpenings.flatMap(x=>(x.openingBalances||[]).map(r=>r.financialYear)),
-    ...userOpenings,
+    ...userOpenings.flatMap(x=>[x.openingFinancialYear,...(x.accountingMappings||[]).map(r=>r.financialYear)]),
     ...bankOpenings.flatMap(x=>[x.financialYear,...(x.openingBalances||[]).map(r=>r.financialYear)]),
-    ...customerOpenings,
+    ...customerOpenings.flatMap(x=>[x.openingFinancialYear,x.accountingProfile?.financialYear]),
+    ...stockOpenings.flatMap(x=>[x.openingFinancialYear,x.financialYear,...Object.keys(x.openingStockByFY||{}),
+      ...Object.keys(x.openingStocks||{}),...Object.keys(x.financialYearOpenings||{})]),
   ]);
   const value={discovered:found,firstDataFinancialYear:found[0]||''};
   cache.set(key,{value,until:Date.now()+ttl});

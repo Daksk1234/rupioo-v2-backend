@@ -6,6 +6,7 @@ import multer from "multer";
 import XLSX from "xlsx";
 import { Role, Group, User, Plan, CompanyProfile, CompanyLedger, AccountTemplate, PlatformPayment, DesignationTemplate, BranchOffice, Department, PincodeAssignment, Pincode, CustomerLink, GenericRecord } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
+import { prepareFinancialYears, removeEmptyFinancialYearDatabases } from "../services/companyFinancialYearManagement.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import { createCompanyBaseLedgers, defaultStakeholderRelationships, ensureLegalAccountTemplates, syncStakeholderLedgers, syncUserLedgers } from "../services/companyAccountingService.js";
@@ -2811,11 +2812,16 @@ router.put("/superadmins/:id", async (req,res) => {
   const duplicate=await User.exists({email,_id:{$ne:user._id}});
   if(duplicate) return fail(res,"Another user already uses this email",409);
 
-  const financialYears=Array.from(new Set((Array.isArray(req.body.financialYears)?req.body.financialYears:profile.financialYears||[])
-    .map(x=>String(x||"").trim()).filter(x=>FY_RE.test(x))));
-  const financialYear=String(req.body.financialYear ?? profile.financialYear ?? financialYears[0] ?? "").trim();
-  if(financialYear && !financialYears.includes(financialYear)) financialYears.unshift(financialYear);
-  if(!financialYears.length) return fail(res,"Add at least one Financial Year",400);
+  let yearPlan;
+  try {
+    yearPlan = await prepareFinancialYears({ company: profile, body: req.body });
+  } catch (error) {
+    return fail(res, error.message, error.statusCode || 409);
+  }
+  if (yearPlan?.removed?.length && (gstChanged || tenantMoveRequested)) return fail(res,"Remove financial years and change GSTIN in separate saves to protect the correct MongoDB tenant",409);
+  const financialYears = yearPlan?.years || profile.financialYears || [];
+  const financialYear = yearPlan?.defaultYear || profile.financialYear;
+  if (!financialYears.length) return fail(res, "Add at least one financial year", 400);
 
   const branchCount=Math.max(1,Number(req.body.branchCount ?? profile.branchCount ?? 1));
   const hasMultipleBranches=Boolean(req.body.hasMultipleBranches ?? (branchCount>1));
@@ -2839,6 +2845,12 @@ router.put("/superadmins/:id", async (req,res) => {
   if(req.body.gstVerified!==undefined) profile.gstVerification={...(profile.gstVerification?.toObject?.()||profile.gstVerification||{}),verified:Boolean(req.body.gstVerified),source:String(req.body.gstSource||profile.gstVerification?.source||""),status:String(req.body.gstStatus||profile.gstVerification?.status||""),taxpayerType:String(req.body.gstTaxpayerType||profile.gstVerification?.taxpayerType||""),constitution:String(req.body.gstConstitution||profile.gstVerification?.constitution||""),verifiedAt:req.body.gstVerified?new Date():profile.gstVerification?.verifiedAt};
   profile.financialYear=financialYear;
   profile.financialYears=financialYears;
+  if (yearPlan) {
+    profile.firstFinancialYear=yearPlan.firstYear;
+    if (yearPlan.removed.includes(String(profile.firstCashFinancialYear||'')) && !Number(profile.firstCashOpeningBalance||0)) {
+      profile.firstCashFinancialYear=yearPlan.firstYear;
+    }
+  }
   profile.hasMultipleBranches=hasMultipleBranches;
   profile.branchCount=branchCount;
   profile.autoRenew=Boolean(req.body.autoRenew ?? profile.autoRenew);
@@ -2860,13 +2872,21 @@ router.put("/superadmins/:id", async (req,res) => {
     profile.markModified("gstin");
   }
   await profile.save();
+  let removedFinancialYearDatabases=[];
+  if (yearPlan?.removed?.length) {
+    try { removedFinancialYearDatabases=await removeEmptyFinancialYearDatabases(yearPlan, profile); }
+    catch(error) {
+      await CompanyProfile.updateOne({_id:profile._id},{$addToSet:{financialYears:{$each:yearPlan.removed}}});
+      return fail(res,`Financial year deletion stopped: ${error.message}. Years were restored in company settings.`,error.statusCode||409);
+    }
+  }
 
   // CompanyProfile is the authoritative tenant identity because tenantId is a
   // stable link to it. Repair an older split state automatically, including
   // the case where the company already moved but the SUPERADMIN user did not.
   user.tenantKey=String(profile.tenantKey||user.tenantKey||"").trim();
   user.tenantId=String(profile._id);
-  user.name=profile.companyName;
+  user.name=String(req.body.name ?? user.name ?? profile.companyName).trim();
   user.email=email;
   user.mobile=profile.mobile;
   await user.save();
@@ -2912,6 +2932,7 @@ router.put("/superadmins/:id", async (req,res) => {
     subscription:subscriptionSnapshot(safeProfile),
     gstChanged,
     tenantIdentityRepaired:tenantIdentityWasSplit,
+    removedFinancialYearDatabases,
     tenantMigration,
     tenantKeyChanged:Boolean(tenantMigration?.changed),
     newTenantKey:tenantMigration?.newTenantKey||safeProfile.tenantKey
@@ -3048,6 +3069,8 @@ router.post("/superadmins", async (req,res) => {
   const financialYears=Array.from(new Set(requestedFinancialYears.map(x=>String(x||"").trim()).filter(x=>FY_RE.test(x))));
   const financialYear=String(req.body.financialYear||financialYears[0]||"").trim();
   if(financialYear && !financialYears.includes(financialYear)) financialYears.unshift(financialYear);
+  const firstFinancialYear=String(req.body.firstFinancialYear||financialYears[0]||"").trim();
+  if(firstFinancialYear && !financialYears.includes(firstFinancialYear)) return fail(res,"First FY must be an enabled financial year",400);
   const planCode=normalizeCode(req.body.planCode||"");
   const hasMultipleBranches=Boolean(req.body.hasMultipleBranches);
   const branchCount=hasMultipleBranches?Math.max(2,Number(req.body.branchCount||2)):1;
@@ -3137,7 +3160,7 @@ router.post("/superadmins", async (req,res) => {
       tenantKey,companyName,tradeName,companyType,gstin,pan,
       aadhaarHash:aadhaar.length===12?hashAadhaar(aadhaar):"",
       aadhaarMasked:aadhaar.length===12?maskAadhaar(aadhaar):"",
-      mobile,email,registeredAddress:address,pincode,area,city,district,state,bankDetails,financialYear,financialYears,
+      mobile,email,registeredAddress:address,pincode,area,city,district,state,bankDetails,financialYear,financialYears,firstFinancialYear,
       hasMultipleBranches,branchCount,planCode:plan.code,planGroupCode:plan.groupCode||"",billingCycle,
       paymentStatus:payment.status,paymentRef:payment.paymentRef,
       subscriptionStartAt,subscriptionEndAt,renewalDate:subscriptionEndAt,lastRenewedAt:subscriptionStartAt,subscriptionStatus:"ACTIVE",

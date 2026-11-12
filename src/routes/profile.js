@@ -9,7 +9,9 @@ import { gstChangeConfirmation, migrateCompanyTenantKey, normalizeCompanyGstin, 
 import { encryptSecret } from "../services/mail/crypto.js";
 import { verifySmtpConnection } from "../services/mail/smtpMail.service.js";
 import { detectMailProvider, isValidEmail } from "../services/mail/providerDetection.service.js";
-import { discoverFinancialYears, fiscalYearCandidates, firstDataYear, normalizeYears, invalidateFinancialYearDiscovery } from "../services/financialYearDiscoveryService.js";
+import { discoverFinancialYears, firstDataYear, normalizeYears, invalidateFinancialYearDiscovery } from "../services/financialYearDiscoveryService.js";
+import { prepareFinancialYears, removeEmptyFinancialYearDatabases } from "../services/companyFinancialYearManagement.js";
+import { validateCashOpening } from "../services/cashOpeningRules.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -92,7 +94,7 @@ async function loadProfile(req) {
   ]);
 
   const discovery = await discoverFinancialYears({tenantKey:company.tenantKey,configured:company.financialYears || []});
-  const effectiveFinancialYears=fiscalYearCandidates({configured:company.financialYears,discovered:discovery.discovered,opening:company.firstCashFinancialYear});
+  const effectiveFinancialYears=normalizeYears([...(company.financialYears||[]),company.firstCashFinancialYear,...discovery.discovered]);
   const subscription = subscriptionSnapshot(company);
   const mailConnection = await MailConnection.findOne({ database: company.tenantKey })
     .select("email provider authMode status smtpHost smtpPort smtpSecure smtpUser encryptedSmtpPassword lastHealthAt lastSuccessfulSendAt lastError")
@@ -105,9 +107,9 @@ async function loadProfile(req) {
       tenantId: String(user.tenantId || company._id || ""),
       tenantKey: user.tenantKey,
     },
-    company: {...company, financialYears:effectiveFinancialYears},
+    company: {...company, financialYears:effectiveFinancialYears, firstFinancialYear:company.firstFinancialYear||effectiveFinancialYears[0]||""},
     financialYearDiscovery: {...discovery, availableFinancialYears:effectiveFinancialYears,
-      suggestedOpeningFinancialYear: firstDataYear({discovered:discovery.discovered,configured:effectiveFinancialYears})},
+      suggestedOpeningFinancialYear:effectiveFinancialYears[0]||firstDataYear({discovered:discovery.discovered,configured:effectiveFinancialYears})},
     plan,
     group: group
       ? {
@@ -189,10 +191,17 @@ router.put("/", async (req, res) => {
   user.name = clean(req.body.name ?? user.name);
   user.email = nextEmail;
   user.mobile = clean(req.body.mobile ?? user.mobile);
-  await user.save();
+  // Save only after FY deletion and all other editable fields pass validation.
 
   for (const key of ["companyName", "tradeName", "mobile", "email", "registeredAddress", "pincode", "area", "city", "district", "state", "logoFileId", "signatureFileId", "invoiceTerms", "gpayNumber"]) {
     if (req.body[key] !== undefined) company[key] = clean(req.body[key]);
+  }
+
+  if (req.body.chequeBounceCharge !== undefined) {
+    const charge = Number(req.body.chequeBounceCharge);
+    if (!Number.isFinite(charge) || charge < 0 || charge > 100000 || Math.abs(Math.round(charge*100)-charge*100)>1e-7)
+      return fail(res, "Cheque bounce charge must be between ₹0 and ₹1,00,000 (up to two decimals)", 422);
+    company.chequeBounceCharge = Math.round(charge*100)/100;
   }
 
   for (const [key, label] of [["stockOverdueDays", "Overdue days"], ["deadStockDays", "Dead stock days"]]) {
@@ -219,41 +228,41 @@ router.put("/", async (req, res) => {
     };
   }
 
-  if (req.body.financialYear !== undefined) {
-    const fy = clean(req.body.financialYear);
-    if (fy && Array.isArray(company.financialYears) && company.financialYears.length && !company.financialYears.includes(fy)) {
-      return fail(res, "Default financial year must be one of the company's enabled financial years", 400);
+  // Financial-year deletion is restricted to completely empty FY databases.
+  // A selected First FY is independent from the cash opening year; neither is
+  // forced backwards merely because older historical data was discovered.
+  let yearPlan;
+  try {
+    yearPlan = await prepareFinancialYears({ company, body: req.body });
+  } catch (error) {
+    return fail(res, error.message, error.statusCode || 409);
+  }
+  if (yearPlan?.removed?.length && (gstChanged || tenantMoveRequested)) {
+    return fail(res, "Remove financial years and change GSTIN in separate saves to protect the correct MongoDB tenant", 409);
+  }
+  if (yearPlan) {
+    company.financialYears = yearPlan.years;
+    company.financialYear = yearPlan.defaultYear;
+    company.firstFinancialYear = yearPlan.firstYear;
+    // An obsolete, zero-only cash-opening reference is safe to move.
+    if (yearPlan.removed.includes(clean(company.firstCashFinancialYear)) && !Number(company.firstCashOpeningBalance || 0)) {
+      company.firstCashFinancialYear = yearPlan.firstYear;
     }
-    company.financialYear = fy;
   }
-
-  if (Array.isArray(req.body.financialYears)) {
-    const years = normalizeYears([...req.body.financialYears.map(clean),...discoveredYears.discovered]);
-    company.financialYears = years;
-    if (years.length && !years.includes(company.financialYear)) company.financialYear = years[0];
-  }
-
-  // Include fiscal-year data that already exists, even when the Superadmin
-  // originally enabled only later financial years. Never remove data years.
-  company.financialYears=normalizeYears([...(company.financialYears || []),...discoveredYears.discovered]);
-  // First-year cash opening: company-wide, not per cashier or per user.
-  // Validate BEFORE saving anything. Cashbook and finance reports both read SYS_CASH.
-  const cashOpeningChanged = req.body.firstCashFinancialYear !== undefined || req.body.firstCashOpeningBalance !== undefined;
-  if(cashOpeningChanged){
-    const firstYear=clean(req.body.firstCashFinancialYear ?? company.firstCashFinancialYear);
-    const amount=Number(req.body.firstCashOpeningBalance ?? company.firstCashOpeningBalance ?? 0);
-    const match=/^(\d{4})-(\d{2})$/.exec(firstYear);
-    if(!match || Number(match[2])!==((Number(match[1])+1)%100))return fail(res,"First Cash Financial Year must use YYYY-YY, e.g. 2025-26",400);
-    if(!Number.isFinite(amount) || amount<0 || amount>1e14)return fail(res,"Cash opening must be a valid non-negative amount",400);
-    // Historical data determines the first FY; a registration-date default
-    // must not reject old imported cash or bank records.
-    const effective=fiscalYearCandidates({configured:company.financialYears,discovered:discoveredYears.discovered,opening:firstYear});
-    const earliest=discoveredYears.firstDataFinancialYear || firstDataYear({configured:effective});
-    if(earliest && firstYear!==earliest)
-      return fail(res,`First Cash Opening belongs to ${earliest}, the earliest ${discoveredYears.firstDataFinancialYear?'financial year with company records':'configured financial year'}. Select that year in the Profile before saving.`,400);
-    company.financialYears=effective;
-    company.firstCashFinancialYear=firstYear;
-    company.firstCashOpeningBalance=Math.round(amount*100)/100;
+  const cashOpeningChanged = req.body.firstCashFinancialYear !== undefined || req.body.firstCashOpeningBalance !== undefined ||
+    (yearPlan && previousCashYear !== clean(company.firstCashFinancialYear));
+  if (cashOpeningChanged) {
+    let firstYear = clean(req.body.firstCashFinancialYear ?? company.firstCashFinancialYear ?? company.firstFinancialYear);
+    const amount = Number(req.body.firstCashOpeningBalance ?? company.firstCashOpeningBalance ?? 0);
+    const available=normalizeYears([...(company.financialYears||[]),...(discoveredYears.discovered||[])]);
+    if (!available.includes(firstYear) && amount === 0) firstYear = discoveredYears.firstDataFinancialYear || available[0];
+    let openingAmount;
+    try{openingAmount=validateCashOpening({financialYear:firstYear,amount,
+      configured:company.financialYears,discovered:discoveredYears.discovered});}
+    catch(e){return fail(res,e.message,400);}
+    company.financialYears=available;
+    company.firstCashFinancialYear = firstYear;
+    company.firstCashOpeningBalance = openingAmount;
   }
 
   const previousStartingNumber = Number(company.salesInvoiceStartingNumber || 1);
@@ -294,7 +303,20 @@ router.put("/", async (req, res) => {
     company.gstin = requestedGstin;
     company.markModified("gstin");
   }
+  await user.save();
   await company.save();
+  let removedFinancialYearDatabases = [];
+  if (yearPlan?.removed?.length) {
+    try {
+      removedFinancialYearDatabases = await removeEmptyFinancialYearDatabases(yearPlan, company);
+    } catch (error) {
+      // Preserve removed settings if a late write appeared in the FY database.
+      // Never claim deletion succeeded after a failed safety check.
+      await CompanyProfile.updateOne({ _id: company._id }, { $addToSet: { financialYears: { $each: yearPlan.removed } } });
+      invalidateFinancialYearDiscovery(company.tenantKey);
+      return fail(res, `Financial year deletion stopped: ${error.message}. Years were restored in Profile.`, error.statusCode || 409);
+    }
+  }
   invalidateFinancialYearDiscovery(company.tenantKey);
 
   const persistedCompany = await CompanyProfile.findById(company._id).lean();
@@ -316,16 +338,19 @@ router.put("/", async (req, res) => {
         const y=String(x.financialYear||"");
         if(y===String(company.firstCashFinancialYear))return false;
         // Do not leave the old profile-created opening behind when the first FY changes.
-        if(y===previousCashYear && previousCashYear!==company.firstCashFinancialYear && Number(x.amount||0)===previousCashAmount && String(x.type||"DR")==="DR")return false;
+        const signedAmount=(String(x.type||'DR')==='CR'?-1:1)*Number(x.amount||0);
+        if(y===previousCashYear && previousCashYear!==company.firstCashFinancialYear && signedAmount===previousCashAmount)return false;
         return true;
       });
-      cashLedger.openingBalances=[...previous,{financialYear:company.firstCashFinancialYear,amount:company.firstCashOpeningBalance,type:"DR"}];
+        cashLedger.openingBalances=[...previous,{financialYear:company.firstCashFinancialYear,
+          amount:Math.abs(company.firstCashOpeningBalance),type:company.firstCashOpeningBalance<0?'CR':'DR'}];
       await cashLedger.save();
     }
   }
   const data = await loadProfile(req);
   return ok(res, {
     ...data,
+    removedFinancialYearDatabases,
     gstChanged,
     tenantMigration,
     tenantKeyChanged: Boolean(tenantMigration?.changed),

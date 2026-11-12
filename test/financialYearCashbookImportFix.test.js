@@ -40,7 +40,7 @@ test('cashbook no longer prints RECONCILIATION REQUIRED on normal rows',()=>{
 });
 test('Cashbook uploads match exact parties, and unmatched ones default to Suspense',()=>{
  const server=source('../src/routes/transactions.js');
- assert.match(server,/confidence:matched\?'EXACT':'SUSPENSE'/);
+ assert.match(server,/confidence:matched\?matched\.confidence:'SUSPENSE'/);
  assert.match(server,/partyType:matched\?\.type\|\|'OTHER'/);
  assert.match(server,/auth\.role==='SUPERADMIN'&&input\.source==='SUPERADMIN_BULK'/);
  assert.match(server,/postBalancedEntries/);

@@ -41,7 +41,8 @@ function partyAddressState(link = {}) {
   return text(billing?.state || link?.ownerState);
 }
 
-async function context(tenantKey, financialYear, startDate, endDate) {
+async function context(tenantKey, financialYear, startDate, endDate, reportContext) {
+  if (reportContext) return reportContext;
   const { SalesInvoice, PurchaseInvoice } = financialModels(tenantKey, financialYear);
   const dq = dateQuery(startDate, endDate);
   const invoiceFilter = { tenantKey, financialYear, status: statusQuery(), ...(dq ? { date: dq } : {}) };
@@ -154,8 +155,8 @@ async function creditDebitNotes(tenantKey, startDate, endDate, linkMap, company)
   });
 }
 
-export async function buildGstr1({ tenantKey, financialYear, startDate, endDate }) {
-  const ctx = await context(tenantKey, financialYear, startDate, endDate);
+export async function buildGstr1({ tenantKey, financialYear, startDate, endDate, reportContext }) {
+  const ctx = await context(tenantKey, financialYear, startDate, endDate, reportContext);
   const sections = { B2B: [], B2CL: [], B2CS: [], CDNR: [], CDNUR: [] };
   for (const inv of ctx.sales) {
     const party = partyMeta(inv, ctx.linkMap, "sales");
@@ -178,8 +179,8 @@ export async function buildGstr1({ tenantKey, financialYear, startDate, endDate 
   return { report: "GSTR1", financialYear, generatedAt: new Date(), sections };
 }
 
-export async function buildGstr2b({ tenantKey, financialYear, startDate, endDate }) {
-  const ctx = await context(tenantKey, financialYear, startDate, endDate);
+export async function buildGstr2b({ tenantKey, financialYear, startDate, endDate, reportContext }) {
+  const ctx = await context(tenantKey, financialYear, startDate, endDate, reportContext);
   const rows = ctx.purchases.map((inv, i) => {
     const party = partyMeta(inv, ctx.linkMap, "purchase");
     const inter = isInterState({ company: ctx.company, party });
@@ -189,30 +190,30 @@ export async function buildGstr2b({ tenantKey, financialYear, startDate, endDate
     const reverseCharge = N(inv.transportationCost) > 0 || upper(inv.purchaseType).includes("REVERSE");
     return {
       srNo: i + 1, purchaseId: String(inv._id), supplierGSTIN: party.gstin || "-", supplierName: party.name,
-      invoiceNo: text(inv.invoiceNo) || "-", invoiceDate: iso(inv.date), invoiceValue: r2(inv.grandTotal), taxableValue: r2(totals.taxable),
+      invoiceNo: text(inv.invoiceNo) || "-", invoiceDate: iso(inv.date), invoiceValue: r2(inv.grandTotal), roundOff: totals.roundOff, taxableValue: r2(totals.taxable),
       placeOfSupply: party.state || (party.stateCode ? party.stateCode : "-"), reverseCharge: reverseCharge ? "Y" : "N",
       gstRate: rates.map((x) => `${r2(x)}%`).join(", ") || "-", igstAmount: totals.igst, cgstAmount: totals.cgst, sgstAmount: totals.sgst,
       eligibleITC: N(inv.taxTotal) > 0 ? "Yes" : "No", reasonForIneligibility: "-", month: monthLabel(inv.date), registrationType: upper(party.link?.registrationType),
     };
-  }).filter((r) => r.supplierGSTIN !== "-" && r.registrationType === "REGULAR").map(({ registrationType, ...row }) => row);
+  }).filter((r) => r.supplierGSTIN !== "-" && r.registrationType === "REGULAR").map(({ registrationType, ...row }, index) => ({ ...row, srNo:index+1 }));
   const totals = rows.reduce((a, r) => ({ invoiceValue:r2(a.invoiceValue+r.invoiceValue), taxableValue:r2(a.taxableValue+r.taxableValue), igst:r2(a.igst+r.igstAmount), cgst:r2(a.cgst+r.cgstAmount), sgst:r2(a.sgst+r.sgstAmount) }), { invoiceValue:0, taxableValue:0, igst:0, cgst:0, sgst:0 });
   return { report: "GSTR2B", financialYear, generatedAt: new Date(), rows, totals };
 }
 
-export async function buildGstr3b({ tenantKey, financialYear, startDate, endDate }) {
-  const ctx = await context(tenantKey, financialYear, startDate, endDate);
-  let s = { taxable:0, igst:0, cgst:0, sgst:0 }, p = { taxable:0, igst:0, cgst:0, sgst:0 };
+export async function buildGstr3b({ tenantKey, financialYear, startDate, endDate, reportContext }) {
+  const ctx = await context(tenantKey, financialYear, startDate, endDate, reportContext);
+  let s = { taxable:0, igst:0, cgst:0, sgst:0, roundOff:0, grand:0 }, p = { taxable:0, igst:0, cgst:0, sgst:0, roundOff:0, grand:0 };
   for (const inv of ctx.sales) {
     const party = partyMeta(inv, ctx.linkMap, "sales");
     const groups = allocateByRate(inv, isInterState({ company:ctx.company, party, explicitGstType:inv.gstType }));
     const t = invoiceTotalsFromRateGroups(groups, inv);
-    s = { taxable:r2(s.taxable+t.taxable), igst:r2(s.igst+t.igst), cgst:r2(s.cgst+t.cgst), sgst:r2(s.sgst+t.sgst) };
+    s = { taxable:r2(s.taxable+t.taxable), igst:r2(s.igst+t.igst), cgst:r2(s.cgst+t.cgst), sgst:r2(s.sgst+t.sgst), roundOff:r2(s.roundOff+t.roundOff), grand:r2(s.grand+t.grand) };
   }
   for (const inv of ctx.purchases) {
     const party = partyMeta(inv, ctx.linkMap, "purchase");
     const groups = allocateByRate(inv, isInterState({ company:ctx.company, party }));
     const t = invoiceTotalsFromRateGroups(groups, inv);
-    p = { taxable:r2(p.taxable+t.taxable), igst:r2(p.igst+t.igst), cgst:r2(p.cgst+t.cgst), sgst:r2(p.sgst+t.sgst) };
+    p = { taxable:r2(p.taxable+t.taxable), igst:r2(p.igst+t.igst), cgst:r2(p.cgst+t.cgst), sgst:r2(p.sgst+t.sgst), roundOff:r2(p.roundOff+t.roundOff), grand:r2(p.grand+t.grand) };
   }
   const natureOfSupplies = [
     ["Outward Taxable Supplies (other than zero-rated, nil-rated, and exempted)",s],
@@ -248,8 +249,8 @@ function hsnBucketForInvoice(inv, party, company, side = "sales") {
   return Array.from(map.values());
 }
 
-export async function buildHsnReport({ tenantKey, financialYear, startDate, endDate }) {
-  const ctx=await context(tenantKey,financialYear,startDate,endDate);const buckets={Regular:new Map(),UnRegister:new Map()};
+export async function buildHsnReport({ tenantKey, financialYear, startDate, endDate, reportContext }) {
+  const ctx=await context(tenantKey,financialYear,startDate,endDate,reportContext);const buckets={Regular:new Map(),UnRegister:new Map()};
   const salesMonthMap=new Map();
   for(const inv of ctx.sales){
     const party=partyMeta(inv,ctx.linkMap,"sales"),bucket=party.registered?"Regular":"UnRegister",rows=hsnBucketForInvoice(inv,party,ctx.company,"sales");
@@ -263,18 +264,18 @@ export async function buildHsnReport({ tenantKey, financialYear, startDate, endD
   return {report:"HSN",financialYear,generatedAt:new Date(),regular,unregister,totals:{regular:totalsOf(regular),unregister:totalsOf(unregister),all:{...allTotals,roundOff:invoiceRoundOff,invoiceGrand}},reconciliation:{hsn:{taxable:allTotals.taxableAmount,cgst:allTotals.cgstAmt,sgst:allTotals.sgstAmt,igst:allTotals.igstAmt,roundOff:invoiceRoundOff,grand:r2(allTotals.grandTotal+invoiceRoundOff)},sales:{taxable:r2(ctx.sales.reduce((s,x)=>s+N(x.taxableTotal),0)),cgst:r2(Array.from(salesMonthMap.values()).reduce((s,x)=>s+x.cgst,0)),sgst:r2(Array.from(salesMonthMap.values()).reduce((s,x)=>s+x.sgst,0)),igst:r2(Array.from(salesMonthMap.values()).reduce((s,x)=>s+x.igst,0)),roundOff:invoiceRoundOff,grand:invoiceGrand},months:Array.from(salesMonthMap.values())}};
 }
 
-export async function buildInputOutput({ tenantKey, financialYear, startDate, endDate }) {
-  const ctx=await context(tenantKey,financialYear,startDate,endDate);const rows=[];
-  for(const inv of ctx.purchases){const party=partyMeta(inv,ctx.linkMap,"purchase"),g=allocateByRate(inv,isInterState({company:ctx.company,party})),t=invoiceTotalsFromRateGroups(g,inv),totalInput=r2(t.cgst+t.sgst+t.igst);rows.push({type:"INPUT",partyName:party.name,invoiceNo:inv.invoiceNo,date:iso(inv.date),invoiceValue:r2(inv.grandTotal),taxableValue:t.taxable,cgstInput:t.cgst,sgstInput:t.sgst,igstInput:t.igst,totalInput,cgstOutput:0,sgstOutput:0,igstOutput:0,totalOutput:0,availableGST:totalInput});}
-  for(const inv of ctx.sales){const party=partyMeta(inv,ctx.linkMap,"sales"),g=allocateByRate(inv,isInterState({company:ctx.company,party,explicitGstType:inv.gstType})),t=invoiceTotalsFromRateGroups(g,inv),totalOutput=r2(t.cgst+t.sgst+t.igst);rows.push({type:"OUTPUT",partyName:party.name,invoiceNo:inv.invoiceNo,date:iso(inv.date),invoiceValue:r2(inv.grandTotal),taxableValue:t.taxable,cgstInput:0,sgstInput:0,igstInput:0,totalInput:0,cgstOutput:t.cgst,sgstOutput:t.sgst,igstOutput:t.igst,totalOutput,availableGST:r2(-totalOutput)});}
+export async function buildInputOutput({ tenantKey, financialYear, startDate, endDate, reportContext }) {
+  const ctx=await context(tenantKey,financialYear,startDate,endDate,reportContext);const rows=[];
+  for(const inv of ctx.purchases){const party=partyMeta(inv,ctx.linkMap,"purchase"),g=allocateByRate(inv,isInterState({company:ctx.company,party})),t=invoiceTotalsFromRateGroups(g,inv),totalInput=r2(t.cgst+t.sgst+t.igst);rows.push({type:"INPUT",partyName:party.name,invoiceNo:inv.invoiceNo,date:iso(inv.date),invoiceValue:r2(inv.grandTotal),roundOff:t.roundOff,taxableValue:t.taxable,cgstInput:t.cgst,sgstInput:t.sgst,igstInput:t.igst,totalInput,cgstOutput:0,sgstOutput:0,igstOutput:0,totalOutput:0,availableGST:totalInput});}
+  for(const inv of ctx.sales){const party=partyMeta(inv,ctx.linkMap,"sales"),g=allocateByRate(inv,isInterState({company:ctx.company,party,explicitGstType:inv.gstType})),t=invoiceTotalsFromRateGroups(g,inv),totalOutput=r2(t.cgst+t.sgst+t.igst);rows.push({type:"OUTPUT",partyName:party.name,invoiceNo:inv.invoiceNo,date:iso(inv.date),invoiceValue:r2(inv.grandTotal),roundOff:t.roundOff,taxableValue:t.taxable,cgstInput:0,sgstInput:0,igstInput:0,totalInput:0,cgstOutput:t.cgst,sgstOutput:t.sgst,igstOutput:t.igst,totalOutput,availableGST:r2(-totalOutput)});}
   rows.sort((a,b)=>String(a.date).localeCompare(String(b.date))||String(a.invoiceNo).localeCompare(String(b.invoiceNo)));
-  const totals=rows.reduce((a,r)=>{for(const k of ["invoiceValue","taxableValue","cgstInput","sgstInput","igstInput","totalInput","cgstOutput","sgstOutput","igstOutput","totalOutput"])a[k]=r2(a[k]+N(r[k]));return a;},{invoiceValue:0,taxableValue:0,cgstInput:0,sgstInput:0,igstInput:0,totalInput:0,cgstOutput:0,sgstOutput:0,igstOutput:0,totalOutput:0});totals.availableGST=r2(totals.totalInput-totals.totalOutput);
+  const totals=rows.reduce((a,r)=>{for(const k of ["roundOff","invoiceValue","taxableValue","cgstInput","sgstInput","igstInput","totalInput","cgstOutput","sgstOutput","igstOutput","totalOutput"])a[k]=r2(a[k]+N(r[k]));return a;},{roundOff:0,invoiceValue:0,taxableValue:0,cgstInput:0,sgstInput:0,igstInput:0,totalInput:0,cgstOutput:0,sgstOutput:0,igstOutput:0,totalOutput:0});totals.availableGST=r2(totals.totalInput-totals.totalOutput);
   return {report:"GST_INPUT_OUTPUT",financialYear,generatedAt:new Date(),rows,totals};
 }
 
-export async function buildTaxReport({ tenantKey, financialYear, startDate, endDate }) {
-  const io=await buildInputOutput({tenantKey,financialYear,startDate,endDate});
-  return {report:"TAX",financialYear,generatedAt:new Date(),rows:[{totalTaxInput:r2(io.totals.totalInput),totalTaxOut:r2(io.totals.totalOutput),BalanceTax:r2(io.totals.availableGST)}]};
+export async function buildTaxReport({ tenantKey, financialYear, startDate, endDate, reportContext }) {
+  const io=await buildInputOutput({tenantKey,financialYear,startDate,endDate,reportContext});
+  return {report:"TAX",financialYear,generatedAt:new Date(),filterTotals:{taxableValue:io.totals.taxableValue,cgst:r2(io.totals.cgstInput+io.totals.cgstOutput),sgst:r2(io.totals.sgstInput+io.totals.sgstOutput),igst:r2(io.totals.igstInput+io.totals.igstOutput),roundOff:io.totals.roundOff,grandTotal:io.totals.invoiceValue},rows:[{totalTaxInput:r2(io.totals.totalInput),totalTaxOut:r2(io.totals.totalOutput),BalanceTax:r2(io.totals.availableGST)}]};
 }
 
 function annualRange(financialYear) {
@@ -476,4 +477,14 @@ export async function buildGstReport(kind,args){
   if(key==="GSTR9")return buildGstr9(args);
   if(key==="GSTR9C")return buildGstr9c(args);
   throw Object.assign(new Error("Unknown GST report"),{statusCode:404});
+}
+
+// All sheets use one source snapshot and exactly the same period.
+export async function buildGstReportBundle(args) {
+  const reportContext=await context(args.tenantKey,args.financialYear,args.startDate,args.endDate);
+  const shared={...args,reportContext};
+  const [gstr1,gstr2b,gstr3b,hsn,inputOutput,tax]=await Promise.all([
+    buildGstr1(shared),buildGstr2b(shared),buildGstr3b(shared),buildHsnReport(shared),buildInputOutput(shared),buildTaxReport(shared),
+  ]);
+  return {gstr1,gstr2b,gstr3b,hsn,inputOutput,tax};
 }

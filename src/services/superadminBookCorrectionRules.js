@@ -22,7 +22,7 @@ export function validateBookCorrection(input, financialYear){
      Math.abs(cents(debit)-debit*100)>1e-6||Math.abs(cents(credit)-credit*100)>1e-6)
     throw new Error('Enter either a positive Debit or a positive Credit, with up to two decimals');
   return {date:dt,debit:input.deleted?0:amount(debit),credit:input.deleted?0:amount(credit),
-    remarks:String(input.remarks||'').trim().slice(0,2000),
+    remarks:String(input.remarks??'').slice(0,2000),
     partyName:String(input.partyName||'').trim().slice(0,250),deleted:Boolean(input.deleted)};
 }
 export function applyCashCorrections(rows,corrections,opening=0){
@@ -32,8 +32,10 @@ export function applyCashCorrections(rows,corrections,opening=0){
     const edit=byKey.get(cashKey(row));
     if(edit?.deleted)continue;
     const next=edit?{...row,date:edit.date,debit:amount(edit.debit),credit:amount(edit.credit),
-      particular:edit.remarks||row.particular,remarks:edit.remarks||row.remarks,
+      particular:edit.remarks??row.particular,remarks:edit.remarks??row.remarks,
+      partyGlobalId:edit.partyGlobalId||row.partyGlobalId,partyType:edit.partyType||row.partyType,
       partyName:edit.partyName||row.partyName,adminCorrected:true,needsCorrection:false,
+      journalCorrectionPending:false,correctionMessage:'',
       type:Number(edit.credit||0)>0?'RECEIPT':'PAYMENT',
       category:(Number(row.credit||0)>0)===(Number(edit.credit||0)>0)
         ?row.category:(Number(edit.credit||0)>0?'CASH_ADJUSTMENT_IN':'CASH_ADJUSTMENT_OUT'),
@@ -56,9 +58,14 @@ export function applyBankCorrections(rows,corrections){
     const edit=map.get(bookKey(row,'BANK'));
     if(edit?.deleted)return [];
     if(!edit)return [row];
+    const correctedParty = String(edit.partyGlobalId || '').trim();
     return [{...row,date:edit.date,debit:amount(edit.debit),credit:amount(edit.credit),
-      remarks:edit.remarks||row.remarks,matchedPartyName:edit.partyName||row.matchedPartyName,
-      partyNameDisplay:edit.partyName||row.partyNameDisplay,adminCorrected:true}];
+      remarks:edit.remarks??row.remarks,
+      matchedPartyGlobalId: correctedParty || row.matchedPartyGlobalId,
+      matchedPartyName:edit.partyName||row.matchedPartyName,
+      partyNameDisplay:edit.partyName||row.partyNameDisplay,
+      classification:correctedParty ? 'POSTED' : row.classification,
+      adminCorrected:true}];
   });
 }
 export function adjustmentJournal({currentNet,originalNet,bookAccount,counterAccount,date,reason,tenantKey,financialYear,transactionId}){

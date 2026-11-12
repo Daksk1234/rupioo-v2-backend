@@ -607,9 +607,8 @@ async function cashSummaryForUser({ tenantKey, financialYear, salespersonId, at 
   const userId = clean(salespersonId);
   const dayStart = startOfDay(at), dayEnd = endOfDay(at), key = localDateKey(at);
   // Receipts are the source of truth for money collected. In particular, do
-  // NOT sum old COLLECTION movements: if a receipt was deleted directly in
-  // MongoDB its historical movement can remain and would falsely inflate
-  // CASH IN HAND. Retain other approved cash movements (handover, etc.).
+  // NOT sum old COLLECTION or other historical movement amounts to determine
+  // custody: a collector's current undeposited receipts are authoritative.
   const liveCashReceipts = {
     tenantKey, financialYear, status: "POSTED", mode: "CASH",
     collectionSource: "SALESPERSON_APP", ...collectionOwnerFilter(userId),
@@ -626,7 +625,28 @@ async function cashSummaryForUser({ tenantKey, financialYear, salespersonId, at 
       { type: "HANDOVER", status: "PENDING", handoverOtpStatus: "VERIFIED" },
     ],
   };
-  const [receiptTotals, movementTotals, movementOpening, todayMovements, pending, todayReceipts] = await Promise.all([
+  // Only an OTP-verified physical handover transfers custody. A legacy
+  // APPROVED handover must not subtract the same cash a second time, and
+  // historic/manual movement rows cannot hide today's undeposited receipts.
+  const verifiedHandoverIds = (await SalespersonCashMovement.distinct('_id', {
+    tenantKey, financialYear, salespersonId: userId,
+    type: 'HANDOVER', status: { $in: ['PENDING', 'APPROVED', 'POSTED'] },
+    handoverOtpStatus: 'VERIFIED',
+  })).map(String);
+  const custodialCashReceipts = {
+    ...liveCashReceipts, customerOtpStatus: 'VERIFIED',
+    cashDepositStatus: { $nin: ['DEPOSITED_TO_CASHIER', 'CLOSED', 'DEPOSITED', 'CANCELLED'] },
+    $and: [
+      { $or: [{ cashDepositStatus: { $ne: 'HANDOVER_PENDING' } },
+        { cashDepositBatchId: { $nin: verifiedHandoverIds } }] },
+    ],
+  };
+  const [custodyTotals, receiptTotals, todayMovements, pending, todayReceipts] = await Promise.all([
+    Receipt.aggregate([
+      { $match: custodialCashReceipts },
+      { $group: { _id: null, total: { $sum: '$amount' },
+        beforeToday: { $sum: { $cond: [{ $lt: ['$date', dayStart] }, '$amount', 0] } } } },
+    ]),
     Receipt.aggregate([
       { $match: liveCashReceipts },
       { $group: {
@@ -639,18 +659,6 @@ async function cashSummaryForUser({ tenantKey, financialYear, salespersonId, at 
         ] } },
       } },
     ]),
-    SalespersonCashMovement.aggregate([
-      { $match: movementScope },
-      { $group: { _id: "$direction", total: { $sum: { $cond: [
-        { $eq: ["$type", "HANDOVER"] }, { $ifNull: ["$cashAmount", "$amount"] }, "$amount",
-      ] } } } },
-    ]),
-    SalespersonCashMovement.aggregate([
-      { $match: { ...movementScope, date: { $lt: dayStart } } },
-      { $group: { _id: "$direction", total: { $sum: { $cond: [
-        { $eq: ["$type", "HANDOVER"] }, { $ifNull: ["$cashAmount", "$amount"] }, "$amount",
-      ] } } } },
-    ]),
     SalespersonCashMovement.find({ ...movementScope, date: { $gte: dayStart, $lt: dayEnd } })
       .sort({ date: -1, createdAt: -1 }).limit(100).lean(),
     SalespersonCashMovement.find({ tenantKey, financialYear, salespersonId: userId, status: "PENDING", type: { $in: ["HANDOVER", "BANK_DEPOSIT"] } })
@@ -659,10 +667,11 @@ async function cashSummaryForUser({ tenantKey, financialYear, salespersonId, at 
       .select("_id receiptNo amount date customerGlobalId partyNameSnapshot").sort({ date: -1, createdAt: -1 }).limit(100).lean(),
   ]);
   const cashReceipts = receiptTotals[0] || {};
-  const movements = new Map(movementTotals.map((row) => [String(row._id), num(row.total)]));
-  const before = new Map(movementOpening.map((row) => [String(row._id), num(row.total)]));
-  const netCash = num(cashReceipts.total) + num(movements.get("IN")) - num(movements.get("OUT"));
-  const netOpening = num(cashReceipts.beforeToday) + num(before.get("IN")) - num(before.get("OUT"));
+  // Physical custody is determined by each original receipt's live status.
+  // Movement journals remain for reporting but cannot erase an undeposited
+  // collector receipt or create a negative/zero balance from stale entries.
+  const netCash = num(custodyTotals[0]?.total);
+  const netOpening = num(custodyTotals[0]?.beforeToday);
   // Direct database deletion can also orphan a previously approved handover.
   // Such historical withdrawals must not turn the current displayed cash negative.
   const cashInHand = money(Math.max(0, netCash));
@@ -670,8 +679,8 @@ async function cashSummaryForUser({ tenantKey, financialYear, salespersonId, at 
   const sumType = (type, direction = null) => money(todayMovements
     .filter((row) => row.type === type && (!direction || row.direction === direction))
     .reduce((total, row) => total + num(type === "HANDOVER" ? (row.cashAmount ?? row.amount) : row.amount), 0));
-  // Verified pending handovers have already been subtracted in movementScope.
-  // Only unverified handovers reserve funds against a second deposit attempt.
+  // Verified handovers are excluded from the live receipt custody totals.
+  // Unverified handovers remain physically in hand but are already reserved.
   const pendingHandover = money(pending.filter((row) => row.type === "HANDOVER" && upper(row.handoverOtpStatus) !== "VERIFIED")
     .reduce((total, row) => total + num(row.cashAmount ?? row.amount), 0));
   const pendingBankDeposit = money(pending.filter((row) => row.type === "BANK_DEPOSIT")
@@ -2683,9 +2692,22 @@ router.post("/cash/handover", async (req, res) => {
     const denominations = cashAmount > 0 ? parseDenominations(req.body.denominations) : [];
     if (cashAmount > 0) assertDenominationsMatch(denominations, cashAmount, "cash handover");
 
-    const summary = await cashSummaryForUser({ tenantKey: req.auth.tenantKey, financialYear, salespersonId: req.auth.sub });
-    const available = money(Math.max(0, summary.cashInHand - summary.pendingTotal));
-    if (cashAmount > available + 0.009) return fail(res, `Only ₹${available.toLocaleString("en-IN")} is available for a new handover`, 409, { cashInHand: summary.cashInHand, pendingTotal: summary.pendingTotal, available });
+    // Receipt custody is authoritative for a physical handover. The separate
+    // cash day-book may contain legacy adjustments, already-approved handovers
+    // or stale entries; none may turn an unhanded receipt into ₹0 available.
+    // Re-read eligible CASH receipts to guard against changes during preview.
+    const [availableRow] = await Receipt.aggregate([
+      { $match: {
+        tenantKey: req.auth.tenantKey, financialYear, status: 'POSTED', mode: 'CASH',
+        receiptType: { $ne: 'CHEQUE' }, collectionSource: 'SALESPERSON_APP',
+        customerOtpStatus: 'VERIFIED', disputeStatus: { $ne: 'HOLD' },
+        cashDepositStatus: { $in: ['PENDING_TO_DEPOSIT', null, '', 'NOT_APPLICABLE'] },
+        ...collectionOwnerFilter(req.auth.sub),
+      } },
+      { $group: { _id: null, amount: { $sum: '$amount' } } },
+    ]);
+    const available = money(availableRow?.amount || 0);
+    if (cashAmount > available + 0.009) return fail(res, `Only ₹${available.toLocaleString("en-IN")} in undeposited, customer-verified cash receipts is available for a new handover`, 409, { available });
 
     let movementNo = makeId("HND");
     while (await SalespersonCashMovement.exists({ tenantKey: req.auth.tenantKey, financialYear, movementNo })) movementNo = makeId("HND");
@@ -2794,32 +2816,49 @@ router.post("/cash/handovers/:movementId/otp/verify", async (req, res) => {
     const result = await verifyOtp({ otpId: movement.handoverOtpId, code });
     if (!result.ok) return fail(res, result.reason, 400);
     if (String(result.challenge.transactionId) !== String(movement._id) || String(result.challenge.recipientId) !== String(req.auth.sub)) return fail(res, "OTP does not belong to this cash handover", 409);
-    const readyStatus = (movement.partyIssues || []).some((x) => !["RESOLVED", "CANCELLED"].includes(upper(x.status))) ? "ISSUE_OPEN" : "READY_FOR_CASHIER_COUNT";
-    // Atomically claim the OTP transition. If a restart already cancelled this
-    // handover, a late OTP verification must never restore its deposit status.
-    const verified = await SalespersonCashMovement.findOneAndUpdate(
-      { _id: movement._id, tenantKey: req.auth.tenantKey, financialYear,
-        salespersonId: req.auth.sub, type: "HANDOVER", ...unverifiedCashHandover },
-      { $set: { handoverOtpStatus: "VERIFIED", handoverOtpVerifiedAt: new Date(), handoverWorkflowStatus: readyStatus },
-        $unset: { handoverOtpCode: "" } },
-      { new: true },
-    );
-    if (!verified) return fail(res, "This OTP handover was cancelled or already processed. Reopen Deposit to Cashier to check the receipts", 409);
-    // One cashier handover OTP confirms every receipt in the bundle. Reflect this
-    // on individual receipts for the DMS, Customer App and salesperson app.
+    if ((movement.partyIssues||[]).some(x=>!["RESOLVED","CANCELLED"].includes(upper(x.status))))
+      return fail(res,"Resolve open handover issues before Cashier OTP confirmation",409);
     const { Receipt } = financialModels(req.auth.tenantKey, financialYear);
-    const receiptIds = (verified.receiptBreakdown || []).map((r) => r.receiptId).filter(objectIdText);
-    if (receiptIds.length) await Receipt.updateMany({
-      _id: { $in: receiptIds }, tenantKey: req.auth.tenantKey, financialYear,
-      cashDepositBatchId: String(verified._id), customerOtpStatus: "VERIFIED", status: "POSTED",
-    }, { $set: {
-      cashierOtpStatus: "VERIFIED", cashierOtpVerifiedAt: verified.handoverOtpVerifiedAt || new Date(),
-      cashierOtpVerifiedBy: req.auth.sub, cashierOtpVerifiedByNameSnapshot: req.auth.name || "",
-      // Customer has paid once handover OTP is verified, but cash must still
-      // be physically counted and accepted by the DMS cashier.
-      receiptWorkflowStatus: readyStatus === "ISSUE_OPEN" ? "ISSUE_OPEN" : "READY_FOR_CASHIER_COUNT",
-    } });
-    return ok(res, { movementNo: verified.movementNo, status: verified.handoverWorkflowStatus }, "Cash handover confirmed; cashier can now count and receive the notes");
+    const receiptIds = (movement.receiptBreakdown || []).map(r=>r.receiptId).filter(objectIdText);
+    if(receiptIds.length!==(movement.receiptBreakdown||[]).length || !receiptIds.length)
+      return fail(res,"A handover must contain valid original receipts",409);
+    const live=await Receipt.find({_id:{$in:receiptIds},tenantKey:req.auth.tenantKey,financialYear,
+      status:"POSTED",customerOtpStatus:"VERIFIED",cashDepositBatchId:String(movement._id),cashDepositStatus:"HANDOVER_PENDING",disputeStatus:{$ne:"HOLD"}}).lean();
+    if(live.length!==receiptIds.length)return fail(res,"A receipt changed before handover verification; refresh the deposit",409);
+    const chequeRows=movement.receiptBreakdown.filter(r=>upper(r.mode)==="CHEQUE");
+    for(const row of chequeRows){
+      const linked=await GenericRecord.exists({tenantKey:req.auth.tenantKey,app:"dms",resource:"cheque-control-received",
+        "data.linkedReceiptNo":row.receiptNo,"data.linkedReceiptFy":financialYear,
+        "data.cashierHandoverId":String(movement._id),"data.status":"HANDOVER_REQUESTED"});
+      if(!linked)return fail(res,`Cheque ${row.receiptNo} has changed custody; repair its linked register before handover`,409);
+    }
+    const now=new Date();
+    // Custody is accepted at the moment Collector enters Cashier OTP. There is
+    // no second Confirm/Close Cashier action. This CAS cannot resurrect a
+    // handover cancelled via Cancel & Restart.
+    const verified=await SalespersonCashMovement.findOneAndUpdate(
+      {_id:movement._id,tenantKey:req.auth.tenantKey,financialYear,salespersonId:req.auth.sub,type:"HANDOVER",...unverifiedCashHandover},
+      {$set:{handoverOtpStatus:"VERIFIED",handoverOtpVerifiedAt:now,handoverWorkflowStatus:"RECEIVED",status:"APPROVED",
+        cashierReceivedAt:now,cashierReceivedBy:movement.recipientUserId,cashierReceivedByNameSnapshot:movement.recipientName,
+        verifiedBy:movement.recipientUserId,verifiedByNameSnapshot:movement.recipientName,verifiedAt:now},
+        $unset:{handoverOtpCode:""}},{new:true});
+    if(!verified)return fail(res,"Handover was cancelled or already verified; refresh Deposit to Cashier",409);
+    await Receipt.updateMany({_id:{$in:receiptIds},tenantKey:req.auth.tenantKey,financialYear,
+      cashDepositBatchId:String(verified._id),cashDepositStatus:"HANDOVER_PENDING"},{$set:{
+      cashDepositStatus:"DEPOSITED_TO_CASHIER",cashDepositedAt:now,cashDepositedBy:movement.recipientUserId,
+      cashDepositedByNameSnapshot:movement.recipientName,cashierOtpStatus:"VERIFIED",cashierOtpVerifiedAt:now,
+      cashierOtpVerifiedBy:movement.recipientUserId,cashierOtpVerifiedByNameSnapshot:movement.recipientName,
+      receiptWorkflowStatus:"WITH_CASHIER"}});
+    for(const row of chequeRows){
+      await GenericRecord.updateOne({tenantKey:req.auth.tenantKey,app:"dms",resource:"cheque-control-received",
+        "data.linkedReceiptNo":row.receiptNo,"data.linkedReceiptFy":financialYear,
+        "data.cashierHandoverId":String(verified._id),"data.status":"HANDOVER_REQUESTED"},
+        {$set:{"data.status":"WITH_CASHIER","data.custodyStatus":"WITH_CASHIER",
+          "data.cashierUserId":movement.recipientUserId,"data.cashierReceivedAt":now.toISOString(),
+          "data.statusDate":now.toISOString().slice(0,10)}});
+    }
+    return ok(res,{movementNo:verified.movementNo,status:"RECEIVED"},
+      "Cashier OTP verified: cash and cheques are now with Cashier. Ledger posting requires a separate authorized action.");
   } catch (error) { return fail(res, error.message, error.statusCode || 500); }
 });
 

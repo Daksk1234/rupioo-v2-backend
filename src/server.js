@@ -6,6 +6,8 @@ import { env } from "./config/env.js";
 import { connectDb } from "./config/db.js";
 import { warmFinancialStorageTenantKeyCache } from "./services/financialStorageTenantService.js";
 import { errorHandler } from "./middleware/error.js";
+import { invalidateCashbookAfterMutation } from "./services/cashbookSnapshotStore.js";
+import { invalidateFinancialYearDiscovery } from "./services/financialYearDiscoveryService.js";
 import { optionalAuth } from "./middleware/auth.js";
 import { companyPermissionGuard } from "./middleware/companyPermissionGuard.js";
 import authRoutes from "./routes/auth.js";
@@ -35,6 +37,7 @@ import registrationRoutes from "./routes/registration.js";
 import bankRoutes from "./routes/banks.js";
 import chequeControlRoutes, { chequeMobileRouter } from "./routes/cheques.js";
 import { dmsCollectionHubRouter, mobileCollectionHubRouter } from "./routes/collectionHub.js";
+import collectionWorkflowRoutes from "./routes/collectionWorkflow.js";
 import profileRoutes from "./routes/profile.js";
 import documentAiRoutes from "./routes/documentAi.js";
 import migrationRoutes from "./routes/migration.js";
@@ -83,6 +86,12 @@ app.use(cors({ origin: allowCorsOrigin, credentials: true }));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
+app.use((req,res,next)=>{
+  if(!['GET','HEAD','OPTIONS'].includes(req.method))res.on('finish',()=>{
+    if(req.auth?.tenantKey)invalidateFinancialYearDiscovery(req.auth.tenantKey);
+  });
+  invalidateCashbookAfterMutation(req,res,next);
+});
 app.get("/health", (_req, res) =>
   res.json({ ok: true, service: "rupioo-global-v2", time: new Date() }),
 );
@@ -160,6 +169,7 @@ app.use("/api/company", companyRoutes);
 app.use("/api/banks", bankRoutes);
 app.use("/api/cheques", chequeControlRoutes);
 app.use("/api/collection-hub", dmsCollectionHubRouter);
+app.use("/api/collection-workflow", collectionWorkflowRoutes);
 app.use("/api/catalog", catalogRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/employees", employeeRoutes);

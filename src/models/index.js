@@ -706,8 +706,10 @@ const companyProfileSchema = new Schema({
   // financialYear is retained as the default/current FY for legacy transaction flows.
   financialYear:String,
   financialYears:{type:[String],default:[]},
+  firstFinancialYear:{type:String,default:""},
   firstCashFinancialYear:{type:String,default:""},
   firstCashOpeningBalance:{type:Number,default:0},
+  chequeBounceCharge:{type:Number,default:0,min:0,max:100000},
   // Sales invoice number series configured by the company Superadmin.
   // Final format: PREFIX-NUMBER-SUFFIX. nextNumber is consumed atomically.
   salesInvoicePrefix:{type:String,default:""},

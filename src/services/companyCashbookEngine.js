@@ -46,7 +46,7 @@ export function buildCompanyCashbook({
   // provisional instead of silently losing the sale or double-counting it.
   if (enforceSourceDocuments) for (const invoice of invoices.values()) {
     const key = `SALES_INVOICE\0${String(invoice.invoiceNo)}`;
-    if (groups.has(key)) continue;
+    if (groups.has(key)||groups.has(`CASH_SALE\0${String(invoice.invoiceNo)}`)) continue;
     groups.set(key, {
       _id: `MISSING-CASH-JOURNAL:${invoice._id || invoice.invoiceNo}`,
       transactionId: String(invoice.invoiceNo), transactionType: 'SALES_INVOICE',
@@ -106,13 +106,14 @@ export function buildCompanyCashbook({
         issue = 'CASH sales invoice missing its posted SYS_CASH journal; projected sale requires accounting repair';
       } else if (originalNet < -0.005 || selfOffset || (invoice && !same(invoice.grandTotal, originalNet))) {
         issue = 'Cash sales invoice amount/direction differs from posted cash journal';
-        category = 'REVIEW';
+        if(invoice)credit=money(invoice.grandTotal);
+        else category = 'REVIEW';
       } else { credit = Math.max(0, originalNet); }
     } else if (kind === 'RECEIPT') {
       category = receipt?.collectionSource === 'SALESPERSON_APP' ? 'CASHIER_RECEIPT' : 'CASH_RECEIPT';
       // Keep the operator/imported narration as the primary particulars.
       // Voucher classification and party already have their own columns.
-      particular = String(receipt?.remarks || '').trim() || String(row.remarks || '').trim() ||
+      particular = (String(receipt?.remarks || '').trim()?receipt.remarks:'') || row.remarks ||
         String(receipt?.partyNameSnapshot || row.partyGlobalId || row.transactionId);
       if (enforceSourceDocuments && !validReceipt) {
         issue = 'Receipt was deleted, voided, or is not a posted CASH receipt; reconcile its orphan journal'; category = 'REVIEW';
@@ -136,7 +137,7 @@ export function buildCompanyCashbook({
       }
     } else if (kind === 'PAYMENT') {
       category = 'CASH_PAYMENT';
-      particular = String(payment?.remarks || '').trim() || String(row.remarks || '').trim() ||
+      particular = (String(payment?.remarks || '').trim()?payment.remarks:'') || row.remarks ||
         String(payment?.partyNameSnapshot || row.partyGlobalId || row.transactionId);
       if (enforceSourceDocuments && !validPayment) {
         issue = 'Payment was deleted, voided, or is not a posted CASH payment; reconcile its orphan journal'; category = 'REVIEW';
@@ -179,9 +180,53 @@ export function buildCompanyCashbook({
       voucherId:kind === 'PAYMENT' && validPayment ? String(payment._id || '') :
         kind === 'RECEIPT' && validReceipt && receipt.receiptWorkflowStatus === 'DMS_DIRECT' ? String(receipt._id || '') : '',
       partyName:payment?.partyNameSnapshot || receipt?.partyNameSnapshot || invoice?.customerNameSnapshot || '',
-      remarks:row.remarks || payment?.remarks || receipt?.remarks || '',
+      remarks:payment?.remarks ?? receipt?.remarks ?? row.remarks ?? '',
       type:credit > 0 ? 'RECEIPT' : debit > 0 ? 'PAYMENT' : 'REVIEW' });
   }
+  // Some historical CASH sales were journalled both on the invoice and on
+  // its explicit settlement receipt. Preserve both source documents, count
+  // only their common physical cash once, and surface the journal discrepancy
+  // through integrity metadata. Equal dates/amounts alone never imply a match.
+  const salesByNo=new Map(),salesById=new Map(),recognizedSales=new Map();
+  for(const row of rows){
+    if(row.category!=='CASH_SALE'||row.credit<=0)continue;
+    const inv=invoices.get(row.transactionId);
+    if(!inv)continue;
+    const available=Math.max(0,money(inv.grandTotal-(recognizedSales.get(String(inv.invoiceNo))||0)));
+    if(row.credit>available){
+      row.credit=available;row.cashNetMovement=money(row.credit-row.debit);
+      row.needsCorrection=true;row.journalCorrectionPending=true;
+      row.correctionMessage='Duplicate journal source for the same system-CASH sales invoice; recognized once';
+      issues.push({transactionId:row.transactionId,transactionType:row.transactionType,message:row.correctionMessage});
+    }
+    recognizedSales.set(String(inv.invoiceNo),money((recognizedSales.get(String(inv.invoiceNo))||0)+row.credit));
+    if(row.credit<=0)continue;
+    const sale={row,invoice:inv,remaining:row.credit};
+    salesByNo.set(String(inv.invoiceNo),sale);
+    if(inv._id)salesById.set(String(inv._id),sale);
+  }
+  for(const row of rows){
+    if(upper(row.transactionType)!=='RECEIPT'||row.credit<=0)continue;
+    const receipt=receiptByNo.get(row.transactionId);
+    if(!validCashParties.has(String(receipt?.customerGlobalId)))continue;
+    let available=row.credit,duplicate=0;
+    for(const allocation of receipt.againstInvoices||[]){
+      const byId=salesById.get(String(allocation.invoiceId||'')),byNo=salesByNo.get(String(allocation.invoiceNo||''));
+      if(byId&&byNo&&byId!==byNo)continue;
+      const sale=byId||byNo;
+      if(!sale||String(sale.invoice.customerGlobalId)!==String(receipt.customerGlobalId))continue;
+      const overlap=Math.max(0,Math.min(available,money(allocation.amount),sale.remaining));
+      duplicate=money(duplicate+overlap);available=money(available-overlap);sale.remaining=money(sale.remaining-overlap);
+    }
+    if(duplicate>0){
+      row.credit=money(row.credit-duplicate);row.cashNetMovement=money(row.credit-row.debit);
+      row.duplicateCashSettlementAmount=duplicate;row.needsCorrection=true;row.journalCorrectionPending=true;
+      row.correctionMessage='Receipt settlement duplicates cash already recognized on its system-CASH invoice; journal review required';
+      issues.push({transactionId:row.transactionId,transactionType:'RECEIPT',message:row.correctionMessage});
+    }
+  }
+  running=money(openingBalance);
+  for(const row of rows){running=cashClosingBalance(running,row);row.runningBalance=running;}
   const totals = rows.reduce((summary,row) => {
     const label = row.category;
     const previous = summary[label] || {count:0,received:0,paid:0};

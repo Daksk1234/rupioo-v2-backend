@@ -1,5 +1,5 @@
 import { cashClosingBalance } from './cashbookBalanceMath.js';
-import { cashBulkMode } from './cashBulkPartyMatcher.js';
+import { cashBulkMode, cashBulkAmount } from './cashBulkPartyMatcher.js';
 /* Cashbook statement import: business display convention OUT=Debit, IN=Credit.
  * Auto-detection is rule based, not an unreviewed AI financial posting.
  */
@@ -17,42 +17,39 @@ const categoryHint=text=>{
  if(/purchase invoice|cash purchase/i.test(text))return 'Cash Purchases (link invoice before accounting)';
  return '';
 };
-const amount=x=>{
- const raw=clean(x).replace(/,/g,'').replace(/₹|Rs\.?/gi,'').replace(/\s/g,'');
- if(!raw)return 0;
- const n=Number(raw.replace(/^\((.*)\)$/,'-$1'));
- if(!Number.isFinite(n)||n<0)throw new Error('Debit/Credit must be non-negative numeric amounts');
- return Math.round(n*100)/100;
-};
 export const cashbookHeaders=['Date','Party Name','Remarks','Mode','Debit','Credit'];
 export function readCashbookRows(rows){
  if(!Array.isArray(rows)||!rows.length)throw new Error('No Cashbook entries found');
  const spec=[{key:'date',label:'Date',required:true},{key:'particulars',label:'Remarks',aliases:['particulars','narration','description','remark'],required:true},
   {key:'debit',label:'Debit',required:true},{key:'credit',label:'Credit',required:true},
-  {key:'mode',label:'Mode'},{key:'running',label:'Running Balance'},
-  {key:'partyName',label:'Party Name',aliases:['party','payee']},
+  {key:'mode',label:'Mode',required:true},
+  {key:'partyName',label:'Party Name',aliases:['party','payee'],required:true},
   {key:'partyType',label:'Party Type'}];
  const cols=resolveColumns(rows[0],spec);
  const missing=spec.filter(x=>x.required&&!cols[x.key]).map(x=>x.label);
  if(missing.length)throw new Error(`Missing columns: ${missing.join(', ')}`);
  return rows.map((row,i)=>{
+  const rowNo=Number.isInteger(row.__rowNum__)?row.__rowNum__+1:i+2;
+  const original={date:clean(valueFor(row,cols.date)),particulars:String(row[cols.particulars]??''),
+    debit:row[cols.debit]??'',credit:row[cols.credit]??'',mode:clean(valueFor(row,cols.mode)),
+    partyName:clean(valueFor(row,cols.partyName)),partyType:clean(valueFor(row,cols.partyType)).toUpperCase()};
   try{
    const dateText=clean(valueFor(row,cols.date));
    const iso=parseStrictVoucherDate(dateText).toISOString().slice(0,10);
-   const particulars=clean(valueFor(row,cols.particulars));
-   if(!particulars||particulars.length>500)throw new Error('Remarks is required (maximum 500 characters)');
+   const particulars=String(row[cols.particulars]??'');
+   if(!particulars.trim()||particulars.length>2000)throw new Error('Remarks is required (maximum 2,000 characters)');
    const mode=cashBulkMode(valueFor(row,cols.mode));
-   const debit=amount(valueFor(row,cols.debit));
-   const credit=amount(valueFor(row,cols.credit));
+   const debit=cashBulkAmount(valueFor(row,cols.debit));
+   const credit=cashBulkAmount(valueFor(row,cols.credit));
    if((debit>0)===(credit>0))throw new Error('Enter an amount in exactly one of Debit or Credit');
-   return {rowNo:i+2,date:iso,particulars,mode,debit,credit,
+   return {rowNo,date:iso,particulars,mode,debit,credit,
     transactionType:debit>0?'PAYMENT':'RECEIPT',amount:debit||credit,
     partyName:clean(valueFor(row,cols.partyName)),partyType:clean(valueFor(row,cols.partyType)).toUpperCase(),
     requiresContra:isContraNarration(particulars),categoryHint:categoryHint(particulars),
     bankWarning:isContraNarration(particulars)?'Possible transfer between Cash and company Bank: use Contra instead of this bulk voucher':
       /\b(NEFT|RTGS|IMPS|UPI)\b/i.test(particulars)?'Bank transfer mentioned: verify this was physically CASH before posting':'',
    };
-  }catch(e){return {rowNo:i+2,error:e.message};}
+  }catch(e){return {...original,rowNo,error:e.message};}
  });
 }
 export function balancePreview(rows,opening){

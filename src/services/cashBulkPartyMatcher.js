@@ -4,7 +4,7 @@
  * Never guess a customer ledger from a partial or ambiguous narration.
  */
 export const normalizeCashPartyName = value => String(value ?? "")
-  .normalize('NFKC').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim().replace(/\s+/g,' ');
+  .normalize('NFKC').toUpperCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g,' ');
 const excluded = new Set(['CASH','BANK','OTHER','GENERAL','ACCOUNT','SUSPENSE','PAYMENT','RECEIPT']);
 const allowedName = name => name.length >= 4 && !excluded.has(name);
 
@@ -13,10 +13,11 @@ export function detectCashBulkParty({partyName='',remarks=''},directory=[]){
   const text=normalizeCashPartyName(remarks);
   const names=(directory||[]).flatMap(p=>[p.name,...(p.aliases||[])].map(alias=>({
     ...p,nameKey:normalizeCashPartyName(alias)
-  }))).filter(x=>allowedName(x.nameKey));
+  })));
   const unique = found => [...new Map(found.map(x=>[`${x.type}:${x.id}`,x])).values()];
   if(explicit){
-    const exact=unique(names.filter(p=>p.nameKey===explicit || normalizeCashPartyName(p.id)===explicit));
+    const exact=unique(names.filter(p=>!excluded.has(p.nameKey) &&
+      (p.nameKey===explicit || normalizeCashPartyName(p.id)===explicit)));
     if(exact.length===1)return {...exact[0],confidence:'EXACT_NAME'};
     // A supplied Party Name is authoritative. Never overwrite it with a
     // different party found in Remarks; unresolved names go to Suspense.
@@ -24,7 +25,7 @@ export function detectCashBulkParty({partyName='',remarks=''},directory=[]){
   }
   if(!text)return null;
   const padded=` ${text} `;
-  const candidates=unique(names.filter(p=>padded.includes(` ${p.nameKey} `)));
+  const candidates=unique(names.filter(p=>allowedName(p.nameKey) && padded.includes(` ${p.nameKey} `)));
   // Distinct parties mentioned in the same narration: cannot know which
   // is the counterparty. A more specific alias of the SAME party is fine.
   if(candidates.length!==1)return null;

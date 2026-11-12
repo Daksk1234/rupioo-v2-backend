@@ -9,7 +9,9 @@ import { sendBusinessEmail } from "../services/mailService.js";
 import { buildLedgerPdf } from "../services/simplePdfService.js";
 import XLSX from "xlsx";
 import PDFDocument from "pdfkit";
-import { buildGstReport } from "../services/gstReportsService.js";
+import { buildGstReport, buildGstReportBundle } from "../services/gstReportsService.js";
+import { createFullGstWorkbook } from "../services/gstReportExportService.js";
+import { gstReportPeriod } from "../utils/gstReportPeriod.js";
 import { resolveFinancialYear } from "../utils/financialYear.js";
 import { buildLegacyReport, legacyReportCatalog, legacyReportKind } from "../services/legacyReportsService.js";
 import { buildV2LiveReport, v2LiveReportCatalog, v2LiveReportKind } from "../services/v2LiveReportsService.js";
@@ -633,11 +635,21 @@ async function partyLedgerRows({ tenantKey, financialYear, partyGlobalId }) {
 }
 
 
-const gstReportArgs = async (req) => ({
-  tenantKey: req.auth.tenantKey,
-  financialYear: await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear}),
-  startDate: String(req.query.startDate || "").trim(),
-  endDate: String(req.query.endDate || "").trim(),
+const gstReportArgs = async (req) => {
+  const financialYear = await resolveFinancialYear({tenantKey:req.auth.tenantKey,requested:req.query.financialYear});
+  return {tenantKey:req.auth.tenantKey,financialYear,...gstReportPeriod(financialYear,String(req.query.startDate||'').trim(),String(req.query.endDate||'').trim())};
+};
+
+router.get('/gst-full-export.xlsx', async (req,res) => {
+  try {
+    const args=await gstReportArgs(req);
+    const bundle=await buildGstReportBundle(args);
+    const workbook=createFullGstWorkbook(bundle,args);
+    const buffer=XLSX.write(workbook,{type:'buffer',bookType:'xlsx'});
+    res.setHeader('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition',`attachment; filename="GST_Full_Report_${args.startDate}_${args.endDate}.xlsx"`);
+    return res.send(buffer);
+  } catch(error) { return fail(res,error.message,error.statusCode||500); }
 });
 
 router.get("/gst/:kind", async (req, res) => {

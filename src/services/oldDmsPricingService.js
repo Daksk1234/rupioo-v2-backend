@@ -173,7 +173,7 @@ export async function recalculateAllProductsForGrades(tenantKey) {
     const config=product.priceListSettings;
     if(config?.enabled){
       const grade=grades.find(g=>String(g.code)===String(config.targetGradeCode))||grades.reduce((best,g)=>!best||g.discountPct>best.discountPct?g:best,null);
-      const calculated=calculateDynamicPrice({mode:config.mode,salePrice:config.salePrice,mrp:config.mrp,gstRate:product.gstRate,gradePct:grade?.discountPct||0,rules,overrides:config.discountOverrides||{}});
+      const calculated=calculateDynamicPrice({mode:config.mode,salePrice:config.salePrice,mrp:config.mrp,gstRate:product.gstRate,gradePct:grade?.discountPct||0,rules,overrides:config.discountOverrides||{},pricingStyle:config.pricingStyle||"LEGACY"});
       return {updateOne:{filter:{_id:product._id,tenantKey},update:{$set:{mrp:calculated.mrp,salePrice:calculated.salePrice,"priceListSettings.mrp":calculated.mrp,"priceListSettings.salePrice":calculated.salePrice,maxGradeDiscountPct:maxDiscount}}}};
     }
     const cost = costBaseOf(product);

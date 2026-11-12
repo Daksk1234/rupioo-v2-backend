@@ -1,8 +1,8 @@
 import {financialModels} from './accountingService.js';
 import {BankAccount} from '../models/index.js';
-import {buildCompanyCashbook} from './companyCashbookEngine.js';
-import {loadCompanyCashbookSources} from './companyCashbookSources.js';
+import {loadCashbookSourceRows,buildCashbookView} from './cashbookViewService.js';
 import {cashKey} from './superadminBookCorrectionRules.js';
+import {loadBankJournalRows} from './bankJournalProjection.js';
 const money=n=>Math.round((Number(n)||0)*100)/100;
 const error=(message,statusCode=409)=>Object.assign(new Error(message),{statusCode});
 const asDate=d=>new Date(d);
@@ -10,16 +10,24 @@ const asDate=d=>new Date(d);
 export async function resolveSuperadminBookSource({tenantKey,financialYear,book,sourceKey}){
  const models=financialModels(tenantKey,financialYear);
  if(book==='CASH'){
-   const lines=await models.LedgerEntry.find({tenantKey,financialYear,status:'POSTED',accountCode:'SYS_CASH',transactionType:{$ne:'SUPERADMIN_BOOK_ADJUSTMENT'}})
-    .select('_id transactionId transactionType date createdAt partyGlobalId debit credit narration').lean();
-   const sources=await loadCompanyCashbookSources({tenantKey,financialYear,lines});
-   const projected=buildCompanyCashbook({lines,...sources,openingBalance:0,enforceSourceDocuments:true});
+   const sources=await loadCashbookSourceRows({tenantKey,financialYear});
+   const projected=buildCashbookView(sources);
    const row=projected.rows.find(x=>cashKey(x)===sourceKey);
    if(!row)throw error('Cashbook entry not found or no longer active',404);
    return {row,transactionId:String(row.transactionId),transactionType:String(row.transactionType),
       bankAccountId:'',accountCode:'SYS_CASH',ledgerId:'',originalDate:asDate(row.date),
       originalCredit:money(row.credit),originalDebit:money(row.debit),
       originalRemarks:row.particular||row.remarks||'',originalPartyName:row.partyName||''};
+ }
+ if(String(sourceKey).startsWith('JRN:')){
+   const row=(await loadBankJournalRows({tenantKey,financialYear})).find(row=>row._listId===sourceKey);
+   if(!row)throw error('Posted bank journal entry not found',404);
+   const bank=await BankAccount.findOne({tenantKey,bankAccountId:row.bankAccountId,status:{$ne:'DELETED'}}).lean();
+   if(!bank)throw error('Source bank account missing');
+   return {row,kind:'JRN',transactionId:row.transactionId,transactionType:row.journalTransactionType,bankAccountId:row.bankAccountId,
+     accountCode:['OD','CC'].includes(String(bank.accountType||'').toUpperCase())?'SYS_BANK_OD':'SYS_BANK_ACCOUNT',ledgerId:bank.ledgerId||'',
+     originalDate:asDate(row.date),originalCredit:money(row.credit),originalDebit:money(row.debit),
+     originalRemarks:row.remarks||'',originalPartyName:row.matchedPartyName||''};
  }
  const parts=String(sourceKey).split(':');const [kind,id,accountFromKey]=parts;
  const modelsByType={BST:models.BankStatementRow,RCT:models.Receipt,PAY:models.Payment,CTR:models.ContraVoucher,BTR:models.BankTransfer};
@@ -34,7 +42,8 @@ export async function resolveSuperadminBookSource({tenantKey,financialYear,book,
    partyName=record.matchedPartyName||record.partyName||'';
  }else if(kind==='RCT'){
    if(record.status!=='POSTED'||record.mode==='CASH')throw error('Not a posted BANK receipt');
-   bankAccountId=record.bankAccountId;credit=record.amount;transactionId=record.receiptNo;transactionType='RECEIPT';partyName=record.partyNameSnapshot||'';
+   bankAccountId=record.bankAccountId;credit=record.amount;transactionId=record.bankLedgerTransactionId||record.receiptNo;
+   transactionType=record.bankLedgerTransactionId&&record.bankLedgerTransactionId!==record.receiptNo?'CHEQUE_CLEARING':'RECEIPT';partyName=record.partyNameSnapshot||'';
  }else if(kind==='PAY'){
    if(record.status!=='POSTED'||record.mode==='CASH')throw error('Not a posted BANK payment');
    bankAccountId=record.bankAccountId;debit=record.amount;transactionId=record.paymentNo;transactionType='PAYMENT';partyName=record.partyNameSnapshot||'';
@@ -52,7 +61,7 @@ export async function resolveSuperadminBookSource({tenantKey,financialYear,book,
  if(!bank)throw error('Source bank account missing');
  return {row:record,kind,transactionId,transactionType,bankAccountId,
    accountCode:['OD','CC'].includes(String(bank.accountType||'').toUpperCase())?'SYS_BANK_OD':'SYS_BANK_ACCOUNT',
-   ledgerId:bank.ledgerId||'',originalDate:asDate(record.date),originalCredit:money(credit),originalDebit:money(debit),
+   ledgerId:bank.ledgerId||'',originalDate:asDate(kind==='RCT'?record.chequeBankReceivedDate||record.date:record.date),originalCredit:money(credit),originalDebit:money(debit),
    originalRemarks:record.remarks||'',originalPartyName:partyName||'',source:record};
 }
 

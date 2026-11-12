@@ -257,7 +257,7 @@ router.get("/old-dms-price-list/products", async (req, res) => {
           mrp:settings.mrp ?? product.mrp,
           gstRate:product.gstRate,
           gradePct:selectedGrade?.discountPct||0,
-          rules:discountRules,overrides:settings.discountOverrides||{},
+          rules:discountRules,overrides:settings.discountOverrides||{},pricingStyle:settings.pricingStyle||"LEGACY",
         });
       } catch(e) { console.error("Price List manual price invalid",String(product._id),e.message); }
     }
@@ -302,10 +302,10 @@ router.get("/old-dms-price-list/products", async (req, res) => {
         name: grade.name,
         discountPct: Number(grade.discountPct || 0),
         basicRate: manualPrice
-          ? calculateDynamicPrice({mode:"MRP_TO_SALE",mrp:manualPrice.mrp,gstRate:product.gstRate,gradePct:grade.discountPct,rules:discountRules,overrides:settings.discountOverrides||{}}).salePrice
+          ? calculateDynamicPrice({mode:"MRP_TO_SALE",mrp:manualPrice.mrp,gstRate:product.gstRate,gradePct:grade.discountPct,rules:discountRules,overrides:settings.discountOverrides||{},pricingStyle:settings.pricingStyle||"LEGACY"}).salePrice
           : gradeBasicFromMrp(priced.mrp, priced.gstRate, grade.discountPct),
         saleIncludingGst: manualPrice
-          ? calculateDynamicPrice({mode:"MRP_TO_SALE",mrp:manualPrice.mrp,gstRate:product.gstRate,gradePct:grade.discountPct,rules:discountRules,overrides:settings.discountOverrides||{}}).saleIncludingGst
+          ? calculateDynamicPrice({mode:"MRP_TO_SALE",mrp:manualPrice.mrp,gstRate:product.gstRate,gradePct:grade.discountPct,rules:discountRules,overrides:settings.discountOverrides||{},pricingStyle:settings.pricingStyle||"LEGACY"}).saleIncludingGst
           : gradeSaleIncludingGstFromMrp(priced.mrp, grade.discountPct),
       })),
       lossStatus: minimumSalePrice > 0 && landedPrice > 0 && minimumSalePrice < landedPrice,
@@ -345,7 +345,7 @@ router.put("/old-dms-price-list/products/:id/manual",async(req,res)=>{
   const mode=upper(body.mode||"SALE_TO_MRP");
   if(!["SALE_TO_MRP","MRP_TO_SALE"].includes(mode))return fail(res,"Choose a valid pricing direction",400);
   const gstRate=Number(body.gstRate??product.gstRate??0);
-  const salePrice=Number(body.salePrice ?? product.salePrice ?? 0);
+  const salePrice=Number(mode === "SALE_TO_MRP" ? (body.minimumSalePrice ?? body.salePrice ?? product.salePrice ?? 0) : (body.salePrice ?? product.salePrice ?? 0));
   const mrp=Number(body.mrp ?? product.mrp ?? 0);
   const landedCost=Number(body.landedCost??product.landedCost??0);
   const manualMin=Number(body.minimumSalePrice??0);
@@ -363,7 +363,7 @@ router.put("/old-dms-price-list/products/:id/manual",async(req,res)=>{
     discountOverrides[rule.code]={percent:number,enabled:rule.mode==="FIXED"?true:value.enabled!==false};
   }
   let result;
-  try{result=calculateDynamicPrice({mode,salePrice,mrp,gstRate,gradePct:selected?.discountPct||0,rules,overrides:discountOverrides});}
+  try{result=calculateDynamicPrice({mode,salePrice,mrp,gstRate,gradePct:selected?.discountPct||0,rules,overrides:discountOverrides,pricingStyle:"ADDITIVE_V2"});}
   catch(e){return fail(res,e.message,400);}
   if(result.salePrice===0&&result.mrp===0)return fail(res,"Enter a sale price or MRP greater than zero",400);
   product.gstRate=gstRate;
@@ -372,9 +372,9 @@ router.put("/old-dms-price-list/products/:id/manual",async(req,res)=>{
   product.salePrice=result.salePrice;
   if(body.name!==undefined){const name=cleanText(body.name);if(!name)return fail(res,"Product name required",400);product.name=name;}
   if(body.sku!==undefined){const sku=cleanText(body.sku);if(!sku)return fail(res,"SKU required",400);product.sku=sku;}
-  product.priceListSettings={enabled:true,mode, salePrice:result.salePrice,mrp:result.mrp,
+  product.priceListSettings={enabled:true,mode,pricingStyle:"ADDITIVE_V2", salePrice:result.salePrice,mrp:result.mrp,
     targetGradeCode:selected?.code||"",discountOverrides,
-    ...(manualMin>0?{minimumSalePrice:manualMin}:{}),updatedBy:String(req.auth.sub||""),updatedAt:new Date()};
+    minimumSalePrice:result.salePrice,updatedBy:String(req.auth.sub||""),updatedAt:new Date()};
   try{await product.save();}catch(e){return fail(res,e?.code===11000?"SKU already exists":e.message,400);}
   return ok(res,{id:product._id,price:result},"Price List updated");
 });

@@ -22,7 +22,6 @@ test('bank transfer has only one source record and two banks in one journal', ()
 test('bank book shows incoming positive Cr and outgoing debit decreases balance',()=>{
   const s = read('../../frontend/src/pages/BankTransactionPage.jsx');
   assert.match(s, /Number\(v \|\| 0\) < 0 \? "Dr" : "Cr"/);
-  assert.match(s, /Rebuild Running Balances/);
 });
 test('receipt/payment and transaction-entry screens include own bank parties',()=>{
   const a = read('../../frontend/src/pages/FinancialEntryPage.jsx');

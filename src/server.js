@@ -3,6 +3,7 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import { env } from "./config/env.js";
+import {COLLECTOR_WORKFLOW_VERSION} from './services/collectorWorkflowVersion.js';
 import { connectDb } from "./config/db.js";
 import { warmFinancialStorageTenantKeyCache } from "./services/financialStorageTenantService.js";
 import { errorHandler } from "./middleware/error.js";
@@ -93,10 +94,10 @@ app.use((req,res,next)=>{
   invalidateCashbookAfterMutation(req,res,next);
 });
 app.get("/health", (_req, res) =>
-  res.json({ ok: true, service: "rupioo-global-v2", time: new Date() }),
+  res.json({ ok: true, service: "rupioo-global-v2", collectorWorkflowVersion:COLLECTOR_WORKFLOW_VERSION, time: new Date() }),
 );
 app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, service: "rupioo-global-v2", time: new Date() }),
+  res.json({ ok: true, service: "rupioo-global-v2", collectorWorkflowVersion:COLLECTOR_WORKFLOW_VERSION, time: new Date() }),
 );
 app.use("/api/auth", authRoutes);
 app.use("/api/registration", registrationRoutes);

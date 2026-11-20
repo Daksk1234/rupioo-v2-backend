@@ -19,6 +19,8 @@ import { streamSbiDepositSlipPDF } from '../services/chequeDepositSlipPdf.js';
 import { syncChequeForReceipt } from '../services/collectionHubService.js';
 import { receivedChequeDeleteBlocker } from '../services/receivedChequeDeleteRules.js';
 import { postCustodyApprovedReceipt } from '../services/salespersonReceiptWorkflowService.js';
+import {collectorTerritoryFilter,customerCollectionPincodes} from '../services/collectorTerritoryService.js';
+import {collectionConfirmationFilter} from '../services/collectionHubRules.js';
 
 const router = express.Router();
 router.use(requireAuth);
@@ -279,13 +281,13 @@ const eventOf=(status,auth,reason='')=>latestEvent(status,auth,reason);
 const resolvedCustomer=async(tenantKey,id)=>{
   if(!clean(id))return null;
   const customer=await CustomerLink.findOne({tenantKey,globalCustomerId:clean(id),status:{$ne:'INACTIVE'}})
-    .select('globalCustomerId localName displayIdentifier accountingProfile salespersonId').lean();
+    .select('globalCustomerId localName displayIdentifier accountingProfile salespersonId addresses registrationMeta').lean();
   if(!customer){const e=new Error('Select a linked customer from the company customer master before ledger posting');e.statusCode=409;throw e;}
   return customer;
 };
 const checkReceiver=async(auth)=>{
   const user=await User.findOne({_id:auth.sub,tenantKey:auth.tenantKey,status:'ACTIVE',loginEnabled:true})
-    .select('name role designation accountType collectorCustomerIds').lean();
+    .select('name role designation accountType collectorPincodes').lean();
   if(!user)throw Object.assign(new Error('Your company user account is inactive'),{statusCode:403});
   return user;
 };
@@ -328,7 +330,7 @@ async function createReceived(req,res){
   if(d.customerGlobalId){
     const customer=await resolvedCustomer(req.auth.tenantKey,d.customerGlobalId);
     if(mobile&&(isChequeSalesperson(role)&&clean(customer.salespersonId)!==clean(req.auth.sub)))return fail(res,'Cheque customer is not assigned to this salesperson',403);
-    if(mobile&&isChequeCollector(role)){const me=await checkReceiver(req.auth);if(!(me.collectorCustomerIds||[]).map(String).includes(d.customerGlobalId))return fail(res,'Cheque customer is not assigned to this collector',403);}
+    if(mobile&&isChequeCollector(role)){const me=await checkReceiver(req.auth);if(!customerCollectionPincodes(customer).some(pin=>(me.collectorPincodes||[]).includes(pin)))return fail(res,'Cheque customer is outside your assigned pincodes',403);}
   }
   if(d.linkedBankTransactionId){
     const reusedBank=await GenericRecord.exists({...source(req.auth.tenantKey,RECEIVED),'data.linkedBankTransactionId':d.linkedBankTransactionId,'data.status':{$nin:['CANCELLED','LOST']}});
@@ -366,7 +368,7 @@ router.get('/received/parties',access('view'),safe(async(req,res)=>{
 mobileRouter.get('/received/parties',mobileAuth,safe(async(req,res)=>{
   const self=await checkReceiver(req.auth),filter={tenantKey:req.auth.tenantKey,status:{$ne:'INACTIVE'}};
   if(isChequeSalesperson(req.auth.role))filter.salespersonId=clean(req.auth.sub);
-  if(isChequeCollector(req.auth.role))filter.globalCustomerId={$in:(self.collectorCustomerIds||[]).map(String)};
+  if(isChequeCollector(req.auth.role))Object.assign(filter,collectorTerritoryFilter(self.collectorPincodes));
   const items=await CustomerLink.find(filter).select('globalCustomerId localName displayIdentifier').limit(150).lean();
   return ok(res,{items:items.map(x=>({id:x.globalCustomerId,name:x.localName||x.displayIdentifier||x.globalCustomerId}))});
 }));
@@ -528,7 +530,7 @@ router.get('/company-received',access('view'),safe(async(req,res)=>{
       {'data.linkedReceiptFy':fy},{'data.receivedDate':{$gte:start,$lt:end}}
     ]}).sort({'data.receivedDate':-1,_id:-1}).limit(5000).lean(),
     Receipt.find({tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',
-      mode:{$ne:'CASH'},customerOtpStatus:'VERIFIED',status:'POSTED'})
+      mode:{$ne:'CASH'},$and:[collectionConfirmationFilter],status:'POSTED'})
       .sort({date:-1,_id:-1}).limit(5000).lean()
   ]);
   const byReceipt=new Map();
@@ -554,7 +556,8 @@ router.get('/company-received',access('view'),safe(async(req,res)=>{
   for(const receipt of receipts){
     const type=(clean(receipt.receiptType).toUpperCase()==='CHEQUE'||clean(receipt.mode).toUpperCase()==='CHEQUE')?'CHEQUE':clean(receipt.mode).toUpperCase()==='CASH'?'CASH':'ONLINE';
     if(type==='CASH')continue; // Cash is shown ONLY in Cashier / Pending Handover.
-    if(type==='CHEQUE'&&receipt.collectionSource==='SALESPERSON_APP'&&clean(receipt.chequeApprovalStatus)!=='APPROVED')continue; // visible only after cashier day close or approved legacy bundle
+    // Customer-verified instruments are visible immediately; custody/Accounts
+    // approval still controls deposit and ledger actions in the workflow.
     const base={entryType:type,receiptBacked:true,receiptId:String(receipt._id),receiptNo:receipt.receiptNo,
       collectedBy:receipt.collectedBySalespersonNameSnapshot||receipt.createdByNameSnapshot||'',
       date:receipt.date,amount:Number(receipt.amount||0),customerGlobalId:receipt.customerGlobalId||'',

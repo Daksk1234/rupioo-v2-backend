@@ -98,7 +98,9 @@ const userSchema = new Schema({
   // Sales hierarchy geography. Sales Heads keep their territory/coverage here;
   // Sales Person customer ownership continues to use PincodeAssignment.
   coveragePincodes: { type: [String], default: [] },
-  // Explicit customer assignments for Collector mobile role (tenant-scoped).
+  // Collection territory is independent of salesperson ownership.
+  collectorPincodes: { type: [String], default: [], index: true },
+  // Retained only as historical data; never used for collector access.
   collectorCustomerIds: { type: [String], default: [] },
   branchId: { type: Schema.Types.ObjectId, ref: "BranchOffice", index: true },
   salary: { type: Number, default: 0 },
@@ -411,6 +413,7 @@ const customerLinkSchema = new Schema({
 customerLinkSchema.index({ tenantKey: 1, globalCustomerId: 1 }, { unique: true });
 customerLinkSchema.index({ tenantKey: 1, systemKey: 1 }, { unique: true, partialFilterExpression: { systemKey: { $type: "string" } } });
 customerLinkSchema.index({ tenantKey:1, status:1, salespersonId:1, territoryId:1 });
+customerLinkSchema.index({ tenantKey:1, status:1, 'addresses.pincode':1 });
 
 const pincodeSchema = new Schema({
   pincode: { type: String, required: true, index: true },
@@ -1451,3 +1454,7 @@ export const CustomerPromotion = mongoose.model("CustomerPromotion", customerPro
 export const LegacyMigrationMap = mongoose.model("LegacyMigrationMap", legacyMigrationMapSchema);
 export const LegacyMigrationRun = mongoose.model("LegacyMigrationRun", legacyMigrationRunSchema);
 export const LegacyMigrationItem = mongoose.model("LegacyMigrationItem", legacyMigrationItemSchema);
+const collectionClaimSchema=new Schema({tenantKey:{type:String,required:true},canonicalKey:{type:String,required:true},
+ receiptId:String,receiptFinancialYear:String,expiresAt:Date,status:{type:String,default:'ACTIVE'},collectorId:String},{timestamps:true});
+collectionClaimSchema.index({tenantKey:1,canonicalKey:1},{unique:true});
+export const CollectionClaim=mongoose.model('CollectionClaim',collectionClaimSchema);

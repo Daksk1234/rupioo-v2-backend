@@ -8,7 +8,7 @@ import { isAdminAuth } from '../utils/adminAccess.js';
 import { canPageAction } from '../config/permissionPageMap.js';
 import { ok, fail } from '../utils/http.js';
 import { syncChequeForReceipt, RECEIVED_RESOURCE } from '../services/collectionHubService.js';
-import { collectionChannel, onlineCollectionStatus, referenceKey, matchesPostedBankCredit } from '../services/collectionHubRules.js';
+import { collectionChannel, onlineCollectionStatus, referenceKey, matchesPostedBankCredit,collectionConfirmationFilter } from '../services/collectionHubRules.js';
 
 const clean = v => String(v ?? '').trim();
 const financialYear = async req => {
@@ -28,7 +28,7 @@ async function fetchVerifiedReceipts(req,{mobile=false, channel='', verified=tru
   const fy = await financialYear(req);
   const { Receipt } = financialModels(req.auth.tenantKey,fy);
   const filter = {tenantKey:req.auth.tenantKey,financialYear:fy, collectionSource:'SALESPERSON_APP', status:{$nin:['DELETED','VOIDED']}};
-  if(verified){ filter.customerOtpStatus='VERIFIED'; filter.status='POSTED'; }
+  if(verified){ filter.$and=[collectionConfirmationFilter]; filter.status='POSTED'; }
   if(channel==='CASH')filter.mode='CASH';
   if(channel==='CHEQUE')filter.$or=[{receiptType:{$in:['CHEQUE','CHECK','CHQ']}},{mode:{$in:['CHEQUE','CHECK','CHQ']}}];
   if(channel==='ONLINE'){filter.mode={$nin:['CASH','CHEQUE','CHECK','CHQ']};filter.receiptType={$nin:['CHEQUE','CHECK','CHQ']};}
@@ -39,7 +39,8 @@ async function fetchVerifiedReceipts(req,{mobile=false, channel='', verified=tru
     date:r.date,partyName:r.partyNameSnapshot,customerGlobalId:r.customerGlobalId,
     amount:Number(r.amount||0), channel:collectionChannel(r),paymentType:r.receiptType,
     collectedBy:r.collectedBySalespersonNameSnapshot,collectorRole:r.collectedByRole||'SALES_PERSON',
-    customerOtpStatus:r.customerOtpStatus,physicalStatus:r.cashDepositStatus,
+    customerOtpStatus:r.customerOtpStatus,customerConfirmationMethod:r.customerConfirmationMethod||'',customerOtpVerifiedAt:r.customerOtpVerifiedAt||null,
+    paymentProofFileId:r.paymentProofFileId||'',physicalStatus:r.cashDepositStatus,
     receiptWorkflowStatus:r.receiptWorkflowStatus,cashierBatchId:r.cashDepositBatchId||'',
     denominations:r.cashDenominations||[],remarks:r.remarks||'',
     chequeNo:r.chequeNumber||'',ifsc:r.payerIfsc||'',reference:r.reference||'',
@@ -67,7 +68,7 @@ dmsCollectionHubRouter.get('/overview',safe(async(req,res)=>{
   // Full-FY totals from all verified collections, not merely current page.
   const {Receipt}=financialModels(req.auth.tenantKey,fy);
   const aggregate=await Receipt.aggregate([
-    {$match:{tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',status:'POSTED',customerOtpStatus:'VERIFIED'}},
+    {$match:{tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',status:'POSTED',$and:[collectionConfirmationFilter]}},
     {$project:{amount:1,cashDepositStatus:1,bankMatchStatus:1,
       channel:{$cond:[{$eq:['$mode','CASH']},'CASH',{$cond:[{$eq:['$receiptType','CHEQUE']},'CHEQUE','ONLINE']}]}}},
     {$group:{_id:'$channel',total:{$sum:'$amount'},count:{$sum:1},
@@ -121,7 +122,7 @@ dmsCollectionHubRouter.patch('/receipts/:id/notes',safe(async(req,res)=>{
   const fy=await financialYear(req),{Receipt}=financialModels(req.auth.tenantKey,fy);
   if(!mongoose.isValidObjectId(req.params.id))return fail(res,'Invalid receipt ID',400);
   const receipt=await Receipt.findOne({_id:req.params.id,tenantKey:req.auth.tenantKey,financialYear:fy,
-    collectionSource:'SALESPERSON_APP',status:'POSTED',customerOtpStatus:'VERIFIED'});
+    collectionSource:'SALESPERSON_APP',status:'POSTED',$and:[collectionConfirmationFilter]});
   if(!receipt)return fail(res,'Confirmed collection not found',404);
   const remarks=clean(req.body?.remarks);
   if(remarks.length>1000)return fail(res,'Remarks are limited to 1,000 characters',422);
@@ -149,7 +150,7 @@ dmsCollectionHubRouter.post('/sync-cheques',safe(async(req,res)=>{
 dmsCollectionHubRouter.get('/online/:receiptId/suggestions',safe(async(req,res)=>{
   const fy=await financialYear(req),{Receipt,BankStatementRow}=financialModels(req.auth.tenantKey,fy);
   if(!mongoose.isValidObjectId(req.params.receiptId))return fail(res,'Valid receipt ID required',400);
-  const receipt=await Receipt.findOne({_id:req.params.receiptId,tenantKey:req.auth.tenantKey,financialYear:fy,status:'POSTED',customerOtpStatus:'VERIFIED',collectionSource:'SALESPERSON_APP'}).lean();
+  const receipt=await Receipt.findOne({_id:req.params.receiptId,tenantKey:req.auth.tenantKey,financialYear:fy,status:'POSTED',$and:[collectionConfirmationFilter],collectionSource:'SALESPERSON_APP'}).lean();
   if(!receipt||collectionChannel(receipt)!=='ONLINE')return fail(res,'Verified online receipt not found',404);
   const ref=referenceKey(receipt.upiPaymentText||receipt.reference);
   if(ref.length<6)return fail(res,'UTR or transaction reference is too short for automatic bank matching',422);
@@ -167,7 +168,7 @@ dmsCollectionHubRouter.post('/online/:receiptId/match',safe(async(req,res)=>{
   if(!isAdminAuth(req.auth) && !canPageAction(req.auth.permissions||[],'/dms/banking','edit'))return fail(res,'Bank Edit permission required',403);
   const fy=await financialYear(req),{Receipt,BankStatementRow}=financialModels(req.auth.tenantKey,fy);
   if(!mongoose.isValidObjectId(req.params.receiptId) || !mongoose.isValidObjectId(req.body?.statementRowId))return fail(res,'Valid receipt and bank statement row IDs required',400);
-  const receipt=await Receipt.findOne({_id:req.params.receiptId,tenantKey:req.auth.tenantKey,financialYear:fy,status:'POSTED',customerOtpStatus:'VERIFIED',collectionSource:'SALESPERSON_APP'});
+  const receipt=await Receipt.findOne({_id:req.params.receiptId,tenantKey:req.auth.tenantKey,financialYear:fy,status:'POSTED',$and:[collectionConfirmationFilter],collectionSource:'SALESPERSON_APP'});
   if(!receipt||collectionChannel(receipt)!=='ONLINE')return fail(res,'Verified online collection not found',404);
   const row=await BankStatementRow.findOne({_id:req.body.statementRowId,tenantKey:req.auth.tenantKey,financialYear:fy,
     bankAccountId:clean(req.body.bankAccountId),classification:'POSTED',transactionId:{$nin:[null,'']}}).lean();

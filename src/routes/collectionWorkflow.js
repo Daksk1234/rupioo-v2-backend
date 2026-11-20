@@ -17,6 +17,7 @@ import { createOtp, verifyOtp } from '../services/otpService.js';
 import { sealHandoverOtp, unsealHandoverOtp } from '../services/collectionWorkflowOtpVault.js';
 import { streamSbiDepositSlipPDF } from '../services/chequeDepositSlipPdf.js';
 import { isSbiDepositAccount } from '../services/chequeDepositSlipRules.js';
+import {collectionConfirmationFilter} from '../services/collectionHubRules.js';
 
 const router=express.Router();
 router.use(requireAuth);
@@ -31,7 +32,7 @@ const source=(req,resource)=>({tenantKey:req.auth.tenantKey,app:'dms',resource})
 const RECEIVED='cheque-control-received',BUNDLES='cheque-control-account-handovers',SLIPS='cheque-control-workflow-slips';
 const isCheque=r=>['CHEQUE','CHECK','CHQ'].includes(upper(r?.receiptType))||['CHEQUE','CHECK','CHQ'].includes(upper(r?.mode));
 const channel=r=>upper(r?.mode)==='CASH'?'CASH':isCheque(r)?'CHEQUE':'ONLINE';
-const receiptFilter=(req,fy)=>({tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',customerOtpStatus:'VERIFIED',status:'POSTED'});
+const receiptFilter=(req,fy)=>({tenantKey:req.auth.tenantKey,financialYear:fy,collectionSource:'SALESPERSON_APP',$and:[collectionConfirmationFilter],status:'POSTED'});
 const may=(req,page,action='view')=>req.auth?.role!=='MASTER'&&(req.auth?.apps||[]).includes('dms')&&(isAdminAuth(req.auth)||canPageAction(req.auth.permissions||[],page,action));
 const allow=(page,action='view')=>(req,res,next)=>may(req,page,action)?next():fail(res,`${page} ${action} permission required`,403);
 const cashier='/dms/cashier',cheque='/dms/cheque-control';

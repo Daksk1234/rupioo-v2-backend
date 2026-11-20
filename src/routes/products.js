@@ -1,12 +1,15 @@
 import express from "express";
 import multer from "multer";
 import path from "path";
+import XLSX from "xlsx";
 import { Product, Unit, CompanyUnit, GenericRecord, FileMeta } from "../models/index.js";
 import { ok, fail, pageMeta } from "../utils/http.js";
 import { requireAuth } from "../middleware/auth.js";
 import { profitMetrics } from "../services/pricingService.js";
 import { referencedProductIds } from "../services/referenceIntegrityService.js";
 import { isAdminAuth } from "../utils/adminAccess.js";
+import { canPageAction } from "../config/permissionPageMap.js";
+import { createProductExportWorkbook, productListFilter } from "../services/productExportService.js";
 import { saveUploadedFile } from "../services/storageService.js";
 import {
   readRows,
@@ -210,6 +213,33 @@ const normalizeNumericFields = (target) => {
   }
 };
 
+router.get("/export-data.xlsx", async (req, res) => {
+  if (!req.auth.tenantKey) return fail(res, "Company session required", 403);
+  if (req.auth.role !== "MASTER" && !canPageAction(req.auth.permissions || [], "/dms/products", "download")) {
+    return fail(res, "Download permission required for Products", 403);
+  }
+  try {
+    // Read the stored documents directly: no schema projection, population,
+    // defaults, computed pricing, or list-page pagination may drop/change keys.
+    const documents = await Product.collection.find(productListFilter(req.auth.tenantKey, req.query))
+      .sort({createdAt: -1, _id: -1}).toArray();
+    if (!isAdminAuth(req.auth)) {
+      // Retain the same management-field restrictions as the product list.
+      for (const product of documents) {
+        delete product.minimumProfitPct;
+        delete product.pricingScheme;
+      }
+    }
+    const book = createProductExportWorkbook(documents);
+    const buffer = XLSX.write(book, {type: "buffer", bookType: "xlsx", compression: true});
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="products-data-${new Date().toISOString().slice(0, 10)}.xlsx"`);
+    return res.send(buffer);
+  } catch (error) {
+    return fail(res, error.message || "Unable to export product data", 500);
+  }
+});
+
 router.get("/suggest-identifiers", async (req, res) => {
   try {
     const name = cleanText(req.query.name);
@@ -232,21 +262,7 @@ router.get("/suggest-identifiers", async (req, res) => {
 router.get("/", async (req, res) => {
   const page = Math.max(1, Number(req.query.page || 1));
   const limit = Math.min(200, Math.max(10, Number(req.query.limit || 50)));
-  const q = String(req.query.q || "").trim();
-  const filter = { tenantKey: req.auth.tenantKey };
-
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.category) filter.category = req.query.category;
-  if (q) {
-    filter.$or = [
-      { name: new RegExp(q, "i") },
-      { sku: new RegExp(q, "i") },
-      { category: new RegExp(q, "i") },
-      { hsnCode: new RegExp(q, "i") },
-      { hsnDescription: new RegExp(q, "i") },
-      { barcode: new RegExp(q, "i") },
-    ];
-  }
+  const filter = productListFilter(req.auth.tenantKey, req.query);
 
   const [items, total] = await Promise.all([
     Product.find(filter)

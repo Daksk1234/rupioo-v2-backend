@@ -22,10 +22,14 @@ import { defaultRoleTemplates, MASTER_TEMPLATE_TENANT } from "../config/defaultR
 import { tenantFinancialYears, userReferenceDetails } from "../services/referenceIntegrityService.js";
 import { resolveBankDetails } from "../services/ifscMasterService.js";
 import { reassignOpenLeadsForPincodes } from "../services/leadAssignmentService.js";
+import {validateCollectorPincodes,collectorTerritoryFilter} from '../services/collectorTerritoryService.js';
+import {COLLECTOR_WORKFLOW_VERSION} from '../services/collectorWorkflowVersion.js';
 import { ensureSystemCashAccount, isSystemCashRecord } from "../services/systemCashAccountService.js";
 import { gstChangeConfirmation, migrateCompanyTenantKey, validateGstinChangeTarget } from "../services/tenantMigrationService.js";
 import { isTenantKeyReserved, resolveTenantKeyAlias } from "../services/tenantKeyService.js";
 import { financialModels } from "../services/accountingService.js";
+
+import { canDeleteCompanyDepartment, planDepartmentReporting } from "../services/departmentReportingPlan.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -315,10 +319,10 @@ const hasDmsAccess = (row={}) => (row.apps||[]).includes("dms") || Boolean(row.d
 const masterDepartments = (filter = {}) =>
   Department.find({ tenantKey: MASTER_DEPARTMENT_TENANT, ...filter });
 
-const activeMasterDepartmentById = (departmentId) =>
+const activeMasterDepartmentById = (departmentId, tenantKey = MASTER_DEPARTMENT_TENANT) =>
   Department.findOne({
     _id: departmentId,
-    tenantKey: MASTER_DEPARTMENT_TENANT,
+    tenantKey: { $in: [MASTER_DEPARTMENT_TENANT, tenantKey] },
     status: "ACTIVE",
   });
 
@@ -416,7 +420,7 @@ const effectiveRolePermissionCeiling = async (req, departmentId) => {
   if (!departmentId) return companyCeiling || [];
   const department = await Department.findOne({
     _id: departmentId,
-    tenantKey: MASTER_DEPARTMENT_TENANT,
+    tenantKey: { $in: [MASTER_DEPARTMENT_TENANT, req.auth.tenantKey] },
     status: "ACTIVE",
   }).lean();
   if (!department) return [];
@@ -1012,6 +1016,10 @@ router.delete("/groups/:id", async (req,res) => {
 router.get("/users", async (req,res) => {
   const tenantKey=await tenantFilter(req), page=Number(req.query.page||1), limit=Math.min(200,Number(req.query.limit||50)), q=String(req.query.q||"").trim();
   const filter={tenantKey};
+  if(req.query.departmentId){
+    if(!/^[a-f0-9]{24}$/i.test(String(req.query.departmentId)))return fail(res,"Invalid Department ID",400);
+    filter.departmentId=req.query.departmentId;
+  }
   if(q) filter.$or=[
     {name:new RegExp(q,"i")},{email:new RegExp(q,"i")},{accountType:new RegExp(q,"i")},
     {tallyAccountTypeName:new RegExp(q,"i")},{tallyAccountTypeCode:new RegExp(q,"i")},{designation:new RegExp(q,"i")},
@@ -1387,25 +1395,10 @@ const replaceSalesRolePincodes=async({tenantKey,user,roleDoc,pincodes,actorId})=
 
 const isCollectionExecutiveRole = (code) => ["COLLECTION_EXECUTIVE", "COLLECTOR"].includes(String(code || "").trim().toUpperCase());
 
-// Collection Executive parties must belong to the exact same company. No implicit
-// fallback to a salesperson's territory or any other tenant is allowed.
-async function validateCollectorCustomerIds(tenantKey, raw) {
-  if (!Array.isArray(raw)) { const e = new Error("Choose customers for the Collection Executive"); e.statusCode = 400; throw e; }
-  const ids = [...new Set(raw.map(x => String(x || "").trim()).filter(Boolean))];
-  if (!ids.length || ids.length > 5000) { const e = new Error("Assign between 1 and 5000 active customers to the Collection Executive"); e.statusCode = 400; throw e; }
-  const count = await CustomerLink.countDocuments({ tenantKey, globalCustomerId: { $in: ids }, status: "ACTIVE" });
-  if (count !== ids.length) { const e = new Error("Collection Executive assignments contain unknown or inactive customers"); e.statusCode = 400; throw e; }
-  return ids;
-}
-
+// Retained as an explicit upgrade error for clients using the former picker.
 router.get("/collector-customers/options", async (req, res) => {
   if (!canManageAccess(req)) return fail(res, "Access administration permission required", 403);
-  if (req.auth.role === "MASTER" && !req.query.tenantKey) return fail(res, "Select a company", 400);
-  const tenantKey = await tenantFilter(req);
-  const rows = await CustomerLink.find({ tenantKey, status: "ACTIVE" })
-    .select("globalCustomerId localName displayIdentifier creditDays creditLimit paymentType")
-    .sort({ localName: 1 }).limit(10000).lean();
-  return ok(res, { items: rows.map(x => ({ id: x.globalCustomerId, name: x.localName || x.displayIdentifier || x.globalCustomerId, creditDays: x.creditDays, paymentType: x.paymentType })) });
+  return fail(res,"Customer-wise collector assignment has been retired. Assign collection pincodes from Users & Access.",410);
 });
 
 // Multi-level, tenant-scoped account tree. GROUP nodes never create posting ledgers;
@@ -1772,7 +1765,7 @@ router.post("/users", async (req,res) => {
   }
 
   if (!ledgerOnly && isCollectionExecutiveRole(roleDoc?.code)) {
-    try { base.collectorCustomerIds = await validateCollectorCustomerIds(tenantKey, req.body.collectorCustomerIds); }
+    try { base.collectorPincodes = await validateCollectorPincodes(req.body.pincodes);base.collectorCustomerIds=[]; }
     catch (e) { return fail(res, e.message, e.statusCode || 400); }
   }
   const user=await User.create(base);
@@ -1905,11 +1898,11 @@ router.put("/users/:id", async (req,res) => {
   }
   const nextRoleCode = String(payload.role || user.role || "").toUpperCase();
   if (!ledgerOnlyMode && isCollectionExecutiveRole(nextRoleCode)) {
-    if (req.body.collectorCustomerIds !== undefined || !isCollectionExecutiveRole(user.role)) {
-      try { payload.collectorCustomerIds = await validateCollectorCustomerIds(user.tenantKey, req.body.collectorCustomerIds); }
+    if (req.body.pincodes !== undefined || !isCollectionExecutiveRole(user.role)) {
+      try { payload.collectorPincodes = await validateCollectorPincodes(req.body.pincodes);payload.collectorCustomerIds=[]; }
       catch (e) { return fail(res, e.message, e.statusCode || 400); }
     }
-  } else { payload.collectorCustomerIds = []; }
+  } else { payload.collectorCustomerIds = [];payload.collectorPincodes=[]; }
   if(ledgerOnlyMode){
     const newCode=String(payload.tallyAccountTypeCode||user.tallyAccountTypeCode||"");
     if(req.body.parentLedgerAccountId!==undefined){
@@ -2030,7 +2023,11 @@ router.get("/departments", async (req,res) => {
   const assignmentEnabled=new Set(
     tenantRoles.filter(r=>Number(r.hierarchyOrder||0)>0&&String(r.code||"").toUpperCase()==="SALES_PERSON").map(r=>String(r.departmentId))
   );
-  return ok(res,shaped.map(row=>({...row,canEdit:false,canDelete:false,customerAssignmentEnabled:assignmentEnabled.has(String(row._id))})));
+  const companyDepartments=await Department.find({tenantKey:req.auth.tenantKey,status:"ACTIVE"}).sort({name:1}).lean();
+  return ok(res,[...shaped,...companyDepartments.map(row=>({
+    ...row,isMasterTemplate:false,permissionCount:operationalPermissions(row.permissions||[]).length,
+    permissionConfigured:row.permissionConfigured===true
+  }))].map(row=>({...row,canEdit:false,canDelete:canDeleteCompanyDepartment(req.auth,row),customerAssignmentEnabled:assignmentEnabled.has(String(row._id))})));
 });
 
 // Download a live XLSX permission matrix for every MASTER Department. The same
@@ -2254,11 +2251,23 @@ router.put("/departments/:id", async (req,res) => {
 });
 
 router.delete("/departments/:id", async (req,res) => {
-  if(req.auth.role!=="MASTER")return fail(res,"Only MASTER can deactivate Departments",403);
-  const row=await Department.findOne({_id:req.params.id,tenantKey:MASTER_DEPARTMENT_TENANT});
-  if(!row)return fail(res,"MASTER Department not found",404);
+  if(!["MASTER","SUPERADMIN"].includes(req.auth.role))return fail(res,"Department administration access required",403);
+  if(!/^[a-f0-9]{24}$/i.test(req.params.id))return fail(res,"Invalid Department ID",400);
+  const row=await Department.findOne({_id:req.params.id,tenantKey:{$in:[MASTER_DEPARTMENT_TENANT,req.auth.tenantKey]}});
+  if(!row)return fail(res,"Department not found",404);
+  if(req.auth.role!=="MASTER"){
+    if(!canDeleteCompanyDepartment(req.auth,row))return fail(res,"SUPERADMIN cannot delete a Department created by MASTER",403);
+    const departmentRoles=await Role.find({tenantKey:req.auth.tenantKey,departmentId:row._id}).select("_id code").lean();
+    const users=await User.countDocuments({tenantKey:req.auth.tenantKey,status:{$ne:"DELETED"},$or:[
+      {departmentId:row._id},{roleId:{$in:departmentRoles.map(role=>role._id)}},
+      {roleId:null,role:{$in:departmentRoles.map(role=>role.code)}}
+    ]});
+    if(users)return fail(res,"Move existing users to another Department before deleting this Department",409);
+    await Role.updateMany({tenantKey:req.auth.tenantKey,departmentId:row._id},{$unset:{departmentId:1},$set:{hierarchyOrder:0}});
+    await PincodeAssignment.updateMany({tenantKey:req.auth.tenantKey,departmentId:row._id},{$set:{status:"INACTIVE",userIds:[]}});
+  }else if(row.tenantKey!==MASTER_DEPARTMENT_TENANT)return fail(res,"MASTER Department not found",404);
   row.status="INACTIVE";row.updatedBy=req.auth.sub;await row.save();
-  return ok(res,{id:row._id,status:row.status},"MASTER Department deactivated");
+  return ok(res,{id:row._id,status:row.status},"Department deactivated");
 });
 
 // Roles are created first from Role Management. This page then assigns those
@@ -2299,7 +2308,8 @@ router.get("/department-role-assignment/:departmentId", async (req,res) => {
   const tenantKey=req.auth.tenantKey;
   await migrateLegacyTenantDepartments(tenantKey);
   await ensureTenantMasterRoles(req);
-  const department=await Department.findOne({_id:req.params.departmentId,tenantKey:MASTER_DEPARTMENT_TENANT}).lean();
+  if(!/^[a-f0-9]{24}$/i.test(req.params.departmentId))return fail(res,"Invalid Department ID",400);
+  const department=await activeMasterDepartmentById(req.params.departmentId,tenantKey).lean();
   if(!department)return fail(res,"Department not found",404);
 
   // IMPORTANT: never silently hide a Role from Department Role Assignment.
@@ -2310,7 +2320,7 @@ router.get("/department-role-assignment/:departmentId", async (req,res) => {
   const rawRoles=await Role.find({tenantKey})
     .populate({
       path:"departmentId",
-      match:{tenantKey:MASTER_DEPARTMENT_TENANT},
+      match:{tenantKey:{$in:[MASTER_DEPARTMENT_TENANT,tenantKey]}},
       select:"name code status reference"
     })
     .sort({status:1,hierarchyOrder:1,name:1})
@@ -2367,10 +2377,12 @@ router.put("/department-role-assignment/:departmentId", async (req,res) => {
   const tenantKey=req.auth.tenantKey;
   await migrateLegacyTenantDepartments(tenantKey);
   await ensureTenantMasterRoles(req);
-  const department=await activeMasterDepartmentById(req.params.departmentId);
-  if(!department)return fail(res,"Active MASTER Department not found",404);
+  if(!/^[a-f0-9]{24}$/i.test(req.params.departmentId))return fail(res,"Invalid Department ID",400);
+  const department=await activeMasterDepartmentById(req.params.departmentId,tenantKey);
+  if(!department)return fail(res,"Active Department not found",404);
   const roleIds=Array.isArray(req.body.roleIds)?req.body.roleIds.map(String).filter(Boolean):[];
   if(!roleIds.length)return fail(res,"Select at least one Role",400);
+  if(new Set(roleIds).size!==roleIds.length||roleIds.some(id=>!/^[a-f0-9]{24}$/i.test(id)))return fail(res,"Role IDs must be valid and unique",400);
 
   const roles=await Role.find({_id:{$in:roleIds},tenantKey,status:"ACTIVE"});
   if(roles.length!==roleIds.length)return fail(res,"One or more selected Roles are invalid",409);
@@ -2404,9 +2416,17 @@ router.put("/department-role-assignment/:departmentId", async (req,res) => {
   const selectedSet=new Set(roleIds);
   for(const role of currentRoles){
     if(selectedSet.has(String(role._id)))continue;
-    const users=await User.countDocuments({tenantKey,status:"ACTIVE",$or:[{roleId:role._id},{role:role.code}]});
-    if(users)return fail(res,`${role.name} has active users and cannot be removed from this Department.`,409);
+    const users=await User.countDocuments({tenantKey,status:{$ne:"DELETED"},$or:[{roleId:role._id},{roleId:null,role:role.code}]});
+    if(users)return fail(res,`${role.name} has users and cannot be removed from this Department.`,409);
   }
+
+  // Validate the complete reporting plan before changing any persisted ranks.
+  const rankedUsers=await User.find({tenantKey,status:{$ne:"DELETED"},$or:[
+    {roleId:{$in:roleIds}},{roleId:null,role:{$in:ordered.map(role=>role.code)}}
+  ]}).select("_id role roleId status assignedToUserId branchId").lean();
+  let reportingChanges;
+  try{reportingChanges=planDepartmentReporting(ordered,rankedUsers);}
+  catch(error){return fail(res,error.message,error.statusCode||409);}
 
   for(const role of currentRoles){
     if(!selectedSet.has(String(role._id))){
@@ -2433,12 +2453,18 @@ router.put("/department-role-assignment/:departmentId", async (req,res) => {
     );
   }
 
+  if(reportingChanges.length)await User.bulkWrite(reportingChanges.map(change=>({updateOne:{
+    filter:{_id:change.userId,tenantKey},
+    update:change.parentUserId?{$set:{assignedToUserId:change.parentUserId}}:{$unset:{assignedToUserId:1}}
+  }})));
+
   await reconcilePincodeAssignmentsForDepartment(tenantKey,department._id,CustomerLink);
   return ok(res,{
     departmentId:String(department._id),
     departmentPermissionConfigured:departmentConfigured,
     departmentPermissionCount:operationalPermissions(department.permissions||[]).length,
     permissionsRemoved,
+    reportingAssignmentsChanged:reportingChanges.length,
     roles:ordered.map((r,i)=>({_id:String(r._id),name:r.name,code:r.code,rank:i+1,permissionCount:(r.permissions||[]).length})),
     customerAssignmentEnabled:sp>=0
   },permissionsRemoved?`Department Role hierarchy saved. ${permissionsRemoved} permission assignment(s) outside the Department ceiling were removed.`:"Department Role hierarchy saved");
@@ -2493,14 +2519,17 @@ router.get("/sales-pincode-users", async (req,res) => {
 
 router.get("/users/:id/pincodes", async (req,res) => {
   const tenantKey=await tenantFilter(req);
-  const user=await User.findOne({_id:req.params.id,tenantKey}).select("name role roleId departmentId assignedToUserId coveragePincodes status").lean();
+  const user=await User.findOne({_id:req.params.id,tenantKey}).select("name role roleId departmentId assignedToUserId coveragePincodes collectorPincodes status").lean();
   if(!user)return fail(res,"User not found",404);
   const role=await Role.findOne({_id:user.roleId,tenantKey}).select("name code departmentId").lean();
   const code=String(role?.code||user.role||"").toUpperCase();
   let pincodes=[];
-  if(code==="SALES_HEAD")pincodes=user.coveragePincodes||[];
+  if(isCollectionExecutiveRole(code))pincodes=user.collectorPincodes||[];
+  else if(code==="SALES_HEAD")pincodes=user.coveragePincodes||[];
   else if(code==="SALES_PERSON")pincodes=(await PincodeAssignment.find({tenantKey,departmentId:role?.departmentId||user.departmentId,status:"ACTIVE",userIds:user._id}).select("pincode").lean()).map(x=>String(x.pincode));
-  return ok(res,{userId:String(user._id),name:user.name,roleCode:code,roleName:role?.name||code,pincodes:Array.from(new Set(pincodes)).sort()});
+  const assignedCustomerCount=isCollectionExecutiveRole(code)?await CustomerLink.countDocuments({tenantKey,status:'ACTIVE',...collectorTerritoryFilter(pincodes)}):null;
+  return ok(res,{userId:String(user._id),name:user.name,roleCode:code,roleName:role?.name||code,pincodes:Array.from(new Set(pincodes)).sort(),
+    assignedCustomerCount,collectorWorkflowVersion:COLLECTOR_WORKFLOW_VERSION});
 });
 
 router.put("/users/:id/pincodes", async (req,res) => {
@@ -2511,7 +2540,12 @@ router.put("/users/:id/pincodes", async (req,res) => {
   const roleDoc=await Role.findOne({_id:user.roleId,tenantKey,status:"ACTIVE"});
   if(!roleDoc)return fail(res,"User Role is not active",409);
   const code=String(roleDoc.code||"").toUpperCase();
-  if(!SALES_GEO_ROLES.has(code))return fail(res,"Pincode allotment is available only for Sales Head and Sales Person",409);
+  if(isCollectionExecutiveRole(code)){
+    try{user.collectorPincodes=await validateCollectorPincodes(req.body.pincodes);user.collectorCustomerIds=[];await user.save();
+      return ok(res,{roleCode:code,pincodes:user.collectorPincodes},'Collector pincode territory updated');}
+    catch(e){return fail(res,e.message,e.statusCode||400);}
+  }
+  if(!SALES_GEO_ROLES.has(code))return fail(res,"Pincode allotment is available only for Sales Head, Sales Person and Collection Executive",409);
   try{
     const oldPins=code==="SALES_PERSON"?(await PincodeAssignment.find({tenantKey,departmentId:roleDoc.departmentId,status:"ACTIVE",userIds:user._id}).select("pincode").lean()).map(x=>String(x.pincode)):[];
     const result=await replaceSalesRolePincodes({tenantKey,user,roleDoc,pincodes:req.body.pincodes,actorId:req.auth.sub});

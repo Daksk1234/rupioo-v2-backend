@@ -6,7 +6,10 @@ export function collectionChannel(receipt) {
   if(['CHEQUE','CHECK','CHQ'].includes(mode)||['CHEQUE','CHECK','CHQ'].includes(type))return 'CHEQUE';
   return 'ONLINE';
 }
-export const receiptIsVerified = r => r?.customerOtpStatus==='VERIFIED' && r?.status==='POSTED';
+export const collectionConfirmationFilter={$or:[{customerOtpStatus:'VERIFIED'},
+ {customerConfirmationMethod:'ONLINE_PROOF',customerOtpStatus:'NOT_REQUIRED',mode:'BANK',receiptType:{$nin:['CASH','CHEQUE','CHECK','CHQ']},paymentProofFileId:{$exists:true,$nin:[null,'']}}]};
+export const receiptIsVerified = r => r?.status==='POSTED'&&(r?.customerOtpStatus==='VERIFIED'||
+ r?.customerConfirmationMethod==='ONLINE_PROOF'&&r?.customerOtpStatus==='NOT_REQUIRED'&&r?.mode==='BANK'&&collectionChannel(r)==='ONLINE'&&Boolean(r?.paymentProofFileId));
 export const chequeCollectionReference = r => `CLN:${clean(r.financialYear)}:${clean(r.receiptNo)}`.toUpperCase();
 export function onlineCollectionStatus(r){return r?.bankMatchStatus==='BANK_MATCHED'?'BANK_MATCHED':receiptIsVerified(r)?'PENDING_BANK_VERIFICATION':'PENDING_CUSTOMER_OTP';}
 export const referenceKey = value=>clean(value).toUpperCase().replace(/[^A-Z0-9]/g,'');

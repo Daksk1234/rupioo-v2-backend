@@ -2,7 +2,8 @@ import express from "express";
 import { Pincode, Hsn, IfscMaster, Unit, AccountTemplate, Branding } from "../models/index.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ok } from "../utils/http.js";
-import { searchTaxpayer, configurationStatus } from "../services/gstService.js";
+import { configurationStatus } from "../services/gstService.js";
+import { lookupCustomerGst } from "../services/customerGstLookupService.js";
 import { ensureDefaultTallyAccountTypes } from "../config/defaultTallyAccountTypes.js";
 import { formatIfscContact, getIfscMaster, ifscSnapshot } from "../services/ifscMasterService.js";
 
@@ -71,7 +72,7 @@ router.get("/gst/status", (_req, res) => ok(res, configurationStatus()));
 // Direct GSTIN lookup before a customer is created.
 router.get("/gst/search", async (req, res, next) => {
   try {
-    const taxpayer = await searchTaxpayer(req.query.gstin);
+    const taxpayer = await lookupCustomerGst(req.query.gstin, {tenantKey:req.auth.tenantKey});
     return ok(res, taxpayer, "GST taxpayer found");
   } catch (error) {
     return next(error);

@@ -19,6 +19,7 @@ import {
   User,
 } from "../models/index.js";
 import { env } from "../config/env.js";
+import {collectorForCustomerFilter} from '../services/collectorTerritoryService.js';
 import { fail, ok, pageMeta } from "../utils/http.js";
 import { makeId } from "../utils/ids.js";
 import { searchTaxpayer } from "../services/gstService.js";
@@ -147,7 +148,7 @@ async function collectorsFor(link, tenantKey) {
   if (!link?.globalCustomerId || !tenantKey || link.status !== "ACTIVE") return [];
   const rows = await User.find({
     tenantKey, role: { $in: ["COLLECTION_EXECUTIVE", "COLLECTOR"] }, status: "ACTIVE", loginEnabled: true,
-    collectorCustomerIds: link.globalCustomerId,
+    ...collectorForCustomerFilter(link),
   }).select("_id name mobile").sort({ name: 1 }).lean();
   return rows.map((u) => ({ id: String(u._id), name: u.name || "Collection Executive", mobile: u.mobile || "" }));
 }
